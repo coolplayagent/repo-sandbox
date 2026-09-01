@@ -2,6 +2,9 @@
 //!
 //! This crate deliberately has no infrastructure dependencies.
 
+pub mod config;
+pub mod exit_code;
+
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -30,15 +33,30 @@ impl Command {
 /// Stable, infrastructure-independent application error model.
 #[derive(Debug, Eq, PartialEq)]
 pub enum AppError {
-    InvalidInput(String),
-    Infrastructure(String),
+    Configuration(String),
+    Environment(String),
+    BuildFailed(String),
+    TestFailed(String),
+}
+
+impl AppError {
+    pub const fn exit_code(&self) -> exit_code::ExitCode {
+        match self {
+            Self::Configuration(_) => exit_code::ExitCode::Configuration,
+            Self::Environment(_) => exit_code::ExitCode::Environment,
+            Self::BuildFailed(_) => exit_code::ExitCode::BuildFailed,
+            Self::TestFailed(_) => exit_code::ExitCode::TestFailed,
+        }
+    }
 }
 
 impl Display for AppError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidInput(message) => write!(formatter, "invalid input: {message}"),
-            Self::Infrastructure(message) => write!(formatter, "infrastructure error: {message}"),
+            Self::Configuration(message) => write!(formatter, "configuration error: {message}"),
+            Self::Environment(message) => write!(formatter, "environment error: {message}"),
+            Self::BuildFailed(message) => write!(formatter, "build failed: {message}"),
+            Self::TestFailed(message) => write!(formatter, "test failed: {message}"),
         }
     }
 }
@@ -71,5 +89,25 @@ mod tests {
                 format!("{} is not implemented yet", command.name())
             );
         }
+    }
+
+    #[test]
+    fn application_errors_map_to_stable_exit_codes() {
+        assert_eq!(
+            AppError::Configuration("bad yaml".into()).exit_code(),
+            exit_code::ExitCode::Configuration
+        );
+        assert_eq!(
+            AppError::Environment("docker unavailable".into()).exit_code(),
+            exit_code::ExitCode::Environment
+        );
+        assert_eq!(
+            AppError::BuildFailed("compiler failed".into()).exit_code(),
+            exit_code::ExitCode::BuildFailed
+        );
+        assert_eq!(
+            AppError::TestFailed("assertion failed".into()).exit_code(),
+            exit_code::ExitCode::TestFailed
+        );
     }
 }

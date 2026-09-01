@@ -17,7 +17,11 @@ bazelisk run //:repo-sandbox -- --version
 ```
 
 The `doctor`, `plan`, `build`, `verify`, and `clean` routes are intentionally
-reserved; their behavior belongs to follow-up issues.
+reserved; their execution behavior belongs to follow-up issues.
+
+The versioned repository configuration and finite CLI override contract are
+documented in [`docs/config-v1.md`](docs/config-v1.md). A complete configuration
+is available as [`.repo-sandbox.yaml.example`](.repo-sandbox.yaml.example).
 
 `Cargo.toml` and `Cargo.lock` describe Rust packages and third-party dependency
 resolution for Bzlmod's crate_universe. Cargo is not a supported build entrypoint.
