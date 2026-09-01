@@ -7,6 +7,7 @@ pub mod config;
 pub mod doctor;
 pub mod exit_code;
 pub mod snapshot;
+pub mod task_image;
 pub mod template;
 
 use std::error::Error;

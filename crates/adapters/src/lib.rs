@@ -3,6 +3,7 @@
 pub mod buildkit;
 pub mod doctor;
 pub mod snapshot;
+pub mod task_image;
 
 pub mod logging {
     use tracing_subscriber::EnvFilter;

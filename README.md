@@ -51,5 +51,11 @@ snapshot identity hashes normalized paths, Git-compatible file modes, and file
 contents. Git metadata is never copied, recursive submodules are opt-in, and Git
 LFS sources are rejected in v1.
 
+Task images combine a resolved environment image with exactly one immutable
+source snapshot at `/workspace`. Their tag is derived from environment, source,
+template, and configuration digests; OCI labels retain those inputs plus the
+build timestamp. See [`docs/task-images.md`](docs/task-images.md) for the
+security and identity contract.
+
 `Cargo.toml` and `Cargo.lock` describe Rust packages and third-party dependency
 resolution for Bzlmod's crate_universe. Cargo is not a supported build entrypoint.
