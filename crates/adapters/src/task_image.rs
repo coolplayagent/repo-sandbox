@@ -152,6 +152,7 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
             template_version: request.template_version.to_owned(),
             base_image: environment,
             platform: request.platform,
+            target_platforms: vec![request.platform],
             build_context: PathBuf::from("."),
             parameters: Default::default(),
             stages: Vec::new(),
@@ -378,7 +379,7 @@ mod tests {
         NeverCancelled, ProcessInvocation, ProcessOutput, SystemProcessExecutor,
     };
     use crate::snapshot::GitSnapshotter;
-    use repo_sandbox_core::build::ImageDigest;
+    use repo_sandbox_core::build::{ImageDigest, PlatformDigest};
     use repo_sandbox_core::snapshot::{
         CleanupPolicy, GitAuthentication, SnapshotOptions, SourceSpec,
     };
@@ -472,9 +473,14 @@ mod tests {
     }
 
     fn environment() -> BuiltImage {
+        let digest = ImageDigest::new(format!("sha256:{}", "e".repeat(64))).unwrap();
         BuiltImage {
             image: ImageRef::new("repo-sandbox/environment:stable").unwrap(),
-            digest: ImageDigest::new(format!("sha256:{}", "e".repeat(64))).unwrap(),
+            digest: digest.clone(),
+            platform_digests: vec![PlatformDigest {
+                platform: Platform::LinuxAmd64,
+                digest,
+            }],
         }
     }
 
@@ -684,6 +690,7 @@ mod tests {
         let environment = BuiltImage {
             image: ImageRef::new("busybox:1.36").unwrap(),
             digest: ImageDigest::new(parent_digest).unwrap(),
+            platform_digests: Vec::new(),
         };
         let config = config();
         let built = TaskImageBuilder::new(SystemProcessExecutor)

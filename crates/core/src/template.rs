@@ -55,6 +55,8 @@ pub struct TemplatePlan {
     pub template_version: String,
     pub base_image: String,
     pub platform: Platform,
+    /// Platforms supported by the template and every selected component.
+    pub target_platforms: Vec<Platform>,
     pub build_context: PathBuf,
     pub parameters: BTreeMap<String, String>,
     pub stages: Vec<PlanStage>,
@@ -263,11 +265,24 @@ impl TemplateCatalog {
             })
             .collect();
 
+        let target_platforms = template
+            .target_platforms
+            .iter()
+            .copied()
+            .filter(|target| {
+                template.components.iter().all(|selected| {
+                    component_by_id[selected.id.as_str()]
+                        .target_platforms
+                        .contains(target)
+                })
+            })
+            .collect();
         Ok(TemplatePlan {
             template_id: template.id.clone(),
             template_version: template.version.clone(),
             base_image: interpolate(&template.base_image, &parameters),
             platform,
+            target_platforms,
             build_context: template.build_context.clone(),
             parameters,
             stages,

@@ -15,6 +15,8 @@ immutable tag; callers that require byte-stable rebuilds supply the same
 reproducible source/build epoch. Source, configuration, resolved environment,
 or creation-time changes select a new tag. The builder only loads the image
 locally; registry push and retention policy remain later orchestration concerns.
+When the environment is multi-platform, the pinned index digest still resolves
+the child manifest selected by the task image's OCI platform.
 
 The OCI labels record creation time, source commit and content digest, template
 ID/version, configuration digest, environment digest, and task identity.
