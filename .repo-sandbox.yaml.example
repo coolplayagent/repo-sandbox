@@ -1,0 +1,26 @@
+version: 1
+template:
+  name: rust
+  platform: linux/amd64
+  image: rust:1.97
+  timeout_seconds: 900
+  resources:
+    cpu: 2
+    memory_mb: 4096
+  environment:
+    allow:
+      - CI
+      - RUST_LOG
+    secrets:
+      - environment: CARGO_TOKEN
+        secret: crates-io-token
+  artifacts:
+    directories:
+      - target/release
+      - reports
+build:
+  - name: compile
+    run: cargo build --locked
+test:
+  - name: unit
+    run: cargo test --locked

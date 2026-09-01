@@ -9,7 +9,7 @@ fn main() {
         Ok(None) => {}
         Err(error) => {
             eprintln!("error: {error}");
-            std::process::exit(1);
+            std::process::exit(error.exit_code().as_i32());
         }
     }
 }

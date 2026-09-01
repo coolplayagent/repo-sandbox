@@ -7,3 +7,8 @@ version.workspace = true
 [lib]
 name = "repo_sandbox_core"
 path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_path_to_error.workspace = true
+serde_yaml.workspace = true
