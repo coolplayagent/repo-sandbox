@@ -23,6 +23,11 @@ repo-sandbox doctor
 repo-sandbox doctor --json
 ```
 
+Private Git snapshots support SSH agent/key references and HTTPS token/credential
+helper authentication without storing credentials. See
+[`docs/config-v1.md`](docs/config-v1.md#private-git-authentication) for the
+security contract.
+
 `doctor` checks the host OS/CPU, Docker daemon, BuildKit, buildx,
 cross-architecture QEMU/binfmt support, repository filesystem space, and Docker
 Hub registry connectivity. It never installs software or changes host/Docker

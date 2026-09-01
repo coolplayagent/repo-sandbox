@@ -2,6 +2,33 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::PathBuf;
 
+/// A reference to secret material owned by the host. The value itself never
+/// becomes part of the configuration or snapshot domain model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExternalSecret {
+    Environment(String),
+    File(PathBuf),
+}
+
+/// Authentication used only while Git contacts a remote.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum GitAuthentication {
+    #[default]
+    None,
+    SshAgent {
+        known_hosts: Option<PathBuf>,
+    },
+    SshKey {
+        private_key: PathBuf,
+        known_hosts: Option<PathBuf>,
+    },
+    HttpsToken {
+        username: String,
+        token: ExternalSecret,
+    },
+    HttpsCredentialHelper,
+}
+
 /// A source supplied by the operator. Remote credentials are intentionally not
 /// represented in the v1 domain model.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +131,10 @@ pub enum SnapshotError {
     InvalidInput(String),
     Unsupported(String),
     Git(String),
+    Authentication(String),
+    Network(String),
+    RepositoryNotFound(String),
+    PermissionDenied(String),
     Io(String),
 }
 
@@ -113,6 +144,16 @@ impl Display for SnapshotError {
             Self::InvalidInput(message) => write!(formatter, "invalid source: {message}"),
             Self::Unsupported(message) => write!(formatter, "unsupported source: {message}"),
             Self::Git(message) => write!(formatter, "git operation failed: {message}"),
+            Self::Authentication(message) => {
+                write!(formatter, "Git authentication failed: {message}")
+            }
+            Self::Network(message) => write!(formatter, "Git network failed: {message}"),
+            Self::RepositoryNotFound(message) => {
+                write!(formatter, "Git repository not found: {message}")
+            }
+            Self::PermissionDenied(message) => {
+                write!(formatter, "Git permission denied: {message}")
+            }
             Self::Io(message) => write!(formatter, "snapshot I/O failed: {message}"),
         }
     }
@@ -130,5 +171,14 @@ mod tests {
         assert!(SnapshotId::parse("A".repeat(64)).is_err());
         assert!(CommitSha::parse("A".repeat(40)).is_ok());
         assert!(CommitSha::parse("abc").is_err());
+    }
+
+    #[test]
+    fn authentication_models_only_external_secret_references() {
+        let auth = GitAuthentication::HttpsToken {
+            username: "git".into(),
+            token: ExternalSecret::Environment("REPO_TOKEN".into()),
+        };
+        assert!(!format!("{auth:?}").contains("actual-token"));
     }
 }
