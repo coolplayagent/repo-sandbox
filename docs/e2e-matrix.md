@@ -34,6 +34,15 @@ The Docker target is CI-required. It covers:
 | `docker-architecture-mismatch` | a real arm64 BuildKit execution | architecture stage fails and is visible in the log |
 | `rust-bazel-dogfood` | repo-sandbox Rust+Bazel image fixture | cold/warm cache, source-only change, amd64/arm64, multistage, Cargo and Bazel tests |
 
+The hosted CI job does not weaken the runner's writable-layer limit when the
+host daemon lacks overlay-on-XFS project quotas. It creates a task-unique sparse
+XFS filesystem mounted with `pquota`, starts a separate Docker daemon with an
+isolated data root, socket, exec root and bridge, and first proves that a
+`busybox:1.36` container can be created and run with
+`--storage-opt size=32M`. The job removes its exact Buildx builder, verifies the
+daemon PID and command line before terminating it, unmounts the task filesystem,
+removes the task bridge and directory, and asserts those resources are gone.
+
 Failure cleanup is ownership-scoped. Images and containers use unique run IDs.
 The runner failure test checks the retained container's
 `io.repo-sandbox.task-id` label before removing that exact container ID. The

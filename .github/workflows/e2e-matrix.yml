@@ -34,6 +34,8 @@ jobs:
         run: cargo test --workspace --all-features
       - name: Validate and list the unified matrix
         run: cargo run -p repo-sandbox-adapters --bin e2e-matrix -- --list
+      - name: Shell driver contracts
+        run: bash -n scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh
 
   docker-required:
     runs-on: ubuntu-24.04
@@ -44,11 +46,17 @@ jobs:
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: amd64,arm64
-      - uses: docker/setup-buildx-action@v3
-        id: buildx
+      - name: Install XFS quota tooling
+        run: sudo apt-get update && sudo apt-get install --yes xfsprogs
+      - name: Start task-owned XFS pquota Docker daemon
+        run: |
+          docker_host=$(sudo scripts/e2e/ci-quota-docker.sh start "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT")
+          echo "DOCKER_HOST=$docker_host" >> "$GITHUB_ENV"
+          export DOCKER_HOST="$docker_host"
+          builder="repo-sandbox-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker buildx create --name "$builder" --driver docker-container --driver-opt network=host --use
+          echo "REPO_SANDBOX_BUILDER=$builder" >> "$GITHUB_ENV"
       - name: Run required local Docker scenarios
-        env:
-          REPO_SANDBOX_BUILDER: ${{ steps.buildx.outputs.name }}
         run: cargo run -p repo-sandbox-adapters --bin e2e-matrix -- --target docker
       - name: Upload scenario logs and reports
         if: always()
@@ -57,3 +65,6 @@ jobs:
           name: e2e-matrix-results
           path: target/e2e/
           if-no-files-found: error
+      - name: Stop task-owned Docker daemon and remove quota storage
+        if: always()
+        run: sudo scripts/e2e/ci-quota-docker.sh stop "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
