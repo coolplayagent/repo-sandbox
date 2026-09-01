@@ -151,8 +151,7 @@ fn system_available_space(path: &Path) -> io::Result<u64> {
     let text = String::from_utf8_lossy(&output.stdout);
     let line = text
         .lines()
-        .filter(|line| !line.trim().is_empty())
-        .next_back()
+        .rfind(|line| !line.trim().is_empty())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "df returned no data"))?;
     let columns = line.split_whitespace().collect::<Vec<_>>();
     let available_kib = columns
