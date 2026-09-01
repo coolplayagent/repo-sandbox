@@ -1,0 +1,11 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+rust_library(
+    name = "adapters",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "repo_sandbox_adapters",
+    deps = all_crate_deps(normal = True),
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,32 @@
+load("@crates//:defs.bzl", "aliases")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+rust_library(
+    name = "cli",
+    srcs = ["src/lib.rs"],
+    aliases = aliases(),
+    crate_name = "repo_sandbox_cli",
+    version = "0.1.0",
+    deps = [
+        "//crates/core:core",
+        "@crates//:clap",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+rust_binary(
+    name = "repo-sandbox",
+    srcs = ["src/main.rs"],
+    crate_name = "repo_sandbox",
+    version = "0.1.0",
+    deps = [
+        ":cli",
+        "//crates/adapters:adapters",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "cli_smoke_test",
+    crate = ":cli",
+)

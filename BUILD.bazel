@@ -1,0 +1,10 @@
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+])
+
+alias(
+    name = "repo-sandbox",
+    actual = "//crates/cli:repo-sandbox",
+    visibility = ["//visibility:public"],
+)

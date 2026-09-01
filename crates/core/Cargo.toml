@@ -1,0 +1,9 @@
+[package]
+name = "repo-sandbox-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "repo_sandbox_core"
+path = "src/lib.rs"

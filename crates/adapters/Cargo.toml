@@ -1,0 +1,12 @@
+[package]
+name = "repo-sandbox-adapters"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "repo_sandbox_adapters"
+path = "src/lib.rs"
+
+[dependencies]
+tracing-subscriber.workspace = true
