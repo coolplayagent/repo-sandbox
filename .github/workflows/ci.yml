@@ -1,0 +1,104 @@
+name: Required pull request quality
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Fork pull requests receive only this read-only token. The workflow never reads secrets.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  BAZEL_CACHE_NAMESPACE: bazel-ci-v1
+  BUILDKIT_CACHE_NAMESPACE: buildkit-e2e-v1
+
+jobs:
+  bazel-quality:
+    name: Bazel quality and runner smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the tested commit without credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install checksum-pinned Bazelisk
+        run: scripts/ci/install-bazelisk.sh "$RUNNER_TEMP/bin"
+      - name: Install the repository Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component clippy --component rustfmt
+          rustup default 1.97.0
+      - name: Restore Bazel cache namespace
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/bazelisk
+          key: ${{ env.BAZEL_CACHE_NAMESPACE }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', 'MODULE.bazel', 'MODULE.bazel.lock', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ env.BAZEL_CACHE_NAMESPACE }}-${{ runner.os }}-${{ runner.arch }}-
+      - name: Bazel build
+        run: bazelisk build //...
+      - name: Bazel unit tests
+        run: bazelisk test //...
+      - name: Rust formatting and lint contracts
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Configuration sample and executable integration
+        run: |
+          binary=$(bazelisk cquery //:repo-sandbox --output=files | tail -n 1)
+          test -x "$binary"
+          install -m 0755 "$binary" "$RUNNER_TEMP/repo-sandbox"
+          "$RUNNER_TEMP/repo-sandbox" --version | grep -Fx 'repo-sandbox 0.1.0'
+          sample=$(mktemp -d)
+          cp .repo-sandbox.yaml.example "$sample/.repo-sandbox.yaml"
+          "$RUNNER_TEMP/repo-sandbox" plan --repository "$sample" | grep -F 'Template: rust-bazel@1.0.0'
+      - name: CI and release security contracts
+        run: scripts/ci/contracts.sh
+
+  docker-required:
+    name: Required Docker E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Checkout the tested commit without credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install the repository Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          platforms: amd64,arm64
+          cache-image: false
+      - name: Install XFS quota tooling
+        run: sudo apt-get update && sudo apt-get install --yes xfsprogs
+      - name: Start task-owned XFS pquota Docker daemon and BuildKit namespace
+        run: |
+          docker_host=$(sudo scripts/e2e/ci-quota-docker.sh start "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT")
+          echo "DOCKER_HOST=$docker_host" >> "$GITHUB_ENV"
+          export DOCKER_HOST="$docker_host"
+          builder="${BUILDKIT_CACHE_NAMESPACE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker buildx create --name "$builder" --driver docker-container --driver-opt network=host --use
+          echo "REPO_SANDBOX_BUILDER=$builder" >> "$GITHUB_ENV"
+      - name: Run required runner integration scenarios
+        run: cargo run -p repo-sandbox-adapters --bin e2e-matrix -- --target docker
+      - name: Upload scenario logs and reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-matrix-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/e2e/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Stop task-owned Docker daemon and remove quota storage
+        if: always()
+        run: sudo scripts/e2e/ci-quota-docker.sh stop "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
