@@ -6,6 +6,7 @@ pub mod build;
 pub mod config;
 pub mod doctor;
 pub mod exit_code;
+pub mod registry;
 pub mod snapshot;
 pub mod task_image;
 pub mod template;

@@ -2,6 +2,7 @@
 
 pub mod buildkit;
 pub mod doctor;
+pub mod registry;
 pub mod snapshot;
 pub mod task_image;
 

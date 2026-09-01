@@ -44,6 +44,12 @@ fails before Dockerfile execution. Multi-platform outputs use an explicit
 registry push or OCI layout because Docker `--load` cannot represent a manifest
 list. See [`docs/templates.md`](docs/templates.md).
 
+OCI registry distribution uses Docker credential helpers or password stdin,
+publishes content-addressed immutable tags plus optional aliases, and verifies
+complete multi-platform manifests on push and pull. See
+[`docs/registry.md`](docs/registry.md) for the security contract and configurable
+integration test.
+
 The versioned repository configuration and finite CLI override contract are
 documented in [`docs/config-v1.md`](docs/config-v1.md). A complete configuration
 is available as [`.repo-sandbox.yaml.example`](.repo-sandbox.yaml.example).
