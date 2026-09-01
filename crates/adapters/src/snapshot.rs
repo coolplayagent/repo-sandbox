@@ -593,9 +593,9 @@ impl AuthenticationContext {
             GitAuthentication::None => Ok(Self::default()),
             GitAuthentication::SshAgent { known_hosts } => {
                 require_ssh_repository(repository)?;
-                let command = ssh_command(None, known_hosts.as_deref(), temporary_root)?;
+                let environment = ssh_environment(None, known_hosts.as_deref(), temporary_root)?;
                 Ok(Self {
-                    environment: vec![("GIT_SSH_COMMAND".into(), command.into())],
+                    environment,
                     secrets: Vec::new(),
                 })
             }
@@ -605,10 +605,10 @@ impl AuthenticationContext {
             } => {
                 require_ssh_repository(repository)?;
                 require_regular_file(private_key, "SSH private key")?;
-                let command =
-                    ssh_command(Some(private_key), known_hosts.as_deref(), temporary_root)?;
+                let environment =
+                    ssh_environment(Some(private_key), known_hosts.as_deref(), temporary_root)?;
                 Ok(Self {
-                    environment: vec![("GIT_SSH_COMMAND".into(), command.into())],
+                    environment,
                     secrets: Vec::new(),
                 })
             }
@@ -621,17 +621,23 @@ impl AuthenticationContext {
                     ));
                 }
                 let token = resolve_secret(token)?;
+                if token.contains(['\r', '\n']) {
+                    return Err(SnapshotError::Authentication(
+                        "external HTTPS token must be a single line".into(),
+                    ));
+                }
                 let askpass = write_askpass(temporary_root)?;
                 Ok(Self {
                     environment: vec![
                         ("GIT_ASKPASS".into(), askpass.into_os_string()),
-                        ("REPO_SANDBOX_GIT_USERNAME".into(), username.into()),
                         ("REPO_SANDBOX_GIT_TOKEN".into(), token.as_str().into()),
                         // A short-lived token must never be approved into a configured
                         // persistent helper.
-                        ("GIT_CONFIG_COUNT".into(), "1".into()),
+                        ("GIT_CONFIG_COUNT".into(), "2".into()),
                         ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
                         ("GIT_CONFIG_VALUE_0".into(), "".into()),
+                        ("GIT_CONFIG_KEY_1".into(), "credential.username".into()),
+                        ("GIT_CONFIG_VALUE_1".into(), username.into()),
                     ],
                     secrets: vec![token],
                 })
@@ -709,11 +715,11 @@ fn resolve_secret(reference: &ExternalSecret) -> Result<String, SnapshotError> {
     }
 }
 
-fn ssh_command(
+fn ssh_environment(
     private_key: Option<&Path>,
     known_hosts: Option<&Path>,
     temporary_root: &Path,
-) -> Result<String, SnapshotError> {
+) -> Result<Vec<(OsString, OsString)>, SnapshotError> {
     if let Some(path) = known_hosts {
         require_regular_file(path, "known_hosts")?;
     }
@@ -733,7 +739,20 @@ fn ssh_command(
     }
     fs::write(&config, contents).map_err(io_error("write temporary SSH configuration"))?;
     restrict_file(&config)?;
-    Ok(format!("ssh -F \"{}\"", ssh_config_path(&config)?))
+    // Git asks a shell to parse GIT_SSH_COMMAND. Keep its text constant: the
+    // untrusted path is expanded from the environment inside double quotes,
+    // and expansion results are not parsed again as shell syntax.
+    Ok(vec![
+        (
+            "GIT_SSH_COMMAND".into(),
+            "ssh -F \"$REPO_SANDBOX_SSH_CONFIG\"".into(),
+        ),
+        (
+            "REPO_SANDBOX_SSH_CONFIG".into(),
+            ssh_config_path(&config)?.into(),
+        ),
+        ("GIT_SSH_VARIANT".into(), "ssh".into()),
+    ])
 }
 
 fn ssh_config_path(path: &Path) -> Result<String, SnapshotError> {
@@ -752,7 +771,7 @@ fn write_askpass(root: &Path) -> Result<PathBuf, SnapshotError> {
     let path = root.join("git-askpass");
     fs::write(
         &path,
-        "#!/bin/sh\ncase \"$1\" in\n  *Username*) printf '%s\\n' \"$REPO_SANDBOX_GIT_USERNAME\" ;;\n  *) printf '%s\\n' \"$REPO_SANDBOX_GIT_TOKEN\" ;;\nesac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$REPO_SANDBOX_GIT_TOKEN\"\n",
     )
     .map_err(io_error("write temporary Git askpass helper"))?;
     restrict_file(&path)?;
@@ -764,7 +783,7 @@ fn write_askpass(root: &Path) -> Result<PathBuf, SnapshotError> {
     let path = root.join("git-askpass.cmd");
     fs::write(
         &path,
-        "@echo off\r\necho %1 | findstr /I Username >nul\r\nif not errorlevel 1 (echo %REPO_SANDBOX_GIT_USERNAME%) else (echo %REPO_SANDBOX_GIT_TOKEN%)\r\n",
+        "@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[Console]::Out.WriteLine([Environment]::GetEnvironmentVariable('REPO_SANDBOX_GIT_TOKEN'))\"\r\n",
     )
     .map_err(io_error("write temporary Git askpass helper"))?;
     restrict_file(&path)?;
@@ -1301,7 +1320,8 @@ mod tests {
     fn https_token_uses_an_ephemeral_helper_without_persisting_the_secret() {
         let root = tempfile::tempdir().unwrap();
         let secret_file = root.path().join("token");
-        fs::write(&secret_file, "super-secret-token\n").unwrap();
+        let token = "super-secret-token& echo owned>unexpected-side-effect &|<>%^$()`";
+        fs::write(&secret_file, format!("{token}\n")).unwrap();
         let context = AuthenticationContext::prepare(
             &GitAuthentication::HttpsToken {
                 username: "git-user".into(),
@@ -1318,11 +1338,7 @@ mod tests {
             .find(|(key, _)| key == "GIT_ASKPASS")
             .map(|(_, value)| PathBuf::from(value))
             .unwrap();
-        assert!(
-            !fs::read_to_string(&askpass)
-                .unwrap()
-                .contains("super-secret-token")
-        );
+        assert!(!fs::read_to_string(&askpass).unwrap().contains(token));
         assert!(
             context
                 .environment
@@ -1333,6 +1349,7 @@ mod tests {
         #[cfg(unix)]
         let output = Command::new(&askpass)
             .arg("Password for remote")
+            .current_dir(root.path())
             .envs(context.environment.iter().map(|(key, value)| (key, value)))
             .output()
             .unwrap();
@@ -1341,20 +1358,19 @@ mod tests {
             .arg("/c")
             .arg(&askpass)
             .arg("Password for remote")
+            .current_dir(root.path())
             .envs(context.environment.iter().map(|(key, value)| (key, value)))
             .output()
             .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            "super-secret-token"
-        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), token);
+        assert!(!root.path().join("unexpected-side-effect").exists());
     }
 
     #[test]
     fn ssh_configuration_is_strict_and_references_the_key() {
         let root = tempfile::tempdir().unwrap();
-        let key = root.path().join("id test");
-        let hosts = root.path().join("known hosts");
+        let key = root.path().join("id # test");
+        let hosts = root.path().join("known # hosts");
         fs::write(&key, "fake-key-not-a-secret").unwrap();
         fs::write(&hosts, "example.test ssh-ed25519 fake").unwrap();
         let context = AuthenticationContext::prepare(
@@ -1366,12 +1382,72 @@ mod tests {
             "git@example.test:org/repo.git",
         )
         .unwrap();
-        let command = context.environment[0].1.to_string_lossy();
+        let command = context
+            .environment
+            .iter()
+            .find(|(key, _)| key == "GIT_SSH_COMMAND")
+            .unwrap()
+            .1
+            .to_string_lossy();
         assert!(!command.contains("fake-key-not-a-secret"));
+        assert!(!command.contains(root.path().to_string_lossy().as_ref()));
         let config = fs::read_to_string(root.path().join("ssh-config")).unwrap();
         assert!(config.contains("StrictHostKeyChecking yes"));
         assert!(config.contains("IdentitiesOnly yes"));
         assert!(config.contains("UserKnownHostsFile"));
+        assert!(config.contains("IdentityFile \""));
+        assert!(config.contains("id # test\""));
+        assert!(config.contains("known # hosts\""));
+
+        let output = Command::new("ssh")
+            .args(["-G", "-F"])
+            .arg(root.path().join("ssh-config"))
+            .arg("example.test")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("id # test"));
+    }
+
+    #[test]
+    fn shell_metacharacters_in_temporary_parent_never_enter_ssh_command_syntax() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base
+            .path()
+            .join("ssh $(touch injected) `touch injected-too` # & space");
+        fs::create_dir(&parent).unwrap();
+        let context = AuthenticationContext::prepare(
+            &GitAuthentication::SshAgent { known_hosts: None },
+            &parent,
+            "git@example.test:org/repo.git",
+        )
+        .unwrap();
+        let command = context
+            .environment
+            .iter()
+            .find(|(key, _)| key == "GIT_SSH_COMMAND")
+            .unwrap()
+            .1
+            .to_string_lossy();
+        assert_eq!(command, "ssh -F \"$REPO_SANDBOX_SSH_CONFIG\"");
+        assert!(!command.contains(parent.to_string_lossy().as_ref()));
+        let config = parent.join("ssh-config");
+        let mut file = fs::OpenOptions::new().append(true).open(config).unwrap();
+        file.write_all(b"Host example.test\n  HostName 127.0.0.1\n  Port 1\n  ConnectTimeout 1\n")
+            .unwrap();
+
+        // Exercise Git's real SSH command boundary. The local refusal is
+        // expected; the assertion is that parsing never executes path text.
+        let output = Command::new("git")
+            .args(["ls-remote", "git@example.test:org/repo.git"])
+            .current_dir(base.path())
+            .envs(context.environment.iter().map(|(key, value)| (key, value)))
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!base.path().join("injected").exists());
+        assert!(!base.path().join("injected-too").exists());
     }
 
     #[test]
