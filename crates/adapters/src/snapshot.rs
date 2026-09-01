@@ -61,7 +61,13 @@ impl GitSnapshotter {
                     ));
                 }
                 ensure_git_root(&root)?;
-                let files = collect_repository(&root, &root, Path::new(""), options)?;
+                let files = collect_repository(
+                    &root,
+                    &root,
+                    Path::new(""),
+                    options,
+                    ModePolicy::LocalWorktree,
+                )?;
                 (
                     SnapshotOrigin::Local {
                         canonical_root: root,
@@ -113,7 +119,13 @@ impl GitSnapshotter {
                 }
                 let clone =
                     fs::canonicalize(&clone).map_err(io_error("resolve cloned worktree"))?;
-                let files = collect_repository(&clone, &clone, Path::new(""), options)?;
+                let files = collect_repository(
+                    &clone,
+                    &clone,
+                    Path::new(""),
+                    options,
+                    ModePolicy::CommittedCheckout,
+                )?;
                 (
                     SnapshotOrigin::RemoteGit {
                         repository: redact_repository(repository),
@@ -165,6 +177,20 @@ struct SourceFile {
     mode: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ModePolicy {
+    /// Reflect unstaged chmod changes where the host filesystem represents them.
+    LocalWorktree,
+    /// Use the selected commit's index mode, independent of checkout behavior.
+    CommittedCheckout,
+}
+
+#[derive(Debug)]
+struct IndexEntry {
+    mode: u32,
+    object_id: String,
+}
+
 fn ensure_git_root(root: &Path) -> Result<(), SnapshotError> {
     let output = git_output(
         root,
@@ -197,6 +223,7 @@ fn collect_repository(
     repository_root: &Path,
     prefix: &Path,
     options: SnapshotOptions,
+    mode_policy: ModePolicy,
 ) -> Result<Vec<SourceFile>, SnapshotError> {
     let output = git_output(
         repository_root,
@@ -223,30 +250,23 @@ fn collect_repository(
         if relative.components().any(|part| part.as_os_str() == ".git") {
             continue;
         }
-        let source = repository_root.join(&relative);
-        let metadata = match fs::symlink_metadata(&source) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(io_error("inspect source file")(error)),
-        };
-        if metadata.file_type().is_symlink() {
+        let index_entry = index_entry(repository_root, &relative)?;
+        if index_entry
+            .as_ref()
+            .is_some_and(|entry| entry.mode == 0o120000)
+        {
             return Err(SnapshotError::Unsupported(format!(
                 "symbolic links are not supported in v1: {}",
                 display_safe_path(&prefix.join(&relative))
             )));
         }
-        if metadata.is_dir() {
-            let Some(object_id) = gitlink_object(repository_root, &relative)? else {
-                return Err(SnapshotError::Unsupported(format!(
-                    "tracked directory is not a Git submodule: {}",
-                    display_safe_path(&prefix.join(&relative))
-                )));
-            };
+        let source = repository_root.join(&relative);
+        if let Some(entry) = index_entry.as_ref().filter(|entry| entry.mode == 0o160000) {
             files.push(SourceFile {
                 relative: normalized_path(&prefix.join(&relative))?,
                 source: None,
-                virtual_content: Some(object_id.into_bytes()),
-                mode: 0o160000,
+                virtual_content: Some(entry.object_id.as_bytes().to_vec()),
+                mode: entry.mode,
             });
             if options.recurse_submodules {
                 ensure_git_root(&source).map_err(|_| {
@@ -260,9 +280,27 @@ fn collect_repository(
                     &source,
                     &prefix.join(&relative),
                     options,
+                    mode_policy,
                 )?);
             }
             continue;
+        }
+        let metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error("inspect source file")(error)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(SnapshotError::Unsupported(format!(
+                "symbolic links are not supported in v1: {}",
+                display_safe_path(&prefix.join(&relative))
+            )));
+        }
+        if metadata.is_dir() {
+            return Err(SnapshotError::Unsupported(format!(
+                "directories emitted as files are not supported: {}",
+                display_safe_path(&prefix.join(&relative))
+            )));
         }
         if !metadata.is_file() {
             return Err(SnapshotError::Unsupported(format!(
@@ -286,8 +324,7 @@ fn collect_repository(
             relative: manifest_path,
             source: Some(canonical),
             virtual_content: None,
-            mode: indexed_mode(repository_root, &relative)?
-                .unwrap_or_else(|| regular_mode(&metadata)),
+            mode: snapshot_file_mode(mode_policy, index_entry.as_ref(), &metadata),
         });
     }
     Ok(files)
@@ -343,6 +380,33 @@ fn regular_mode(metadata: &fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn regular_mode(_metadata: &fs::Metadata) -> u32 {
     0o100644
+}
+
+#[cfg(unix)]
+fn snapshot_file_mode(
+    policy: ModePolicy,
+    index_entry: Option<&IndexEntry>,
+    metadata: &fs::Metadata,
+) -> u32 {
+    match policy {
+        ModePolicy::LocalWorktree => regular_mode(metadata),
+        ModePolicy::CommittedCheckout => index_entry
+            .map(|entry| entry.mode)
+            .unwrap_or_else(|| regular_mode(metadata)),
+    }
+}
+
+#[cfg(not(unix))]
+fn snapshot_file_mode(
+    _policy: ModePolicy,
+    index_entry: Option<&IndexEntry>,
+    metadata: &fs::Metadata,
+) -> u32 {
+    // Windows has no portable executable bit. Git's index is the authoritative
+    // representation for tracked files; untracked files use the regular default.
+    index_entry
+        .map(|entry| entry.mode)
+        .unwrap_or_else(|| regular_mode(metadata))
 }
 
 fn reject_lfs(files: &[SourceFile]) -> Result<(), SnapshotError> {
@@ -418,7 +482,7 @@ fn copy_and_digest(
     ))
 }
 
-fn indexed_mode(repository: &Path, relative: &Path) -> Result<Option<u32>, SnapshotError> {
+fn index_entry(repository: &Path, relative: &Path) -> Result<Option<IndexEntry>, SnapshotError> {
     let output = git_output(
         repository,
         [
@@ -429,51 +493,30 @@ fn indexed_mode(repository: &Path, relative: &Path) -> Result<Option<u32>, Snaps
         ],
         "inspect source file mode",
     )?;
-    let Some(mode) = output
-        .stdout
-        .split(|byte| byte.is_ascii_whitespace())
-        .next()
-    else {
-        return Ok(None);
-    };
-    if mode.is_empty() {
+    if output.stdout.is_empty() {
         return Ok(None);
     }
-    let mode = std::str::from_utf8(mode)
-        .ok()
-        .and_then(|value| u32::from_str_radix(value, 8).ok())
-        .ok_or_else(|| SnapshotError::Git("Git returned an invalid file mode".into()))?;
-    Ok(Some(mode))
-}
-
-fn gitlink_object(repository: &Path, relative: &Path) -> Result<Option<String>, SnapshotError> {
-    let output = git_output(
-        repository,
-        [
-            OsString::from("ls-files"),
-            OsString::from("--stage"),
-            OsString::from("--"),
-            relative.as_os_str().to_owned(),
-        ],
-        "inspect Git submodule entry",
-    )?;
     let text = std::str::from_utf8(&output.stdout)
         .map_err(|_| SnapshotError::Git("Git returned non-UTF-8 index data".into()))?;
     let mut fields = text.split_ascii_whitespace();
-    if fields.next() != Some("160000") {
-        return Ok(None);
-    }
+    let mode = fields
+        .next()
+        .and_then(|value| u32::from_str_radix(value, 8).ok())
+        .ok_or_else(|| SnapshotError::Git("Git returned an invalid file mode".into()))?;
     let object = fields
         .next()
-        .ok_or_else(|| SnapshotError::Git("Git omitted a submodule object id".into()))?;
+        .ok_or_else(|| SnapshotError::Git("Git omitted an index object id".into()))?;
     if !(object.len() == 40 || object.len() == 64)
         || !object.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(SnapshotError::Git(
-            "Git returned an invalid submodule object id".into(),
+            "Git returned an invalid object id".into(),
         ));
     }
-    Ok(Some(object.to_ascii_lowercase()))
+    Ok(Some(IndexEntry {
+        mode,
+        object_id: object.to_ascii_lowercase(),
+    }))
 }
 
 #[cfg(unix)]
@@ -617,6 +660,17 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
     fn repository() -> TempDir {
         let directory = tempfile::tempdir().unwrap();
         run_git(directory.path(), &["init", "-q"]);
@@ -660,6 +714,99 @@ mod tests {
         .unwrap();
         let path_changed = create_local(repo.path());
         assert_ne!(content_changed.snapshot.id, path_changed.snapshot.id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unstaged_local_executable_mode_changes_identity_but_remote_commit_stays_stable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = repository();
+        let branch = git_stdout(repo.path(), &["branch", "--show-current"]);
+        let remote_spec = SourceSpec::RemoteGit {
+            repository: repo.path().to_string_lossy().into_owned(),
+            git_ref: branch,
+        };
+        let local_before = create_local(repo.path());
+        let remote_before = GitSnapshotter::default()
+            .create(&remote_spec, SnapshotOptions::default())
+            .unwrap();
+
+        let tracked = repo.path().join("tracked.txt");
+        fs::set_permissions(&tracked, fs::Permissions::from_mode(0o755)).unwrap();
+        let local_after = create_local(repo.path());
+        let remote_after = GitSnapshotter::default()
+            .create(&remote_spec, SnapshotOptions::default())
+            .unwrap();
+
+        assert_ne!(local_before.snapshot.id, local_after.snapshot.id);
+        assert_eq!(remote_before.snapshot.id, remote_after.snapshot.id);
+    }
+
+    #[test]
+    fn index_symlink_is_rejected_even_when_the_worktree_entry_is_a_regular_file() {
+        let repo = repository();
+        let link = repo.path().join("link");
+        fs::write(&link, "tracked.txt").unwrap();
+        let object = git_stdout(repo.path(), &["hash-object", "-w", "link"]);
+        run_git(
+            repo.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "120000",
+                &object,
+                "link",
+            ],
+        );
+
+        let error = GitSnapshotter::default()
+            .create(
+                &SourceSpec::LocalDirectory(repo.path().to_owned()),
+                SnapshotOptions::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SnapshotError::Unsupported(_)));
+        assert!(error.to_string().contains("symbolic links"));
+    }
+
+    #[test]
+    fn non_recursive_missing_submodule_gitlink_still_changes_identity() {
+        let repo = repository();
+        let first_commit = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+        fs::write(repo.path().join("tracked.txt"), "second\n").unwrap();
+        run_git(repo.path(), &["commit", "-qam", "second"]);
+        let second_commit = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+        assert!(!repo.path().join("deps/child").exists());
+
+        run_git(
+            repo.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &first_commit,
+                "deps/child",
+            ],
+        );
+        let first = create_local(repo.path());
+        assert!(!first.path().join("deps/child").exists());
+
+        run_git(
+            repo.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &second_commit,
+                "deps/child",
+            ],
+        );
+        let second = create_local(repo.path());
+        assert_ne!(first.snapshot.id, second.snapshot.id);
     }
 
     #[test]
