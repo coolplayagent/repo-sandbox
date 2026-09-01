@@ -65,9 +65,9 @@ for architecture in amd64 arm64; do
 
   source_digest=$(tar -C "$temporary/context/source" --sort=name --mtime='UTC 1970-01-01' \
     --owner=0 --group=0 --numeric-owner -cf - . | sha256sum | awk '{print "sha256:"$1}')
-  docker buildx build "${builder_args[@]}" --platform "$platform" --target task \
+  docker build --platform "$platform" --target task \
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
-    --progress plain --load --tag "$task" -f "$temporary/context/Dockerfile.task" "$temporary/context"
+    --progress plain --tag "$task" -f "$temporary/context/Dockerfile.task" "$temporary/context"
   environment_before_source_change=$(docker image inspect "$environment" --format '{{.Id}}')
   original_task_identity=$(docker image inspect "$task" --format '{{.Id}}')
 
@@ -77,9 +77,9 @@ for architecture in amd64 arm64; do
   changed_digest=$(tar -C "$temporary/context/source" --sort=name --mtime='UTC 1970-01-01' \
     --owner=0 --group=0 --numeric-owner -cf - . | sha256sum | awk '{print "sha256:"$1}')
   task_log="$temporary/task-$architecture-source-change.log"
-  docker buildx build "${builder_args[@]}" --platform "$platform" --target task \
+  docker build --platform "$platform" --target task \
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$changed_digest" \
-    --progress plain --load --tag "$task" -f "$temporary/context/Dockerfile.task" \
+    --progress plain --tag "$task" -f "$temporary/context/Dockerfile.task" \
     "$temporary/context" 2>&1 | tee "$task_log"
   environment_after_source_change=$(docker image inspect "$environment" --format '{{.Id}}')
   changed_task_identity=$(docker image inspect "$task" --format '{{.Id}}')
@@ -91,9 +91,9 @@ for architecture in amd64 arm64; do
   # Restore the exact original source and rebuild the final task. From here on,
   # task and baseline contain byte-identical business input and digest labels.
   cp "$temporary/main.rs.original" "$temporary/context/source/src/main.rs"
-  docker buildx build "${builder_args[@]}" --platform "$platform" --target task \
+  docker build --platform "$platform" --target task \
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
-    --progress plain --load --tag "$task" -f "$temporary/context/Dockerfile.task" "$temporary/context"
+    --progress plain --tag "$task" -f "$temporary/context/Dockerfile.task" "$temporary/context"
   labels=$(docker image inspect "$task" --format '{{json .Config.Labels}}')
   restored_task_identity=$(docker image inspect "$task" --format '{{.Id}}')
   test "$restored_task_identity" = "$original_task_identity"
