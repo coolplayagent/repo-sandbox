@@ -75,3 +75,7 @@ resolution for Bzlmod's crate_universe. Cargo is not a supported build entrypoin
 
 The supported EulerOS 2.10.7 x86_64 WSL2 bootstrap and its explicit platform
 boundary are documented in [`docs/euleros-wsl2.md`](docs/euleros-wsl2.md).
+
+Capability-driven deployment to native amd64/arm64 EulerOS/HCE-compatible yum
+VMs, including strict SSH triggering and the real two-VM acceptance contract,
+is documented in [`docs/euleros-hce-vm.md`](docs/euleros-hce-vm.md).
