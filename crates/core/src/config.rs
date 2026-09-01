@@ -105,6 +105,7 @@ pub struct CliOverrides {
     pub push: bool,
     pub report: Option<PathBuf>,
     pub keep_on_failure: bool,
+    pub recurse_submodules: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,6 +116,7 @@ pub struct ExecutionRequest {
     pub push: bool,
     pub report: Option<PathBuf>,
     pub keep_on_failure: bool,
+    pub recurse_submodules: bool,
 }
 
 impl ExecutionRequest {
@@ -128,6 +130,7 @@ impl ExecutionRequest {
             push: cli.push,
             report: cli.report,
             keep_on_failure: cli.keep_on_failure,
+            recurse_submodules: cli.recurse_submodules,
         }
     }
 }

@@ -60,6 +60,9 @@ pub struct RuntimeArgs {
     /// Preserve a failed sandbox for diagnosis.
     #[arg(long)]
     pub keep_on_failure: bool,
+    /// Recursively materialize Git submodules in the source snapshot.
+    #[arg(long)]
+    pub recurse_submodules: bool,
 }
 
 impl From<RuntimeArgs> for CliOverrides {
@@ -71,6 +74,7 @@ impl From<RuntimeArgs> for CliOverrides {
             push: value.push,
             report: value.report,
             keep_on_failure: value.keep_on_failure,
+            recurse_submodules: value.recurse_submodules,
         }
     }
 }
@@ -352,6 +356,7 @@ mod tests {
             "--report-path",
             "out/report.json",
             "--keep-on-failure",
+            "--recurse-submodules",
         ])
         .unwrap();
         let Commands::Plan(args) = cli.command.unwrap() else {
@@ -367,6 +372,7 @@ mod tests {
         assert!(overrides.push);
         assert_eq!(overrides.report, Some(PathBuf::from("out/report.json")));
         assert!(overrides.keep_on_failure);
+        assert!(overrides.recurse_submodules);
     }
 
     #[test]

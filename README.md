@@ -34,5 +34,12 @@ The versioned repository configuration and finite CLI override contract are
 documented in [`docs/config-v1.md`](docs/config-v1.md). A complete configuration
 is available as [`.repo-sandbox.yaml.example`](.repo-sandbox.yaml.example).
 
+Source inputs are materialized into private temporary directories. Local Git
+worktrees include tracked files plus untracked files accepted by Git's ignore
+rules; remote refs are resolved to a full commit object ID before checkout. The
+snapshot identity hashes normalized paths, Git-compatible file modes, and file
+contents. Git metadata is never copied, recursive submodules are opt-in, and Git
+LFS sources are rejected in v1.
+
 `Cargo.toml` and `Cargo.lock` describe Rust packages and third-party dependency
 resolution for Bzlmod's crate_universe. Cargo is not a supported build entrypoint.
