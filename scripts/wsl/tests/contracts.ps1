@@ -23,6 +23,12 @@ Assert-Match $installer 'systemctl is-active.+\|\| systemctl start' 'Docker star
 Assert-Match $installer 'rpm -q qemu-user-static' 'QEMU installation must be state-aware'
 Assert-Match $smoke '--platform linux/amd64' 'acceptance must exercise native amd64'
 Assert-Match $smoke '--platform linux/arm64' 'acceptance must exercise emulated arm64'
+Assert-Match $smoke '(?s)amd64\).+uname -m.+x86_64.+arm64\).+uname -m.+aarch64' 'Dockerfile must map each target architecture to its correct kernel architecture'
+Assert-Match $smoke '(?s)docker run.+--platform linux/amd64.+uname -m.+x86_64' 'runtime smoke must assert amd64 is x86_64'
+Assert-Match $smoke '(?s)docker run.+--platform linux/arm64.+uname -m.+aarch64' 'runtime smoke must assert arm64 is aarch64'
+Assert-Match $smoke 'io\.repo-sandbox\.smoke\.issue-14' 'temporary images must carry a smoke ownership label'
+Assert-Match $smoke 'if \[\[ \$owner == "\$run_id" \]\]' 'cleanup must verify image ownership before removal'
+Assert-Match $smoke 'docker image rm -- "\$tag"' 'cleanup must remove only an exact generated tag'
 if ($installer -match '(?m)^\s*(curl|wget).+\|\s*(sh|bash)') { throw 'pipe-to-shell downloads are forbidden' }
 if ($installer -match 'daemon\.json') { throw 'installer must not overwrite Docker daemon configuration' }
 
