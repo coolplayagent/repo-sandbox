@@ -6,3 +6,5 @@ edition = "2024"
 [[bin]]
 name = "multistage-smoke"
 path = "src/main.rs"
+
+[workspace]
