@@ -1,9 +1,10 @@
 use repo_sandbox_core::snapshot::{
-    CleanupPolicy, CommitSha, SnapshotError, SnapshotId, SnapshotOptions, SnapshotOrigin,
-    SourceSnapshot, SourceSpec,
+    CleanupPolicy, CommitSha, ExternalSecret, GitAuthentication, SnapshotError, SnapshotId,
+    SnapshotOptions, SnapshotOrigin, SourceSnapshot, SourceSpec,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -33,13 +34,20 @@ impl MaterializedSnapshot {
 #[derive(Clone, Debug, Default)]
 pub struct GitSnapshotter {
     temporary_parent: Option<PathBuf>,
+    authentication: GitAuthentication,
 }
 
 impl GitSnapshotter {
     pub fn in_temporary_parent(parent: PathBuf) -> Self {
         Self {
             temporary_parent: Some(parent),
+            authentication: GitAuthentication::None,
         }
+    }
+
+    pub fn with_authentication(mut self, authentication: GitAuthentication) -> Self {
+        self.authentication = authentication;
+        self
     }
 
     pub fn create(
@@ -83,7 +91,12 @@ impl GitSnapshotter {
                 // Clone into a different directory than the final copy. This lets
                 // the final tree omit all Git and submodule administrative data.
                 let clone = staging.path().join("clone");
-                git(
+                let authentication = AuthenticationContext::prepare(
+                    &self.authentication,
+                    staging.path(),
+                    repository,
+                )?;
+                git_remote(
                     staging.path(),
                     [
                         OsString::from("clone"),
@@ -93,6 +106,7 @@ impl GitSnapshotter {
                         clone.as_os_str().to_owned(),
                     ],
                     "clone remote repository",
+                    &authentication,
                 )?;
                 let commit = resolve_commit(&clone, git_ref)?;
                 git(
@@ -106,7 +120,7 @@ impl GitSnapshotter {
                     "checkout resolved commit",
                 )?;
                 if options.recurse_submodules {
-                    git(
+                    git_remote(
                         &clone,
                         [
                             OsString::from("submodule"),
@@ -115,6 +129,7 @@ impl GitSnapshotter {
                             OsString::from("--recursive"),
                         ],
                         "initialize recursive submodules",
+                        &authentication,
                     )?;
                 }
                 let clone =
@@ -562,6 +577,233 @@ fn resolve_commit(repository: &Path, requested: &str) -> Result<CommitSha, Snaps
     ))
 }
 
+#[derive(Default)]
+struct AuthenticationContext {
+    environment: Vec<(OsString, OsString)>,
+    secrets: Vec<String>,
+}
+
+impl AuthenticationContext {
+    fn prepare(
+        authentication: &GitAuthentication,
+        temporary_root: &Path,
+        repository: &str,
+    ) -> Result<Self, SnapshotError> {
+        match authentication {
+            GitAuthentication::None => Ok(Self::default()),
+            GitAuthentication::SshAgent { known_hosts } => {
+                require_ssh_repository(repository)?;
+                let environment = ssh_environment(None, known_hosts.as_deref(), temporary_root)?;
+                Ok(Self {
+                    environment,
+                    secrets: Vec::new(),
+                })
+            }
+            GitAuthentication::SshKey {
+                private_key,
+                known_hosts,
+            } => {
+                require_ssh_repository(repository)?;
+                require_regular_file(private_key, "SSH private key")?;
+                let environment =
+                    ssh_environment(Some(private_key), known_hosts.as_deref(), temporary_root)?;
+                Ok(Self {
+                    environment,
+                    secrets: Vec::new(),
+                })
+            }
+            GitAuthentication::HttpsToken { username, token } => {
+                require_https_repository(repository)?;
+                if username.is_empty() || username.chars().any(char::is_control) {
+                    return Err(SnapshotError::InvalidInput(
+                        "HTTPS token username must not be empty or contain control characters"
+                            .into(),
+                    ));
+                }
+                let token = resolve_secret(token)?;
+                if token.contains(['\r', '\n']) {
+                    return Err(SnapshotError::Authentication(
+                        "external HTTPS token must be a single line".into(),
+                    ));
+                }
+                let askpass = write_askpass(temporary_root)?;
+                Ok(Self {
+                    environment: vec![
+                        ("GIT_ASKPASS".into(), askpass.into_os_string()),
+                        ("REPO_SANDBOX_GIT_TOKEN".into(), token.as_str().into()),
+                        // A short-lived token must never be approved into a configured
+                        // persistent helper.
+                        ("GIT_CONFIG_COUNT".into(), "2".into()),
+                        ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
+                        ("GIT_CONFIG_VALUE_0".into(), "".into()),
+                        ("GIT_CONFIG_KEY_1".into(), "credential.username".into()),
+                        ("GIT_CONFIG_VALUE_1".into(), username.into()),
+                    ],
+                    secrets: vec![token],
+                })
+            }
+            GitAuthentication::HttpsCredentialHelper => {
+                require_https_repository(repository)?;
+                Ok(Self::default())
+            }
+        }
+    }
+}
+
+fn require_ssh_repository(repository: &str) -> Result<(), SnapshotError> {
+    if repository.starts_with("ssh://")
+        || (!repository.contains("://") && repository.contains('@') && repository.contains(':'))
+    {
+        Ok(())
+    } else {
+        Err(SnapshotError::InvalidInput(
+            "SSH authentication requires an ssh:// or user@host:path repository".into(),
+        ))
+    }
+}
+
+fn require_https_repository(repository: &str) -> Result<(), SnapshotError> {
+    if repository.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(SnapshotError::InvalidInput(
+            "HTTPS authentication requires an https:// repository".into(),
+        ))
+    }
+}
+
+fn require_regular_file(path: &Path, description: &str) -> Result<(), SnapshotError> {
+    if path.is_file() {
+        Ok(())
+    } else {
+        Err(SnapshotError::InvalidInput(format!(
+            "{description} reference is not a regular file"
+        )))
+    }
+}
+
+fn resolve_secret(reference: &ExternalSecret) -> Result<String, SnapshotError> {
+    let value = match reference {
+        ExternalSecret::Environment(name) => {
+            if name.is_empty() || name.chars().any(char::is_control) {
+                return Err(SnapshotError::InvalidInput(
+                    "secret environment reference is invalid".into(),
+                ));
+            }
+            env::var(name).map_err(|_| {
+                SnapshotError::Authentication(format!(
+                    "secret environment reference `{name}` is unavailable"
+                ))
+            })?
+        }
+        ExternalSecret::File(path) => {
+            require_regular_file(path, "secret file")?;
+            fs::read_to_string(path)
+                .map_err(|error| {
+                    SnapshotError::Authentication(format!("read secret file: {error}"))
+                })?
+                .trim_end_matches(['\r', '\n'])
+                .to_owned()
+        }
+    };
+    if value.is_empty() {
+        Err(SnapshotError::Authentication(
+            "external secret resolved to an empty value".into(),
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn ssh_environment(
+    private_key: Option<&Path>,
+    known_hosts: Option<&Path>,
+    temporary_root: &Path,
+) -> Result<Vec<(OsString, OsString)>, SnapshotError> {
+    if let Some(path) = known_hosts {
+        require_regular_file(path, "known_hosts")?;
+    }
+    let config = temporary_root.join("ssh-config");
+    let mut contents = String::from("Host *\n  BatchMode yes\n  StrictHostKeyChecking yes\n");
+    if let Some(path) = private_key {
+        contents.push_str(&format!(
+            "  IdentityFile \"{}\"\n  IdentitiesOnly yes\n",
+            ssh_config_path(path)?
+        ));
+    }
+    if let Some(path) = known_hosts {
+        contents.push_str(&format!(
+            "  UserKnownHostsFile \"{}\"\n",
+            ssh_config_path(path)?
+        ));
+    }
+    fs::write(&config, contents).map_err(io_error("write temporary SSH configuration"))?;
+    restrict_file(&config)?;
+    // Git asks a shell to parse GIT_SSH_COMMAND. Keep its text constant: the
+    // untrusted path is expanded from the environment inside double quotes,
+    // and expansion results are not parsed again as shell syntax.
+    Ok(vec![
+        (
+            "GIT_SSH_COMMAND".into(),
+            "ssh -F \"$REPO_SANDBOX_SSH_CONFIG\"".into(),
+        ),
+        (
+            "REPO_SANDBOX_SSH_CONFIG".into(),
+            ssh_config_path(&config)?.into(),
+        ),
+        ("GIT_SSH_VARIANT".into(), "ssh".into()),
+    ])
+}
+
+fn ssh_config_path(path: &Path) -> Result<String, SnapshotError> {
+    let value = path.to_string_lossy().replace('\\', "/");
+    if value.contains(['\r', '\n', '"']) {
+        Err(SnapshotError::InvalidInput(
+            "SSH file reference contains unsupported characters".into(),
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+#[cfg(unix)]
+fn write_askpass(root: &Path) -> Result<PathBuf, SnapshotError> {
+    let path = root.join("git-askpass");
+    fs::write(
+        &path,
+        "#!/bin/sh\nprintf '%s\\n' \"$REPO_SANDBOX_GIT_TOKEN\"\n",
+    )
+    .map_err(io_error("write temporary Git askpass helper"))?;
+    restrict_file(&path)?;
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn write_askpass(root: &Path) -> Result<PathBuf, SnapshotError> {
+    let path = root.join("git-askpass.cmd");
+    fs::write(
+        &path,
+        "@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[Console]::Out.WriteLine([Environment]::GetEnvironmentVariable('REPO_SANDBOX_GIT_TOKEN'))\"\r\n",
+    )
+    .map_err(io_error("write temporary Git askpass helper"))?;
+    restrict_file(&path)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn restrict_file(path: &Path) -> Result<(), SnapshotError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(io_error("restrict temporary credential helper permissions"))
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_path: &Path) -> Result<(), SnapshotError> {
+    // tempfile creates the containing directory for the current user. Windows
+    // inherits that directory's ACL; the file is never persisted beyond it.
+    Ok(())
+}
+
 fn validate_remote_input(repository: &str, git_ref: &str) -> Result<(), SnapshotError> {
     if repository.trim().is_empty() || repository.chars().any(char::is_control) {
         return Err(SnapshotError::InvalidInput(
@@ -572,6 +814,17 @@ fn validate_remote_input(repository: &str, git_ref: &str) -> Result<(), Snapshot
         return Err(SnapshotError::InvalidInput(
             "Git ref must not be empty or contain control characters".into(),
         ));
+    }
+    if repository.starts_with("http://") || repository.starts_with("https://") {
+        let authority = repository
+            .split_once("://")
+            .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+            .unwrap_or_default();
+        if authority.contains('@') {
+            return Err(SnapshotError::InvalidInput(
+                "HTTP repository URLs must not contain inline credentials".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -623,7 +876,95 @@ where
     git_output(cwd, arguments, operation).map(|_| ())
 }
 
+fn git_remote<I, S>(
+    cwd: &Path,
+    arguments: I,
+    operation: &str,
+    authentication: &AuthenticationContext,
+) -> Result<(), SnapshotError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = git_raw_with_environment(cwd, arguments, &authentication.environment)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(classify_remote_failure(
+            operation,
+            &output.stderr,
+            &authentication.secrets,
+        ))
+    }
+}
+
+fn classify_remote_failure(operation: &str, stderr: &[u8], secrets: &[String]) -> SnapshotError {
+    let mut detail = String::from_utf8_lossy(stderr).into_owned();
+    for secret in secrets {
+        detail = detail.replace(secret, "<redacted>");
+    }
+    let normalized = detail.to_ascii_lowercase();
+    let message = format!("{operation}; remote diagnostics were redacted");
+    if [
+        "authentication failed",
+        "invalid username or password",
+        "could not read username",
+        "error: 401",
+        "permission denied (publickey",
+        "no such identity",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    {
+        SnapshotError::Authentication(message)
+    } else if [
+        "repository not found",
+        "does not appear to be a git repository",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    {
+        SnapshotError::RepositoryNotFound(message)
+    } else if [
+        "access denied",
+        "permission denied",
+        "not allowed",
+        "not granted",
+        "error: 403",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    {
+        SnapshotError::PermissionDenied(message)
+    } else if [
+        "could not resolve host",
+        "failed to connect",
+        "connection timed out",
+        "network is unreachable",
+        "connection refused",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    {
+        SnapshotError::Network(message)
+    } else {
+        SnapshotError::Git(message)
+    }
+}
+
 fn git_raw<I, S>(cwd: &Path, arguments: I) -> Result<Output, SnapshotError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    git_raw_with_environment(cwd, arguments, &[])
+}
+
+fn git_raw_with_environment<I, S>(
+    cwd: &Path,
+    arguments: I,
+    environment: &[(OsString, OsString)],
+) -> Result<Output, SnapshotError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -633,6 +974,7 @@ where
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .envs(environment.iter().map(|(key, value)| (key, value)))
         .output()
         .map_err(|error| SnapshotError::Git(format!("could not execute Git: {error}")))
 }
@@ -972,5 +1314,168 @@ mod tests {
             redact_repository("https://person:token@example.test/org/repo.git"),
             "https://<redacted>@example.test/org/repo.git"
         );
+    }
+
+    #[test]
+    fn https_token_uses_an_ephemeral_helper_without_persisting_the_secret() {
+        let root = tempfile::tempdir().unwrap();
+        let secret_file = root.path().join("token");
+        let token = "super-secret-token& echo owned>unexpected-side-effect &|<>%^$()`";
+        fs::write(&secret_file, format!("{token}\n")).unwrap();
+        let context = AuthenticationContext::prepare(
+            &GitAuthentication::HttpsToken {
+                username: "git-user".into(),
+                token: ExternalSecret::File(secret_file),
+            },
+            root.path(),
+            "https://example.test/org/repo.git",
+        )
+        .unwrap();
+
+        let askpass = context
+            .environment
+            .iter()
+            .find(|(key, _)| key == "GIT_ASKPASS")
+            .map(|(_, value)| PathBuf::from(value))
+            .unwrap();
+        assert!(!fs::read_to_string(&askpass).unwrap().contains(token));
+        assert!(
+            context
+                .environment
+                .iter()
+                .any(|(key, value)| { key == "GIT_CONFIG_VALUE_0" && value.is_empty() })
+        );
+
+        #[cfg(unix)]
+        let output = Command::new(&askpass)
+            .arg("Password for remote")
+            .current_dir(root.path())
+            .envs(context.environment.iter().map(|(key, value)| (key, value)))
+            .output()
+            .unwrap();
+        #[cfg(windows)]
+        let output = Command::new("cmd")
+            .arg("/c")
+            .arg(&askpass)
+            .arg("Password for remote")
+            .current_dir(root.path())
+            .envs(context.environment.iter().map(|(key, value)| (key, value)))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), token);
+        assert!(!root.path().join("unexpected-side-effect").exists());
+    }
+
+    #[test]
+    fn ssh_configuration_is_strict_and_references_the_key() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("id # test");
+        let hosts = root.path().join("known # hosts");
+        fs::write(&key, "fake-key-not-a-secret").unwrap();
+        fs::write(&hosts, "example.test ssh-ed25519 fake").unwrap();
+        let context = AuthenticationContext::prepare(
+            &GitAuthentication::SshKey {
+                private_key: key,
+                known_hosts: Some(hosts),
+            },
+            root.path(),
+            "git@example.test:org/repo.git",
+        )
+        .unwrap();
+        let command = context
+            .environment
+            .iter()
+            .find(|(key, _)| key == "GIT_SSH_COMMAND")
+            .unwrap()
+            .1
+            .to_string_lossy();
+        assert!(!command.contains("fake-key-not-a-secret"));
+        assert!(!command.contains(root.path().to_string_lossy().as_ref()));
+        let config = fs::read_to_string(root.path().join("ssh-config")).unwrap();
+        assert!(config.contains("StrictHostKeyChecking yes"));
+        assert!(config.contains("IdentitiesOnly yes"));
+        assert!(config.contains("UserKnownHostsFile"));
+        assert!(config.contains("IdentityFile \""));
+        assert!(config.contains("id # test\""));
+        assert!(config.contains("known # hosts\""));
+
+        let output = Command::new("ssh")
+            .args(["-G", "-F"])
+            .arg(root.path().join("ssh-config"))
+            .arg("example.test")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("id # test"));
+    }
+
+    #[test]
+    fn shell_metacharacters_in_temporary_parent_never_enter_ssh_command_syntax() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base
+            .path()
+            .join("ssh $(touch injected) `touch injected-too` # & space");
+        fs::create_dir(&parent).unwrap();
+        let context = AuthenticationContext::prepare(
+            &GitAuthentication::SshAgent { known_hosts: None },
+            &parent,
+            "git@example.test:org/repo.git",
+        )
+        .unwrap();
+        let command = context
+            .environment
+            .iter()
+            .find(|(key, _)| key == "GIT_SSH_COMMAND")
+            .unwrap()
+            .1
+            .to_string_lossy();
+        assert_eq!(command, "ssh -F \"$REPO_SANDBOX_SSH_CONFIG\"");
+        assert!(!command.contains(parent.to_string_lossy().as_ref()));
+        let config = parent.join("ssh-config");
+        let mut file = fs::OpenOptions::new().append(true).open(config).unwrap();
+        file.write_all(b"Host example.test\n  HostName 127.0.0.1\n  Port 1\n  ConnectTimeout 1\n")
+            .unwrap();
+
+        // Exercise Git's real SSH command boundary. The local refusal is
+        // expected; the assertion is that parsing never executes path text.
+        let output = Command::new("git")
+            .args(["ls-remote", "git@example.test:org/repo.git"])
+            .current_dir(base.path())
+            .envs(context.environment.iter().map(|(key, value)| (key, value)))
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!base.path().join("injected").exists());
+        assert!(!base.path().join("injected-too").exists());
+    }
+
+    #[test]
+    fn remote_failures_have_stable_safe_categories() {
+        let cases = [
+            ("Authentication failed for token-123", "authentication"),
+            ("repository not found", "not-found"),
+            ("remote: access denied", "permission"),
+            ("fatal: could not resolve host", "network"),
+        ];
+        for (stderr, expected) in cases {
+            let error = classify_remote_failure("clone", stderr.as_bytes(), &["token-123".into()]);
+            assert!(!error.to_string().contains("token-123"));
+            assert!(matches!(
+                (expected, error),
+                ("authentication", SnapshotError::Authentication(_))
+                    | ("not-found", SnapshotError::RepositoryNotFound(_))
+                    | ("permission", SnapshotError::PermissionDenied(_))
+                    | ("network", SnapshotError::Network(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn inline_https_credentials_are_rejected() {
+        let error =
+            validate_remote_input("https://user:token@example.test/repo", "main").unwrap_err();
+        assert!(matches!(error, SnapshotError::InvalidInput(_)));
+        assert!(!error.to_string().contains("token"));
     }
 }

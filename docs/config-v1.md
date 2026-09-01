@@ -4,6 +4,34 @@ The repository configuration is explicit and versioned. v1 does not inspect
 language files or Dockerfiles to infer any of these values. See
 `.repo-sandbox.yaml.example` for a complete example.
 
+## Private Git authentication
+
+Git credentials are runtime inputs to the snapshot adapter and are deliberately
+not fields in `.repo-sandbox.yaml`. Callers may select one of these modes:
+
+- SSH agent, using the host's `SSH_AUTH_SOCK`;
+- an SSH private-key file reference;
+- an HTTPS short-lived token referenced by an environment variable or a
+  host-only file; or
+- the user's configured Git credential helper.
+
+SSH always runs with `BatchMode=yes` and `StrictHostKeyChecking=yes`. An optional
+`known_hosts` file can be referenced explicitly; otherwise OpenSSH's normal
+known-hosts files are used. Host-key enrollment is an operator step and is never
+performed automatically.
+
+Short-lived HTTPS tokens are passed only to a private temporary askpass helper.
+Configured credential helpers are disabled for that mode so the token cannot be
+stored. Credential-helper mode uses the user's existing Git configuration and
+disables terminal prompting. Inline credentials in HTTP(S) repository URLs are
+rejected. Temporary helpers and SSH configuration are removed on success and on
+failure; secret values are absent from command arguments, errors, snapshot
+metadata, and source contents.
+
+Remote failures are reported separately as authentication, network, repository
+not found, or permission denied. Raw remote diagnostics are not copied into
+errors because servers frequently echo URLs or credentials.
+
 ## Schema
 
 Every field shown in the example is required. Unknown fields are errors.
