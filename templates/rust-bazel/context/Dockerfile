@@ -43,6 +43,7 @@ RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,s
 FROM debian:bookworm-slim AS environment
 
 ARG TARGETARCH
+ARG RUST_VERSION=1.97.0
 # These are task-runtime dependencies. Downloader/build-only packages stay in
 # toolchain-build; apt indexes and archives live only in BuildKit cache mounts.
 RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,sharing=locked \
@@ -65,7 +66,13 @@ ENV CARGO_HOME=/usr/local/cargo \
 RUN --mount=type=cache,id=repo-sandbox-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=repo-sandbox-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=repo-sandbox-bazel-${TARGETARCH},target=/root/.cache/bazel,sharing=locked \
-    rustc --version && cargo --version && bazel --help >/dev/null
+    set -eu; \
+    rustup default "$RUST_VERSION"; \
+    ln -sf "$(rustup which --toolchain "$RUST_VERSION" rustc)" /usr/local/cargo/bin/rustc; \
+    ln -sf "$(rustup which --toolchain "$RUST_VERSION" rustdoc)" /usr/local/cargo/bin/rustdoc; \
+    rustc --version; \
+    cargo --version; \
+    bazel --help >/dev/null
 
 # These values are part of the final image configuration. BuildKit can reuse
 # unchanged installation layers, while a template, component, or parameter

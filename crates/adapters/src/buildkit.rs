@@ -1283,6 +1283,8 @@ mod tests {
         );
         assert!(!final_stage.contains("/run/secrets/github_token"));
         assert!(final_stage.contains("target=/root/.cache/bazel"));
+        assert!(final_stage.contains("rustup default \"$RUST_VERSION\""));
+        assert!(final_stage.contains("rustup which --toolchain \"$RUST_VERSION\" rustc"));
         assert!(!final_stage.contains("/toolchain-downloads"));
         assert!(!final_stage.contains("BAZELISK_HOME="));
 
