@@ -39,9 +39,13 @@ host daemon lacks overlay-on-XFS project quotas. It creates a task-unique sparse
 XFS filesystem mounted with `pquota`, starts a separate Docker daemon with an
 isolated data root, socket, exec root and bridge, and first proves that a
 `busybox:1.36` container can be created and run with
-`--storage-opt size=32M`. The job removes its exact Buildx builder, verifies the
+`--storage-opt size=32M`. BuildKit and disposable dogfood acceptance build
+stages that fetch public dependencies use the host network; final task
+containers and runner scenarios stay on the isolated bridge. The job removes
+its exact Buildx builder, verifies the
 daemon PID and command line before terminating it, unmounts the task filesystem,
-removes the task bridge and directory, and asserts those resources are gone.
+its exec-root network namespace and loop device, removes the task bridge and
+directory, and asserts those resources are gone.
 
 Failure cleanup is ownership-scoped. Images and containers use unique run IDs.
 The runner failure test checks the retained container's

@@ -13,6 +13,8 @@ cleanup() {
     "repo-sandbox-$run_id-environment-amd64" "repo-sandbox-$run_id-environment-arm64" \
     "repo-sandbox-$run_id-task-amd64" "repo-sandbox-$run_id-task-arm64" \
     "repo-sandbox-$run_id-baseline-amd64" "repo-sandbox-$run_id-baseline-arm64" \
+    "repo-sandbox-$run_id-acceptance-task-amd64" "repo-sandbox-$run_id-acceptance-task-arm64" \
+    "repo-sandbox-$run_id-acceptance-baseline-amd64" "repo-sandbox-$run_id-acceptance-baseline-arm64" \
     >/dev/null 2>&1 || true
   rm -rf "$temporary"
 }
@@ -55,6 +57,8 @@ for architecture in amd64 arm64; do
   environment="repo-sandbox-$run_id-environment-$architecture"
   task="repo-sandbox-$run_id-task-$architecture"
   baseline="repo-sandbox-$run_id-baseline-$architecture"
+  acceptance_task="repo-sandbox-$run_id-acceptance-task-$architecture"
+  acceptance_baseline="repo-sandbox-$run_id-acceptance-baseline-$architecture"
   cache_cold="$temporary/cache-$architecture-cold"
   cache_warm="$temporary/cache-$architecture-warm"
   cold_log="$temporary/environment-$architecture-cold.log"
@@ -129,10 +133,20 @@ for architecture in amd64 arm64; do
     --build-arg "SOURCE_DIGEST=$source_digest" --progress plain --load --tag "$baseline" \
     -f "$temporary/context/Dockerfile.single-stage" "$temporary/context"
 
-  for image in "$task" "$baseline"; do
-    docker run --rm --platform "$platform" "$image" cargo test --locked
-    docker run --rm --platform "$platform" "$image" bazel --batch build //:rust_binary
-  done
+  # Only these disposable build-stage checks receive host networking so Cargo
+  # and Bazel can fetch public dependencies. Final task containers retain the
+  # runner's isolated default network contract.
+  retry_external_build docker build --network host --provenance=false \
+    --platform "$platform" --target acceptance \
+    --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
+    --progress plain --tag "$acceptance_task" -f "$temporary/context/Dockerfile.task" \
+    "$temporary/context"
+  retry_external_build docker build --network host --provenance=false \
+    --platform "$platform" --target acceptance --build-arg "SOURCE_DIGEST=$source_digest" \
+    --progress plain --tag "$acceptance_baseline" \
+    -f "$temporary/context/Dockerfile.single-stage" "$temporary/context"
+  printf '%s build-stage acceptance network=host scope=public-dependency-download passed\n' \
+    "$architecture"
 
   history=$(docker history --no-trunc "$task")
   ! grep -Fq 'issue1-secret-marker-must-not-leak' <<<"$history"

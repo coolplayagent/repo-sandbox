@@ -137,6 +137,9 @@ stop() {
       ! kill -0 "$pid" 2>/dev/null
     fi
   fi
+  local netns_mount="$task_root/exec/netns/default"
+  mountpoint -q "$netns_mount" && umount "$netns_mount"
+  ! mountpoint -q "$netns_mount"
   mountpoint -q "$mountpoint" && umount "$mountpoint"
   if [[ -f $state/loop-device ]]; then
     local loop_device backing_file
