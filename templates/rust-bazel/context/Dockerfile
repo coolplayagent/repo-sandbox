@@ -7,8 +7,10 @@ FROM ${BASE_IMAGE} AS toolchain-build
 
 ARG TARGETARCH
 ARG BAZELISK_VERSION=1.27.0
+ARG BAZEL_VERSION=8.3.1
 RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,sharing=locked \
     --mount=type=cache,id=repo-sandbox-apt-lists-${TARGETARCH},target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,id=repo-sandbox-toolchain-downloads-${TARGETARCH},target=/toolchain-downloads,sharing=locked \
     --mount=type=secret,id=github_token,required=false \
     set -eu; \
     token_header=''; \
@@ -19,11 +21,22 @@ RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,s
     apt-get update; \
     apt-get install --yes --no-install-recommends ca-certificates curl; \
     mkdir -p /toolchain/bin; \
+    case "$TARGETARCH" in amd64) bazel_arch=x86_64 ;; arm64) bazel_arch=arm64 ;; *) exit 64 ;; esac; \
     if [ -n "$token_header" ]; then header_args="--header=$token_header"; else header_args=''; fi; \
-    curl --fail --location --show-error $header_args \
-      "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-${TARGETARCH}" \
-      --output /toolchain/bin/bazel; \
-    chmod 0755 /toolchain/bin/bazel; \
+    bazelisk_download="/toolchain-downloads/bazelisk-${BAZELISK_VERSION}-${TARGETARCH}"; \
+    bazel_download="/toolchain-downloads/bazel-${BAZEL_VERSION}-${bazel_arch}"; \
+    if [ ! -s "$bazelisk_download" ]; then \
+      curl --fail --location --show-error $header_args \
+        "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-${TARGETARCH}" \
+        --output "$bazelisk_download"; \
+    fi; \
+    if [ ! -s "$bazel_download" ]; then \
+      curl --fail --location --show-error $header_args \
+        "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-linux-${bazel_arch}" \
+        --output "$bazel_download"; \
+    fi; \
+    install -m 0755 "$bazel_download" /toolchain/bin/bazel; \
+    install -m 0755 "$bazelisk_download" /toolchain/bin/bazelisk; \
     rustc --version; \
     cargo --version
 
@@ -42,6 +55,7 @@ RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,s
 COPY --from=toolchain-build /usr/local/cargo/ /usr/local/cargo/
 COPY --from=toolchain-build /usr/local/rustup/ /usr/local/rustup/
 COPY --from=toolchain-build /toolchain/bin/bazel /usr/local/bin/bazel
+COPY --from=toolchain-build /toolchain/bin/bazelisk /usr/local/bin/bazelisk
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:${PATH}

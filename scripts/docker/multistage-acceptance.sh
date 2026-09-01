@@ -19,7 +19,18 @@ cleanup() {
 trap cleanup EXIT
 
 cp -R "$repo_root/tests/multistage/." "$temporary/context"
+cp "$temporary/context/source/src/main.rs" "$temporary/main.rs.original"
 printf '%s\n' 'issue1-secret-marker-must-not-leak' >"$temporary/github-token"
+
+assert_cached_step() {
+  local log=$1
+  local description=$2
+  awk -v description="$description" '
+    index($0, description) { step=$1 }
+    step != "" && $1 == step && $2 == "CACHED" { hit=1 }
+    END { exit !hit }
+  ' "$log"
+}
 
 printf '%-8s %15s %15s %15s %10s\n' platform compressed_single compressed_multi unpacked_multi reduction
 for architecture in amd64 arm64; do
@@ -36,18 +47,29 @@ for architecture in amd64 arm64; do
     --secret "id=github_token,src=$temporary/github-token" \
     --cache-to "type=local,dest=$cache_cold,mode=max" --progress plain --load \
     --tag "$environment" "$repo_root/templates/rust-bazel/context" 2>&1 | tee "$cold_log"
+  cold_environment_identity=$(docker image inspect "$environment" --format '{{.Id}}')
   docker buildx build "${builder_args[@]}" --platform "$platform" --target environment \
     --secret "id=github_token,src=$temporary/github-token" \
     --cache-from "type=local,src=$cache_cold" --cache-to "type=local,dest=$cache_warm,mode=max" \
     --progress plain --load --tag "$environment" \
     "$repo_root/templates/rust-bazel/context" 2>&1 | tee "$warm_log"
-  grep -q 'CACHED' "$warm_log"
+  warm_environment_identity=$(docker image inspect "$environment" --format '{{.Id}}')
+  test "$cold_environment_identity" = "$warm_environment_identity"
+  assert_cached_step "$warm_log" '[toolchain-build 2/2] RUN'
+  assert_cached_step "$warm_log" '[environment 2/7] RUN'
+  assert_cached_step "$warm_log" '[environment 3/7] COPY --from=toolchain-build /usr/local/cargo/'
+  assert_cached_step "$warm_log" '[environment 4/7] COPY --from=toolchain-build /usr/local/rustup/'
+  assert_cached_step "$warm_log" '[environment 5/7] COPY --from=toolchain-build /toolchain/bin/bazel'
+  assert_cached_step "$warm_log" '[environment 6/7] COPY --from=toolchain-build /toolchain/bin/bazelisk'
+  assert_cached_step "$warm_log" '[environment 7/7] RUN'
 
   source_digest=$(tar -C "$temporary/context/source" --sort=name --mtime='UTC 1970-01-01' \
     --owner=0 --group=0 --numeric-owner -cf - . | sha256sum | awk '{print "sha256:"$1}')
   docker buildx build "${builder_args[@]}" --platform "$platform" --target task \
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
     --progress plain --load --tag "$task" -f "$temporary/context/Dockerfile.task" "$temporary/context"
+  environment_before_source_change=$(docker image inspect "$environment" --format '{{.Id}}')
+  original_task_identity=$(docker image inspect "$task" --format '{{.Id}}')
 
   # Only business source changes. The immutable environment remains identical,
   # while task COPY/label work is invalidated and rebuilt.
@@ -59,9 +81,23 @@ for architecture in amd64 arm64; do
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$changed_digest" \
     --progress plain --load --tag "$task" -f "$temporary/context/Dockerfile.task" \
     "$temporary/context" 2>&1 | tee "$task_log"
-  grep -q 'CACHED' "$task_log"
-  sed -i '$d' "$temporary/context/source/src/main.rs"
-  sed -i '$d' "$temporary/context/source/src/main.rs"
+  environment_after_source_change=$(docker image inspect "$environment" --format '{{.Id}}')
+  changed_task_identity=$(docker image inspect "$task" --format '{{.Id}}')
+  test "$environment_before_source_change" = "$environment_after_source_change"
+  test "$original_task_identity" != "$changed_task_identity"
+  changed_labels=$(docker image inspect "$task" --format '{{json .Config.Labels}}')
+  grep -Fq "\"io.repo-sandbox.source.digest\":\"$changed_digest\"" <<<"$changed_labels"
+
+  # Restore the exact original source and rebuild the final task. From here on,
+  # task and baseline contain byte-identical business input and digest labels.
+  cp "$temporary/main.rs.original" "$temporary/context/source/src/main.rs"
+  docker buildx build "${builder_args[@]}" --platform "$platform" --target task \
+    --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
+    --progress plain --load --tag "$task" -f "$temporary/context/Dockerfile.task" "$temporary/context"
+  labels=$(docker image inspect "$task" --format '{{json .Config.Labels}}')
+  restored_task_identity=$(docker image inspect "$task" --format '{{.Id}}')
+  test "$restored_task_identity" = "$original_task_identity"
+  grep -Fq "\"io.repo-sandbox.source.digest\":\"$source_digest\"" <<<"$labels"
 
   docker buildx build "${builder_args[@]}" --platform "$platform" --target task \
     --build-arg "SOURCE_DIGEST=$source_digest" --progress plain --load --tag "$baseline" \
@@ -72,14 +108,16 @@ for architecture in amd64 arm64; do
     docker run --rm --platform "$platform" "$image" bazel --batch build //:rust_binary
   done
 
-  labels=$(docker image inspect "$task" --format '{{json .Config.Labels}}')
-  grep -Fq "\"io.repo-sandbox.source.digest\":\"$changed_digest\"" <<<"$labels"
   history=$(docker history --no-trunc "$task")
   ! grep -Fq 'issue1-secret-marker-must-not-leak' <<<"$history"
   docker run --rm --platform "$platform" "$task" sh -ec '
     test ! -e /toolchain
     test ! -e /run/secrets/github_token
+    test -z "$(find /root/.cache -mindepth 1 -print -quit 2>/dev/null)"
+    test -z "$(find /var/cache/repo-sandbox -mindepth 1 -print -quit 2>/dev/null)"
     test ! -e /root/.cache/bazel
+    test ! -e /root/.cache/bazelisk
+    test ! -e /toolchain-downloads
     test ! -e /usr/local/cargo/registry
     test ! -e /usr/local/cargo/git
     test -z "$(find /var/lib/apt/lists -mindepth 1 -print -quit 2>/dev/null)"

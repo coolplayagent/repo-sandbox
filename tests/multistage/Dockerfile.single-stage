@@ -6,13 +6,18 @@ ARG BASE_IMAGE=docker.io/library/rust:1.97.0-bookworm
 FROM ${BASE_IMAGE} AS task
 ARG TARGETARCH
 ARG BAZELISK_VERSION=1.27.0
+ARG BAZEL_VERSION=8.3.1
 ARG SOURCE_DIGEST
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl git \
+    && case "$TARGETARCH" in amd64) bazel_arch=x86_64 ;; arm64) bazel_arch=arm64 ;; *) exit 64 ;; esac \
     && curl --fail --location --show-error \
       "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-${TARGETARCH}" \
+      --output /usr/local/bin/bazelisk \
+    && curl --fail --location --show-error \
+      "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-linux-${bazel_arch}" \
       --output /usr/local/bin/bazel \
-    && chmod 0755 /usr/local/bin/bazel \
+    && chmod 0755 /usr/local/bin/bazel /usr/local/bin/bazelisk \
     && rm -rf /var/lib/apt/lists/*
 COPY --link source/ /workspace/
 WORKDIR /workspace

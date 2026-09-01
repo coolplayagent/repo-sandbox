@@ -1265,12 +1265,14 @@ mod tests {
         assert!(dockerfile.contains("COPY --from=toolchain-build /usr/local/cargo/"));
         assert!(dockerfile.contains("COPY --from=toolchain-build /usr/local/rustup/"));
         assert!(dockerfile.contains("COPY --from=toolchain-build /toolchain/bin/bazel"));
+        assert!(dockerfile.contains("COPY --from=toolchain-build /toolchain/bin/bazelisk"));
         assert!(dockerfile.contains("--mount=type=secret,id=github_token,required=false"));
         for cache in [
             "repo-sandbox-apt-",
             "repo-sandbox-cargo-registry-",
             "repo-sandbox-cargo-git-",
             "repo-sandbox-bazel-",
+            "repo-sandbox-toolchain-downloads-",
         ] {
             assert!(dockerfile.contains(cache), "missing cache mount {cache}");
         }
@@ -1280,6 +1282,25 @@ mod tests {
                 .contains("apt-get install --yes --no-install-recommends ca-certificates curl")
         );
         assert!(!final_stage.contains("/run/secrets/github_token"));
+        assert!(final_stage.contains("target=/root/.cache/bazel"));
+        assert!(!final_stage.contains("/toolchain-downloads"));
+        assert!(!final_stage.contains("BAZELISK_HOME="));
+
+        let acceptance = include_str!("../../../scripts/docker/multistage-acceptance.sh");
+        for contract in [
+            "assert_cached_step \"$warm_log\" '[toolchain-build 2/2] RUN'",
+            "cold_environment_identity",
+            "environment_before_source_change",
+            "environment_after_source_change",
+            "restored_task_identity",
+            "test -z \"$(find /root/.cache",
+            "test ! -e /root/.cache/bazelisk",
+        ] {
+            assert!(
+                acceptance.contains(contract),
+                "missing acceptance contract {contract}"
+            );
+        }
     }
 
     #[test]
