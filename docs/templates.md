@@ -27,3 +27,27 @@ repo-sandbox plan --repository path/to/repository
 
 The output identifies the resolved template, image, platform, central build
 context, and every dependency edge in stable execution order.
+
+## BuildKit adapter
+
+`repo_sandbox_adapters::buildkit::BuildKit` converts a `TemplatePlan` into a
+structured `docker buildx build` invocation. Callers supply an `ImageRef` and
+may select build arguments, standard HTTP/HTTPS proxy arguments, cache imports
+and exports, target progress format, load or push output, and an existing or
+task-owned ephemeral builder. The result is a core `BuiltImage` containing the
+requested image reference and the BuildKit `sha256` digest.
+
+The adapter passes every option as a separate process argument; it never
+constructs a shell command. A stable plan digest covers the template version,
+resolved parameters, platform, contexts, component versions, and dependency
+edges. The Dockerfile records this digest as an OCI label, so changed template
+inputs invalidate the final image configuration while BuildKit remains free to
+reuse unchanged installation layers.
+
+When an ephemeral builder is requested, the adapter first inspects the name and
+rejects an existing builder as unowned. It then creates the builder without
+changing the globally selected builder and, only after creation succeeds, always attempts
+`docker buildx rm --force <owned-name>` after success, failure, or interruption.
+Create failures never trigger name-based removal, including an `already exists`
+race after inspection. Existing builders are never removed. The implementation deliberately never
+runs `docker system prune` or `docker buildx prune`.

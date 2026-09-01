@@ -2,6 +2,7 @@
 //!
 //! This crate deliberately has no infrastructure dependencies.
 
+pub mod build;
 pub mod config;
 pub mod doctor;
 pub mod exit_code;

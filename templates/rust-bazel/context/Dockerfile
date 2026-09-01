@@ -1,5 +1,15 @@
-ARG RUST_VERSION=1.97.0
-FROM docker.io/library/rust:${RUST_VERSION}-bookworm
+ARG BASE_IMAGE=docker.io/library/rust:1.97.0-bookworm
+FROM ${BASE_IMAGE}
+
+# These values are part of the final image configuration. BuildKit can reuse
+# unchanged installation layers, while a template, component, or parameter
+# change still produces a distinct environment image.
+ARG REPO_SANDBOX_TEMPLATE_ID
+ARG REPO_SANDBOX_TEMPLATE_VERSION
+ARG REPO_SANDBOX_PLAN_DIGEST
+LABEL org.opencontainers.image.title="${REPO_SANDBOX_TEMPLATE_ID}" \
+      org.opencontainers.image.version="${REPO_SANDBOX_TEMPLATE_VERSION}" \
+      io.repo-sandbox.plan-digest="${REPO_SANDBOX_PLAN_DIGEST}"
 
 ARG BAZELISK_VERSION=1.27.0
 RUN apt-get update \
