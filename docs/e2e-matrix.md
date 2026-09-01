@@ -1,0 +1,100 @@
+# End-to-end scenario matrix
+
+`tests/e2e/scenarios.yaml` is the single source of truth for the P1 Docker,
+WSL and VM matrix. Each scenario fixes its execution tier, targets, capability
+coverage, required environment, wall-clock timeout, argv (without shell
+interpolation), expected exit code, required/forbidden log text, and output
+artifacts. The Rust runner executes the commands; the YAML is not a collection
+of regular expressions standing in for end-to-end work.
+
+Run the host-required Docker tier with:
+
+```console
+cargo run -p repo-sandbox-adapters --bin e2e-matrix -- --target docker
+```
+
+Use `--list`, `--scenario ID`, and `--output PATH` to inspect or narrow a run.
+The default output is a unique `target/e2e/<pid>-<timestamp>/` directory. Every
+executed scenario gets its own directory containing the complete
+`scenario.log`, assertion-bearing `report.json`, and its declared artifacts.
+An existing scenario directory is never reused or overwritten.
+On Linux the runner starts each command in a new session; on Windows it uses an
+exact root PID. A matrix timeout terminates that owned process tree before the
+scenario is reaped, so child Docker or SSH clients cannot outlive the run.
+
+## Required host matrix
+
+The Docker target is CI-required. It covers:
+
+| Scenario | Real boundary | Assertions |
+| --- | --- | --- |
+| `public-git-snapshot` | task-owned localhost unauthenticated smart-HTTP `git http-backend` service and `GitSnapshotter` | network clone, fixed commit materialization, joined server thread/closed port teardown |
+| `docker-adapters` | `GitSnapshotter`, `TaskImageBuilder`, `BuildKit`, `DockerRunner` | local source, task image contents, cold/warm cache, artifact export |
+| `docker-failures` | task-owned Docker containers through `DockerRunner` | build exit 41, test exit 42, timeout, stage names, failed-container retention |
+| `docker-architecture-mismatch` | a real arm64 BuildKit execution | architecture stage fails and is visible in the log |
+| `rust-bazel-dogfood` | repo-sandbox Rust+Bazel image fixture | cold/warm cache, source-only change, amd64/arm64, multistage, Cargo and Bazel tests |
+
+The hosted CI job does not weaken the runner's writable-layer limit when the
+host daemon lacks overlay-on-XFS project quotas. It creates a task-unique sparse
+XFS filesystem mounted with `pquota`, starts a separate Docker daemon with an
+isolated data root, socket, exec root and bridge, and first proves that a
+`busybox:1.36` container can be created and run with
+`--storage-opt size=32M`. BuildKit and disposable dogfood acceptance build
+stages that fetch public dependencies use the host network; final task
+containers and runner scenarios stay on the isolated bridge. The job removes
+its exact Buildx builder, verifies the
+daemon PID and command line before terminating it, unmounts the task filesystem,
+its exec-root network namespace and loop device, removes the task bridge and
+directory, and asserts those resources are gone.
+
+Failure cleanup is ownership-scoped. Images and containers use unique run IDs.
+The runner failure test checks the retained container's
+`io.repo-sandbox.task-id` label before removing that exact container ID. The
+dogfood script removes only its uniquely tagged images and task-local cache
+directories. No scenario prunes Docker, deletes builders selected by the
+caller, or removes shared images/caches.
+
+## Opt-in targets
+
+WSL and VM are represented by the same scenario description and assertion
+model, but are not reported as passing unless real targets are supplied:
+
+```console
+REPO_SANDBOX_WSL_DISTRO=EulerOS cargo run -p repo-sandbox-adapters --bin e2e-matrix -- --target wsl
+REPO_SANDBOX_VM_TARGETS=/secure/targets.tsv cargo run -p repo-sandbox-adapters --bin e2e-matrix -- --target vm
+```
+
+The WSL driver reuses `scripts/wsl/smoke-euleros.sh`. The VM driver reuses
+`scripts/vm/acceptance-matrix.sh` and therefore requires explicit successful
+amd64 and arm64 rows. Missing variables produce an explicit `SKIP` for opt-in
+scenarios; they never produce synthetic success records.
+
+Private HTTPS and SSH Git are also opt-in so CI never depends on an external
+cloud repository. Point the variables below at a disposable local fixture or
+operator-controlled temporary service:
+
+- HTTPS success: `REPO_SANDBOX_E2E_HTTPS_URL`, `_REF`, `_USER`, `_TOKEN`;
+  invalid-auth injection additionally uses `_INVALID_TOKEN`.
+- SSH: `REPO_SANDBOX_E2E_SSH_URL`, `_REF`, `_KEY`, `_KNOWN_HOSTS`.
+- Registry: `REPO_SANDBOX_REGISTRY_TEST_SOURCE` and
+  `REPO_SANDBOX_REGISTRY_TEST_REPOSITORY`.
+
+HTTPS tokens are resolved only through the adapter's ephemeral askpass helper;
+SSH uses an external key plus strict known-hosts file. Scenario logs assert the
+HTTPS token is absent, adapter errors redact resolved secrets, and task-image
+history/filesystem scans reject credential material. Before logs or reports are
+written, the matrix runner also replaces declared secret environment values and
+both the original and trailing-newline-trimmed SSH key file contents with
+`<redacted>`; assertion messages never echo a forbidden value. The SSH boundary
+is enforced by the runner and its LF/CRLF stdout/stderr tests rather than by
+copying private key material into a YAML assertion. Never put secret values in
+the YAML or a Git URL.
+
+## Exit and failure contract
+
+The matrix command exits zero only when every selected required scenario and
+every enabled opt-in scenario satisfies all fixed assertions. A command
+failure, matrix timeout, missing required log marker, forbidden credential
+marker, or missing artifact is a failure. The JSON report retains the observed
+exit code and timeout state, while component reports retain the precise build
+or test phase and step name.

@@ -1,5 +1,5 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 rust_library(
     name = "adapters",
@@ -13,4 +13,11 @@ rust_library(
 rust_test(
     name = "adapters_test",
     crate = ":adapters",
+)
+
+rust_binary(
+    name = "e2e_matrix",
+    srcs = ["e2e/e2e_matrix.rs"],
+    crate_root = "e2e/e2e_matrix.rs",
+    deps = all_crate_deps(normal = True),
 )

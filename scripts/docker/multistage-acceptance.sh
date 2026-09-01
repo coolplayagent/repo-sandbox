@@ -13,10 +13,29 @@ cleanup() {
     "repo-sandbox-$run_id-environment-amd64" "repo-sandbox-$run_id-environment-arm64" \
     "repo-sandbox-$run_id-task-amd64" "repo-sandbox-$run_id-task-arm64" \
     "repo-sandbox-$run_id-baseline-amd64" "repo-sandbox-$run_id-baseline-arm64" \
+    "repo-sandbox-$run_id-acceptance-task-amd64" "repo-sandbox-$run_id-acceptance-task-arm64" \
+    "repo-sandbox-$run_id-acceptance-baseline-amd64" "repo-sandbox-$run_id-acceptance-baseline-arm64" \
     >/dev/null 2>&1 || true
   rm -rf "$temporary"
 }
 trap cleanup EXIT
+
+retry_external_build() {
+  local attempt=1
+  local maximum=3
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    if (( attempt >= maximum )); then
+      echo "external build failed after $maximum attempts" >&2
+      return 1
+    fi
+    echo "external build attempt $attempt failed; retrying" >&2
+    sleep $((attempt * 5))
+    attempt=$((attempt + 1))
+  done
+}
 
 cp -R "$repo_root/tests/multistage/." "$temporary/context"
 cp "$temporary/context/source/src/main.rs" "$temporary/main.rs.original"
@@ -38,17 +57,21 @@ for architecture in amd64 arm64; do
   environment="repo-sandbox-$run_id-environment-$architecture"
   task="repo-sandbox-$run_id-task-$architecture"
   baseline="repo-sandbox-$run_id-baseline-$architecture"
+  acceptance_task="repo-sandbox-$run_id-acceptance-task-$architecture"
+  acceptance_baseline="repo-sandbox-$run_id-acceptance-baseline-$architecture"
   cache_cold="$temporary/cache-$architecture-cold"
   cache_warm="$temporary/cache-$architecture-warm"
   cold_log="$temporary/environment-$architecture-cold.log"
   warm_log="$temporary/environment-$architecture-warm.log"
 
-  docker buildx build "${builder_args[@]}" --platform "$platform" --target environment \
+  retry_external_build docker buildx build "${builder_args[@]}" --provenance=false \
+    --platform "$platform" --target environment \
     --secret "id=github_token,src=$temporary/github-token" \
     --cache-to "type=local,dest=$cache_cold,mode=max" --progress plain --load \
     --tag "$environment" "$repo_root/templates/rust-bazel/context" 2>&1 | tee "$cold_log"
   cold_environment_identity=$(docker image inspect "$environment" --format '{{.Id}}')
-  docker buildx build "${builder_args[@]}" --platform "$platform" --target environment \
+  retry_external_build docker buildx build "${builder_args[@]}" --provenance=false \
+    --platform "$platform" --target environment \
     --secret "id=github_token,src=$temporary/github-token" \
     --cache-from "type=local,src=$cache_cold" --cache-to "type=local,dest=$cache_warm,mode=max" \
     --progress plain --load --tag "$environment" \
@@ -67,7 +90,7 @@ for architecture in amd64 arm64; do
 
   source_digest=$(tar -C "$temporary/context/source" --sort=name --mtime='UTC 1970-01-01' \
     --owner=0 --group=0 --numeric-owner -cf - . | sha256sum | awk '{print "sha256:"$1}')
-  docker build --platform "$platform" --target task \
+  retry_external_build docker build --provenance=false --platform "$platform" --target task \
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
     --progress plain --tag "$task" -f "$temporary/context/Dockerfile.task" "$temporary/context"
   environment_before_source_change=$(docker image inspect "$environment" --format '{{.Id}}')
@@ -79,7 +102,7 @@ for architecture in amd64 arm64; do
   changed_digest=$(tar -C "$temporary/context/source" --sort=name --mtime='UTC 1970-01-01' \
     --owner=0 --group=0 --numeric-owner -cf - . | sha256sum | awk '{print "sha256:"$1}')
   task_log="$temporary/task-$architecture-source-change.log"
-  docker build --platform "$platform" --target task \
+  retry_external_build docker build --provenance=false --platform "$platform" --target task \
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$changed_digest" \
     --progress plain --tag "$task" -f "$temporary/context/Dockerfile.task" \
     "$temporary/context" 2>&1 | tee "$task_log"
@@ -95,7 +118,7 @@ for architecture in amd64 arm64; do
   # Restore the exact original source and rebuild the final task. From here on,
   # task and baseline contain byte-identical business input and digest labels.
   cp "$temporary/main.rs.original" "$temporary/context/source/src/main.rs"
-  docker build --platform "$platform" --target task \
+  retry_external_build docker build --provenance=false --platform "$platform" --target task \
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
     --progress plain --tag "$task" -f "$temporary/context/Dockerfile.task" "$temporary/context"
   labels=$(docker image inspect "$task" --format '{{json .Config.Labels}}')
@@ -105,14 +128,25 @@ for architecture in amd64 arm64; do
   printf '%s restored task identity=%s source_digest=%s\n' \
     "$architecture" "$restored_task_identity" "$source_digest"
 
-  docker buildx build "${builder_args[@]}" --platform "$platform" --target task \
+  retry_external_build docker buildx build "${builder_args[@]}" --provenance=false \
+    --platform "$platform" --target task \
     --build-arg "SOURCE_DIGEST=$source_digest" --progress plain --load --tag "$baseline" \
     -f "$temporary/context/Dockerfile.single-stage" "$temporary/context"
 
-  for image in "$task" "$baseline"; do
-    docker run --rm --platform "$platform" "$image" cargo test --locked
-    docker run --rm --platform "$platform" "$image" bazel --batch build //:rust_binary
-  done
+  # Only these disposable build-stage checks receive host networking so Cargo
+  # and Bazel can fetch public dependencies. Final task containers retain the
+  # runner's isolated default network contract.
+  retry_external_build docker build --network host --provenance=false \
+    --platform "$platform" --target acceptance \
+    --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
+    --progress plain --tag "$acceptance_task" -f "$temporary/context/Dockerfile.task" \
+    "$temporary/context"
+  retry_external_build docker build --network host --provenance=false \
+    --platform "$platform" --target acceptance --build-arg "SOURCE_DIGEST=$source_digest" \
+    --progress plain --tag "$acceptance_baseline" \
+    -f "$temporary/context/Dockerfile.single-stage" "$temporary/context"
+  printf '%s build-stage acceptance network=host scope=public-dependency-download passed\n' \
+    "$architecture"
 
   history=$(docker history --no-trunc "$task")
   ! grep -Fq 'issue1-secret-marker-must-not-leak' <<<"$history"

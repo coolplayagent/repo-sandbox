@@ -1,0 +1,164 @@
+version: 1
+scenarios:
+  - id: public-git-snapshot
+    description: Materialize a public remote through a task-owned localhost unauthenticated HTTP service.
+    tier: required
+    targets: [docker, wsl, vm]
+    covers: [public_remote_git, network_transport, snapshot, fixed_commit, isolated_fixture]
+    timeout_seconds: 60
+    command:
+      program: cargo
+      args: [test, -p, repo-sandbox-adapters, "snapshot::tests::public_http_remote_is_materialized_without_external_network", "--", "--exact", "--nocapture"]
+    expected:
+      exit_code: 0
+      log_contains: ["public_http_remote_is_materialized_without_external_network ... ok"]
+
+  - id: private-https-snapshot
+    description: Materialize an operator-provided disposable private HTTPS Git fixture.
+    tier: opt_in
+    targets: [docker, wsl, vm]
+    covers: [private_https_git, ephemeral_credential_helper, credential_redaction]
+    required_env: [REPO_SANDBOX_E2E_HTTPS_URL, REPO_SANDBOX_E2E_HTTPS_REF, REPO_SANDBOX_E2E_HTTPS_USER, REPO_SANDBOX_E2E_HTTPS_TOKEN]
+    redact_env: [REPO_SANDBOX_E2E_HTTPS_TOKEN]
+    timeout_seconds: 120
+    command:
+      program: cargo
+      args: [test, -p, repo-sandbox-adapters, "snapshot::tests::private_https_remote_opt_in", "--", "--ignored", "--exact", "--nocapture"]
+    expected:
+      exit_code: 0
+      log_contains: ["private_https_remote_opt_in ... ok"]
+      log_not_contains: ["${ENV:REPO_SANDBOX_E2E_HTTPS_TOKEN}"]
+
+  - id: private-ssh-snapshot
+    description: Materialize an operator-provided disposable private SSH Git fixture with strict known-host checking.
+    tier: opt_in
+    targets: [docker, wsl, vm]
+    covers: [private_ssh_git, external_key, strict_known_hosts, credential_redaction]
+    required_env: [REPO_SANDBOX_E2E_SSH_URL, REPO_SANDBOX_E2E_SSH_REF, REPO_SANDBOX_E2E_SSH_KEY, REPO_SANDBOX_E2E_SSH_KNOWN_HOSTS]
+    redact_file_env: [REPO_SANDBOX_E2E_SSH_KEY]
+    timeout_seconds: 120
+    command:
+      program: cargo
+      args: [test, -p, repo-sandbox-adapters, "snapshot::tests::private_ssh_remote_opt_in", "--", "--ignored", "--exact", "--nocapture"]
+    expected:
+      exit_code: 0
+      log_contains: ["private_ssh_remote_opt_in ... ok"]
+
+  - id: private-https-invalid-auth
+    description: Reject an explicitly invalid HTTPS credential without exposing it.
+    tier: opt_in
+    targets: [docker, wsl, vm]
+    covers: [invalid_authentication, snapshot_failure, credential_redaction]
+    required_env: [REPO_SANDBOX_E2E_HTTPS_URL, REPO_SANDBOX_E2E_HTTPS_REF, REPO_SANDBOX_E2E_HTTPS_USER, REPO_SANDBOX_E2E_HTTPS_INVALID_TOKEN]
+    redact_env: [REPO_SANDBOX_E2E_HTTPS_INVALID_TOKEN]
+    timeout_seconds: 120
+    command:
+      program: cargo
+      args: [test, -p, repo-sandbox-adapters, "snapshot::tests::private_https_invalid_authentication_opt_in", "--", "--ignored", "--exact", "--nocapture"]
+    expected:
+      exit_code: 0
+      log_contains: ["stage=snapshot authentication_failure=redacted"]
+      log_not_contains: ["${ENV:REPO_SANDBOX_E2E_HTTPS_INVALID_TOKEN}"]
+
+  - id: docker-adapters
+    description: Exercise snapshot-to-task-image, BuildKit cold/warm cache and Docker runner artifact export.
+    tier: required
+    targets: [docker]
+    covers: [local_directory, snapshot, buildkit, cold_cache, warm_cache, task_image, runner, artifact_export]
+    timeout_seconds: 600
+    command:
+      program: repo-bash
+      args: ["${ROOT}/scripts/e2e/docker-scenario.sh", adapters, "${RESULT_DIR}"]
+    expected:
+      exit_code: 0
+      log_contains: ["stage=snapshot-task-image status=passed", "stage=buildkit-cache status=passed", "stage=runner-artifact-export status=passed"]
+      log_not_contains: [issue16-private-credential-marker]
+      artifacts: [adapter-smoke.passed]
+
+  - id: docker-failures
+    description: Inject build/test failures and a timeout, then verify stage attribution and keep-on-failure ownership.
+    tier: required
+    targets: [docker]
+    covers: [build_failure, test_failure, timeout, keep_on_failure, exact_cleanup, credential_redaction]
+    timeout_seconds: 180
+    command:
+      program: repo-bash
+      args: ["${ROOT}/scripts/e2e/docker-scenario.sh", failures, "${RESULT_DIR}"]
+    expected:
+      exit_code: 0
+      log_contains: ["stage=build failure_exit=41", "stage=test failure_exit=42", "stage=timeout status=timed_out", "stage=cleanup status=retained_then_owned_removed", "credential_scan=passed"]
+      log_not_contains: [issue16-private-credential-marker]
+      artifacts: [failure-matrix.passed]
+
+  - id: docker-architecture-mismatch
+    description: Inject a target-architecture contract failure through real BuildKit.
+    tier: required
+    targets: [docker]
+    covers: [architecture_mismatch, build_failure, stage_log]
+    timeout_seconds: 120
+    command:
+      program: repo-bash
+      args: ["${ROOT}/scripts/e2e/docker-scenario.sh", architecture-mismatch, "${RESULT_DIR}"]
+    expected:
+      exit_code: 0
+      log_contains: ["stage=architecture-check", "architecture_mismatch=observed"]
+      artifacts: [architecture-mismatch.passed]
+
+  - id: rust-bazel-dogfood
+    description: Build and test repo-sandbox's Rust+Bazel fixture across caches, source changes, stages and architectures.
+    tier: required
+    targets: [docker]
+    covers: [rust, bazel, cold_cache, warm_cache, source_change, amd64, arm64, multistage, secrets]
+    timeout_seconds: 2700
+    command:
+      program: repo-bash
+      args: ["${ROOT}/scripts/e2e/docker-scenario.sh", dogfood, "${RESULT_DIR}"]
+    expected:
+      exit_code: 0
+      log_contains: ["final-image history/filesystem security scan: passed", "dogfood=passed"]
+      log_not_contains: [issue1-secret-marker-must-not-leak]
+      artifacts: [dogfood.passed]
+
+  - id: registry-publish-pull
+    description: Reuse the registry adapter against an operator-owned disposable repository.
+    tier: opt_in
+    targets: [docker, wsl, vm]
+    covers: [registry, publish, pull, digest, multiarch]
+    required_env: [REPO_SANDBOX_REGISTRY_TEST_SOURCE, REPO_SANDBOX_REGISTRY_TEST_REPOSITORY]
+    timeout_seconds: 600
+    command:
+      program: cargo
+      args: [test, -p, repo-sandbox-adapters, "registry::tests::docker_registry_login_publish_pull_and_multiarch_digest_consistency", "--", "--ignored", "--exact", "--nocapture"]
+    expected:
+      exit_code: 0
+      log_contains: ["docker_registry_login_publish_pull_and_multiarch_digest_consistency ... ok"]
+
+  - id: euleros-wsl-dogfood
+    description: Run the existing EulerOS WSL doctor, Rust+Bazel and multiarch smoke path.
+    tier: opt_in
+    targets: [wsl]
+    covers: [wsl, euleros, rust, bazel, docker, amd64, arm64]
+    required_env: [REPO_SANDBOX_WSL_DISTRO]
+    timeout_seconds: 1800
+    command:
+      program: powershell.exe
+      args: [-NoProfile, -File, "${ROOT}/scripts/e2e/wsl-target.ps1", -ResultDirectory, "${RESULT_DIR}"]
+    expected:
+      exit_code: 0
+      log_contains: ["amd64 native build and arm64 QEMU smoke passed", "wsl_dogfood=passed"]
+      artifacts: [wsl-dogfood.passed]
+
+  - id: euleros-hce-vm-matrix
+    description: Run the existing SSH acceptance matrix on explicit disposable amd64 and arm64 VM targets.
+    tier: opt_in
+    targets: [vm]
+    covers: [vm, euleros_hce, ssh, amd64, arm64, rust, bazel, docker]
+    required_env: [REPO_SANDBOX_VM_TARGETS]
+    timeout_seconds: 3600
+    command:
+      program: repo-bash
+      args: ["${ROOT}/scripts/e2e/vm-target.sh", "${ENV:REPO_SANDBOX_VM_TARGETS}", "${RESULT_DIR}"]
+    expected:
+      exit_code: 0
+      log_contains: ["EulerOS/HCE amd64 and arm64 VM acceptance matrix passed", "vm_matrix=passed"]
+      artifacts: [vm-matrix.passed]

@@ -79,3 +79,8 @@ boundary are documented in [`docs/euleros-wsl2.md`](docs/euleros-wsl2.md).
 Capability-driven deployment to native amd64/arm64 EulerOS/HCE-compatible yum
 VMs, including strict SSH triggering and the real two-VM acceptance contract,
 is documented in [`docs/euleros-hce-vm.md`](docs/euleros-hce-vm.md).
+
+The descriptor-driven end-to-end matrix dogfoods the Rust+Bazel repository
+through real snapshot, BuildKit, registry, Docker runner, WSL and VM boundaries.
+Required local Docker scenarios and explicitly skipped opt-in targets are
+documented in [`docs/e2e-matrix.md`](docs/e2e-matrix.md).

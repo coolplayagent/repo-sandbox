@@ -26,3 +26,7 @@ RUN apt-get update \
 COPY --link source/ /workspace/
 WORKDIR /workspace
 LABEL io.repo-sandbox.source.digest="${SOURCE_DIGEST}"
+
+FROM task AS acceptance
+RUN cargo test --locked \
+    && bazel --batch build //:rust_binary
