@@ -72,3 +72,6 @@ security and identity contract.
 
 `Cargo.toml` and `Cargo.lock` describe Rust packages and third-party dependency
 resolution for Bzlmod's crate_universe. Cargo is not a supported build entrypoint.
+
+The supported EulerOS 2.10.7 x86_64 WSL2 bootstrap and its explicit platform
+boundary are documented in [`docs/euleros-wsl2.md`](docs/euleros-wsl2.md).
