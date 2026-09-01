@@ -1,0 +1,13 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "core",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "repo_sandbox_core",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "core_test",
+    crate = ":core",
+)
