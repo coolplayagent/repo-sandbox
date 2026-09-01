@@ -317,9 +317,12 @@ fn execute(
         .iter()
         .filter_map(|name| env::var(name).ok())
         .collect::<Vec<_>>();
-    secrets.extend(scenario.redact_file_env.iter().filter_map(|name| {
-        let path = env::var_os(name)?;
-        fs::read_to_string(path).ok()
+    secrets.extend(scenario.redact_file_env.iter().flat_map(|name| {
+        let Some(contents) = env::var_os(name).and_then(|path| fs::read_to_string(path).ok())
+        else {
+            return Vec::new();
+        };
+        file_secret_variants(contents)
     }));
     let stdout = redact(&stdout, &secrets);
     let stderr = redact(&stderr, &secrets);
@@ -437,6 +440,19 @@ fn redact(bytes: &[u8], secrets: &[String]) -> Vec<u8> {
         value = value.replace(secret, "<redacted>");
     }
     value.into_bytes()
+}
+
+fn file_secret_variants(contents: String) -> Vec<String> {
+    let trimmed = contents.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut variants = Vec::with_capacity(2);
+    variants.push(contents.clone());
+    if trimmed != contents {
+        variants.push(trimmed.to_owned());
+    }
+    variants
 }
 
 fn command_path(path: &Path) -> String {
@@ -570,4 +586,43 @@ fn run_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{}-{nanos}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{file_secret_variants, redact};
+
+    fn assert_streams_redacted(contents: &str) {
+        let secrets = file_secret_variants(contents.to_owned());
+        let trimmed = contents.trim_end_matches(['\r', '\n']);
+        let stdout = format!("stdout-before:{trimmed}:stdout-after");
+        let stderr = format!("stderr-before:{contents}:stderr-after");
+
+        assert_eq!(
+            String::from_utf8(redact(stdout.as_bytes(), &secrets)).unwrap(),
+            "stdout-before:<redacted>:stdout-after"
+        );
+        assert_eq!(
+            String::from_utf8(redact(stderr.as_bytes(), &secrets)).unwrap(),
+            "stderr-before:<redacted>:stderr-after"
+        );
+    }
+
+    #[test]
+    fn file_secret_with_lf_tail_is_redacted_from_stdout_and_stderr() {
+        assert_streams_redacted("-----BEGIN TEST KEY-----\nlf-secret\n-----END TEST KEY-----\n");
+    }
+
+    #[test]
+    fn file_secret_with_crlf_tail_is_redacted_from_stdout_and_stderr() {
+        assert_streams_redacted(
+            "-----BEGIN TEST KEY-----\r\ncrlf-secret\r\n-----END TEST KEY-----\r\n",
+        );
+    }
+
+    #[test]
+    fn empty_file_secret_variants_are_skipped() {
+        assert!(file_secret_variants(String::new()).is_empty());
+        assert!(file_secret_variants("\r\n".to_owned()).is_empty());
+    }
 }

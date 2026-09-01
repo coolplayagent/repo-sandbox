@@ -28,7 +28,7 @@ The Docker target is CI-required. It covers:
 
 | Scenario | Real boundary | Assertions |
 | --- | --- | --- |
-| `public-git-snapshot` | task-owned localhost unauthenticated dumb-HTTP service and `GitSnapshotter` | network clone, fixed commit materialization, joined server thread/closed port teardown |
+| `public-git-snapshot` | task-owned localhost unauthenticated smart-HTTP `git http-backend` service and `GitSnapshotter` | network clone, fixed commit materialization, joined server thread/closed port teardown |
 | `docker-adapters` | `GitSnapshotter`, `TaskImageBuilder`, `BuildKit`, `DockerRunner` | local source, task image contents, cold/warm cache, artifact export |
 | `docker-failures` | task-owned Docker containers through `DockerRunner` | build exit 41, test exit 42, timeout, stage names, failed-container retention |
 | `docker-architecture-mismatch` | a real arm64 BuildKit execution | architecture stage fails and is visible in the log |
@@ -71,8 +71,11 @@ SSH uses an external key plus strict known-hosts file. Scenario logs assert the
 HTTPS token is absent, adapter errors redact resolved secrets, and task-image
 history/filesystem scans reject credential material. Before logs or reports are
 written, the matrix runner also replaces declared secret environment values and
-SSH key file contents with `<redacted>`; assertion messages never echo a
-forbidden value. Never put secret values in the YAML or a Git URL.
+both the original and trailing-newline-trimmed SSH key file contents with
+`<redacted>`; assertion messages never echo a forbidden value. The SSH boundary
+is enforced by the runner and its LF/CRLF stdout/stderr tests rather than by
+copying private key material into a YAML assertion. Never put secret values in
+the YAML or a Git URL.
 
 ## Exit and failure contract
 
