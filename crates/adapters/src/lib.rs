@@ -1,5 +1,7 @@
 //! Infrastructure adapters for repo-sandbox.
 
+pub mod doctor;
+
 pub mod logging {
     use tracing_subscriber::EnvFilter;
 
