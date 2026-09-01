@@ -20,7 +20,9 @@ Docker state, and never removes an image, volume, network, or shared container.
 
 Steps run in declared build-then-test order. The system executor tees each raw
 stdout/stderr chunk to the console as it arrives and appends the same bytes to
-the corresponding step, so live logs and archived output cannot diverge.
+the corresponding step's `stdout_bytes`/`stderr_bytes`, so invalid UTF-8 and
+code points split across read boundaries remain losslessly recoverable. The
+`stdout`/`stderr` strings are explicitly only human-readable lossy views.
 Reports retain each executed
 step's phase, name, start/end wall-clock time, elapsed duration, exit code,
 stdout, stderr, and outcome. `fail_fast` stops after the first command failure;
@@ -32,8 +34,10 @@ exhaustion are distinct from ordinary command failures.
 `RunReport` also records the source snapshot identity and origin, a secret-free
 configuration summary, the image reference and content digest, total timing,
 cleanup disposition, and cleanup errors. `write_report_json` writes both success
-and failure reports via a same-directory temporary file and rename, avoiding a
-partially written JSON file.
+and failure reports through a unique `create_new` same-directory temporary file,
+flush plus `sync_all`, and an atomic create-if-absent hard-link publication.
+Existing reports are never overwritten; concurrent writers produce one winner,
+and failed writers clean their private temporary file.
 
 By default the exact container ID returned by this task's successful create is
 removed on success and failure. `keep_on_failure` retains that container only on

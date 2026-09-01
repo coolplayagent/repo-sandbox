@@ -72,16 +72,29 @@ pub trait DockerExecutor {
         sink: &dyn LogSink,
         phase: StepPhase,
         step: &str,
-    ) -> io::Result<ProcessOutput> {
+    ) -> io::Result<StreamedProcessOutput> {
         let output = self.execute(invocation, timeout)?;
-        sink.stdout(phase, step, output.stdout.as_bytes());
-        sink.stderr(phase, step, output.stderr.as_bytes());
-        Ok(output)
+        let stdout_bytes = output.stdout.as_bytes().to_vec();
+        let stderr_bytes = output.stderr.as_bytes().to_vec();
+        sink.stdout(phase, step, &stdout_bytes);
+        sink.stderr(phase, step, &stderr_bytes);
+        Ok(StreamedProcessOutput {
+            output,
+            stdout_bytes,
+            stderr_bytes,
+        })
     }
 }
 
-/// Receives exactly the bytes captured in each [`StepResult`]. Implementations
-/// must not transform the stream, so live output and the JSON report agree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamedProcessOutput {
+    pub output: ProcessOutput,
+    pub stdout_bytes: Vec<u8>,
+    pub stderr_bytes: Vec<u8>,
+}
+
+/// Receives exactly the bytes captured in each [`StepResult::stdout_bytes`] and
+/// [`StepResult::stderr_bytes`]. Text fields remain a readable lossy view.
 pub trait LogSink: Sync {
     fn stdout(&self, phase: StepPhase, step: &str, bytes: &[u8]);
     fn stderr(&self, phase: StepPhase, step: &str, bytes: &[u8]);
@@ -112,6 +125,7 @@ impl DockerExecutor for SystemDockerExecutor {
         timeout: Duration,
     ) -> io::Result<ProcessOutput> {
         self.execute_process(invocation, timeout, None)
+            .map(|output| output.output)
     }
 
     fn execute_streaming(
@@ -121,7 +135,7 @@ impl DockerExecutor for SystemDockerExecutor {
         sink: &dyn LogSink,
         phase: StepPhase,
         step: &str,
-    ) -> io::Result<ProcessOutput> {
+    ) -> io::Result<StreamedProcessOutput> {
         self.execute_process(invocation, timeout, Some((sink, phase, step)))
     }
 }
@@ -132,7 +146,7 @@ impl SystemDockerExecutor {
         invocation: &ProcessInvocation,
         timeout: Duration,
         live: Option<(&dyn LogSink, StepPhase, &str)>,
-    ) -> io::Result<ProcessOutput> {
+    ) -> io::Result<StreamedProcessOutput> {
         let mut child = Command::new(&invocation.program)
             .args(&invocation.args)
             .current_dir(invocation.current_dir.as_deref().unwrap_or(Path::new(".")))
@@ -167,11 +181,17 @@ impl SystemDockerExecutor {
                 }
                 thread::sleep(Duration::from_millis(20));
             };
-            Ok(ProcessOutput {
-                exit_code: status.code(),
-                stdout: join_scoped(stdout_reader)?,
-                stderr: join_scoped(stderr_reader)?,
-                interrupted,
+            let stdout_bytes = join_scoped(stdout_reader)?;
+            let stderr_bytes = join_scoped(stderr_reader)?;
+            Ok(StreamedProcessOutput {
+                output: ProcessOutput {
+                    exit_code: status.code(),
+                    stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+                    interrupted,
+                },
+                stdout_bytes,
+                stderr_bytes,
             })
         })
     }
@@ -191,11 +211,10 @@ fn read_stream(mut stream: impl Read, mut emit: impl FnMut(&[u8])) -> io::Result
     Ok(bytes)
 }
 
-fn join_scoped(reader: thread::ScopedJoinHandle<'_, io::Result<Vec<u8>>>) -> io::Result<String> {
-    let bytes = reader
+fn join_scoped(reader: thread::ScopedJoinHandle<'_, io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reader
         .join()
-        .map_err(|_| io::Error::other("process output reader panicked"))??;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+        .map_err(|_| io::Error::other("process output reader panicked"))?
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -514,31 +533,44 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
                 &step.name,
             );
             let step_ended = self.clock.now();
-            let (status, exit_code, stdout, stderr) = match output {
+            let (status, exit_code, stdout, stderr, stdout_bytes, stderr_bytes) = match output {
                 Err(error) => (
                     StepStatus::InfrastructureFailed,
                     None,
                     String::new(),
                     error.to_string(),
+                    Vec::new(),
+                    Vec::new(),
                 ),
-                Ok(output) if output.interrupted => (
+                Ok(streamed) if streamed.output.interrupted => (
                     StepStatus::TimedOut,
-                    output.exit_code,
-                    output.stdout,
-                    output.stderr,
+                    streamed.output.exit_code,
+                    streamed.output.stdout,
+                    streamed.output.stderr,
+                    streamed.stdout_bytes,
+                    streamed.stderr_bytes,
                 ),
-                Ok(output) if output.exit_code == Some(0) => (
+                Ok(streamed) if streamed.output.exit_code == Some(0) => (
                     StepStatus::Succeeded,
-                    output.exit_code,
-                    output.stdout,
-                    output.stderr,
+                    streamed.output.exit_code,
+                    streamed.output.stdout,
+                    streamed.output.stderr,
+                    streamed.stdout_bytes,
+                    streamed.stderr_bytes,
                 ),
-                Ok(output) => {
-                    let limit = self.resource_limit(container_id, &output);
+                Ok(streamed) => {
+                    let limit = self.resource_limit(container_id, &streamed.output);
                     let status = limit.map_or(StepStatus::CommandFailed, |limit| {
                         StepStatus::ResourceExceeded { limit }
                     });
-                    (status, output.exit_code, output.stdout, output.stderr)
+                    (
+                        status,
+                        streamed.output.exit_code,
+                        streamed.output.stdout,
+                        streamed.output.stderr,
+                        streamed.stdout_bytes,
+                        streamed.stderr_bytes,
+                    )
                 }
             };
             report.steps.push(StepResult {
@@ -553,6 +585,8 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
                 status: status.clone(),
                 stdout,
                 stderr: stderr.clone(),
+                stdout_bytes,
+                stderr_bytes,
             });
 
             match status {
@@ -647,15 +681,19 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
         started_ms: u64,
         phase: StepPhase,
         step: &str,
-    ) -> io::Result<ProcessOutput> {
+    ) -> io::Result<StreamedProcessOutput> {
         let elapsed = self.clock.now().monotonic_ms.saturating_sub(started_ms);
         let remaining = spec.timeout_ms.saturating_sub(elapsed);
         if remaining == 0 {
-            return Ok(ProcessOutput {
-                exit_code: None,
-                stdout: String::new(),
-                stderr: "total job timeout elapsed".to_owned(),
-                interrupted: true,
+            return Ok(StreamedProcessOutput {
+                output: ProcessOutput {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: "total job timeout elapsed".to_owned(),
+                    interrupted: true,
+                },
+                stdout_bytes: Vec::new(),
+                stderr_bytes: Vec::new(),
             });
         }
         self.executor.execute_streaming(
@@ -802,6 +840,53 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .expect("fake output for every invocation")
+        }
+    }
+
+    struct RawStepExecutor {
+        clock: Rc<Cell<u64>>,
+        control_calls: Cell<usize>,
+        bytes: Vec<u8>,
+    }
+
+    impl DockerExecutor for &RawStepExecutor {
+        fn execute(
+            &self,
+            _invocation: &ProcessInvocation,
+            _timeout: Duration,
+        ) -> io::Result<ProcessOutput> {
+            self.clock.set(self.clock.get() + 10);
+            let call = self.control_calls.get();
+            self.control_calls.set(call + 1);
+            Ok(match call {
+                0 => output(0, "", ""),
+                1 => output(0, "container-id-raw", ""),
+                _ => output(0, "", ""),
+            })
+        }
+
+        fn execute_streaming(
+            &self,
+            _invocation: &ProcessInvocation,
+            _timeout: Duration,
+            sink: &dyn LogSink,
+            phase: StepPhase,
+            step: &str,
+        ) -> io::Result<StreamedProcessOutput> {
+            self.clock.set(self.clock.get() + 10);
+            let split = 2.min(self.bytes.len());
+            sink.stdout(phase, step, &self.bytes[..split]);
+            sink.stdout(phase, step, &self.bytes[split..]);
+            Ok(StreamedProcessOutput {
+                output: ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: String::from_utf8_lossy(&self.bytes).into_owned(),
+                    stderr: String::new(),
+                    interrupted: false,
+                },
+                stdout_bytes: self.bytes.clone(),
+                stderr_bytes: Vec::new(),
+            })
         }
     }
 
@@ -1008,6 +1093,24 @@ mod tests {
         assert_eq!(expected_stderr, "build-warning\ntest-warning\n");
         assert_eq!(&*sink.stdout.lock().unwrap(), expected_stdout.as_bytes());
         assert_eq!(&*sink.stderr.lock().unwrap(), expected_stderr.as_bytes());
+        assert_eq!(
+            report
+                .steps
+                .iter()
+                .flat_map(|step| &step.stdout_bytes)
+                .copied()
+                .collect::<Vec<_>>(),
+            *sink.stdout.lock().unwrap()
+        );
+        assert_eq!(
+            report
+                .steps
+                .iter()
+                .flat_map(|step| &step.stderr_bytes)
+                .copied()
+                .collect::<Vec<_>>(),
+            *sink.stderr.lock().unwrap()
+        );
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("run.json");
         write_report_json(&report, &path).unwrap();
@@ -1020,6 +1123,124 @@ mod tests {
                 .unwrap()
                 .starts_with("sha256:")
         );
+    }
+
+    #[test]
+    fn report_publish_is_no_overwrite_atomic_and_concurrency_safe() {
+        let clock = FakeClock(Rc::new(Cell::new(0)));
+        let executor = FakeExecutor::new(&clock, success_outputs(3));
+        let report = DockerRunner::new(&executor, clock)
+            .run(&spec(true))
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+
+        let existing = temp.path().join("existing.json");
+        fs::write(&existing, b"{\"preserved\":true}").unwrap();
+        assert!(write_report_json(&report, &existing).is_err());
+        let preserved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&existing).unwrap()).unwrap();
+        assert_eq!(preserved["preserved"], true);
+
+        let shared = temp.path().join("shared.json");
+        let successes = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| write_report_json(&report, &shared).is_ok()))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|success| *success)
+                .count()
+        });
+        assert_eq!(successes, 1);
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&shared).unwrap()).unwrap();
+
+        std::thread::scope(|scope| {
+            let report = &report;
+            let handles: Vec<_> = (0..8)
+                .map(|index| {
+                    let path = temp.path().join(format!("distinct-{index}.json"));
+                    scope.spawn(move || write_report_json(report, &path))
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+        let leftovers: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary reports leaked: {leftovers:?}"
+        );
+    }
+
+    struct ByteAtATime {
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+
+    impl Read for ByteAtATime {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.offset == self.bytes.len() {
+                return Ok(0);
+            }
+            buffer[0] = self.bytes[self.offset];
+            self.offset += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn stream_capture_is_lossless_for_split_utf8_and_invalid_bytes() {
+        let original = vec![b'a', 0xf0, 0x9f, 0x98, 0x80, 0xff, b'z'];
+        let mut live = Vec::new();
+        let captured = read_stream(
+            ByteAtATime {
+                bytes: original.clone(),
+                offset: 0,
+            },
+            |chunk| live.extend_from_slice(chunk),
+        )
+        .unwrap();
+        assert_eq!(live, original);
+        assert_eq!(captured, original);
+        assert_ne!(String::from_utf8_lossy(&captured).as_bytes(), captured);
+    }
+
+    #[test]
+    fn report_lossless_bytes_exactly_reconstruct_non_utf8_live_output() {
+        let clock = FakeClock(Rc::new(Cell::new(0)));
+        let raw = vec![0xf0, 0x9f, 0x98, 0x80, 0xff, b'\n'];
+        let executor = RawStepExecutor {
+            clock: Rc::clone(&clock.0),
+            control_calls: Cell::new(0),
+            bytes: raw.clone(),
+        };
+        let sink = RecordingSink::default();
+        let report = DockerRunner::new_with_sink(&executor, clock, sink.clone())
+            .run(&spec(true))
+            .unwrap();
+        let from_report: Vec<u8> = report
+            .steps
+            .iter()
+            .flat_map(|step| step.stdout_bytes.iter().copied())
+            .collect();
+        assert_eq!(from_report, raw.repeat(report.steps.len()));
+        assert_eq!(from_report, *sink.stdout.lock().unwrap());
+        assert!(report.steps[0].stdout.contains('\u{fffd}'));
+        let json = serde_json::to_vec(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let recovered: Vec<u8> = value["steps"][0]["stdout_bytes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|byte| byte.as_u64().unwrap() as u8)
+            .collect();
+        assert_eq!(recovered, raw);
     }
 
     #[test]
