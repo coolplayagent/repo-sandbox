@@ -2,8 +2,12 @@
 
 use std::fmt::{self, Display, Formatter};
 
+use crate::config::Platform;
+use serde::Serialize;
+
 /// The OCI image name selected by the caller (for example `example/image:tag`).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct ImageRef(String);
 
 impl ImageRef {
@@ -28,7 +32,8 @@ impl Display for ImageRef {
 }
 
 /// A content digest returned by BuildKit.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct ImageDigest(String);
 
 impl ImageDigest {
@@ -55,9 +60,18 @@ impl Display for ImageDigest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BuiltImage {
     pub image: ImageRef,
+    /// Digest of the exported image or multi-platform image index.
+    pub digest: ImageDigest,
+    /// Concrete image manifest digest for every requested OCI platform.
+    pub platform_digests: Vec<PlatformDigest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PlatformDigest {
+    pub platform: Platform,
     pub digest: ImageDigest,
 }
 
@@ -71,5 +85,22 @@ mod tests {
         assert!(ImageRef::new("bad image").is_err());
         assert!(ImageDigest::new(format!("sha256:{}", "a".repeat(64))).is_ok());
         assert!(ImageDigest::new("sha256:short").is_err());
+    }
+
+    #[test]
+    fn build_results_can_report_each_oci_platform_digest() {
+        let digest = ImageDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap();
+        let built = BuiltImage {
+            image: ImageRef::new("registry.test/repo:tag").unwrap(),
+            digest: digest.clone(),
+            platform_digests: vec![PlatformDigest {
+                platform: Platform::LinuxArm64,
+                digest: digest.clone(),
+            }],
+        };
+        assert_eq!(built.platform_digests[0].platform, Platform::LinuxArm64);
+        let report = serde_yaml::to_string(&built).unwrap();
+        assert!(report.contains("linux/arm64"));
+        assert!(report.contains(digest.as_str()));
     }
 }

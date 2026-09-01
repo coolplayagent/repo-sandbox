@@ -37,6 +37,13 @@ with the environment exit code (`3`). `plan` resolves the selected central
 template and displays its stable dependency graph; `build`, `verify`, and
 `clean` remain reserved for follow-up issues.
 
+Environment builds use canonical `linux/amd64` and `linux/arm64` platform names.
+Cross-architecture and multi-platform builds require a builder that advertises
+the non-native platform through a native node or QEMU/binfmt; missing capability
+fails before Dockerfile execution. Multi-platform outputs use an explicit
+registry push or OCI layout because Docker `--load` cannot represent a manifest
+list. See [`docs/templates.md`](docs/templates.md).
+
 The versioned repository configuration and finite CLI override contract are
 documented in [`docs/config-v1.md`](docs/config-v1.md). A complete configuration
 is available as [`.repo-sandbox.yaml.example`](.repo-sandbox.yaml.example).

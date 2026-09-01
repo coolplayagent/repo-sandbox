@@ -1,5 +1,5 @@
-use serde::Deserialize;
 use serde::de::IntoDeserializer;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -50,7 +50,7 @@ impl TemplateSelection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum Platform {
     #[serde(rename = "linux/amd64")]
     LinuxAmd64,

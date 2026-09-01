@@ -1,7 +1,9 @@
 //! Docker Buildx/BuildKit adapter for central environment templates.
 
-use repo_sandbox_core::build::{BuiltImage, ImageDigest, ImageRef};
+use repo_sandbox_core::build::{BuiltImage, ImageDigest, ImageRef, PlatformDigest};
+use repo_sandbox_core::config::Platform;
 use repo_sandbox_core::template::TemplatePlan;
+use serde_yaml::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -132,11 +134,13 @@ impl Progress {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum ImageOutput {
     #[default]
     Load,
     Push,
+    /// Export an unpacked OCI image layout without requiring a registry.
+    OciDirectory(PathBuf),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -175,6 +179,8 @@ pub struct BuildOptions {
     pub proxy: ProxyConfig,
     pub cache: CacheConfig,
     pub builder: Builder,
+    /// Empty selects the plan's platform. More than one platform creates an OCI image index.
+    pub platforms: Vec<Platform>,
     /// Additional non-template build arguments. Reserved adapter arguments cannot be replaced.
     pub build_args: BTreeMap<String, String>,
 }
@@ -189,6 +195,7 @@ pub struct BuildRequest<'a> {
 #[derive(Debug)]
 pub enum BuildError {
     InvalidRequest(String),
+    Capability(String),
     Process {
         operation: &'static str,
         source: io::Error,
@@ -232,6 +239,9 @@ impl Display for BuildError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRequest(message) => write!(formatter, "invalid build request: {message}"),
+            Self::Capability(message) => {
+                write!(formatter, "platform capability unavailable: {message}")
+            }
             Self::Process { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::Failed {
                 operation,
@@ -266,11 +276,21 @@ impl Error for BuildError {}
 
 pub struct BuildKit<E> {
     executor: E,
+    native_platform: Option<Platform>,
 }
 
 impl<E> BuildKit<E> {
     pub const fn new(executor: E) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            native_platform: None,
+        }
+    }
+
+    /// Override host architecture discovery for deterministic orchestration tests.
+    pub const fn with_native_platform(mut self, platform: Platform) -> Self {
+        self.native_platform = Some(platform);
+        self
     }
 }
 
@@ -280,7 +300,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
         request: BuildRequest<'_>,
         cancellation: &dyn Cancellation,
     ) -> Result<BuiltImage, BuildError> {
-        validate_options(&request.options)?;
+        let platforms = validate_request(&request)?;
         let ephemeral = match &request.options.builder {
             Builder::Ephemeral { name } => Some(name.as_str()),
             Builder::Existing(_) => None,
@@ -305,7 +325,9 @@ impl<E: ProcessExecutor> BuildKit<E> {
             self.run("create Buildx builder", &create, cancellation)?;
         }
 
-        let primary = self.build_inner(&request, cancellation);
+        let primary = self
+            .ensure_platform_capabilities(&request.options.builder, &platforms, cancellation)
+            .and_then(|()| self.build_inner(&request, &platforms, cancellation));
         let cleanup = ephemeral.map(|name| self.remove_builder(name));
         match (primary, cleanup) {
             (result, None) | (result, Some(Ok(()))) => result,
@@ -320,6 +342,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
     fn build_inner(
         &self,
         request: &BuildRequest<'_>,
+        platforms: &[Platform],
         cancellation: &dyn Cancellation,
     ) -> Result<BuiltImage, BuildError> {
         let metadata_dir = tempfile::tempdir().map_err(|source| BuildError::Process {
@@ -327,17 +350,117 @@ impl<E: ProcessExecutor> BuildKit<E> {
             source,
         })?;
         let metadata_path = metadata_dir.path().join("metadata.json");
-        let invocation = build_invocation(request, &metadata_path)?;
+        let invocation = build_invocation(request, platforms, &metadata_path)?;
         self.run("docker buildx build", &invocation, cancellation)?;
         let source = fs::read_to_string(&metadata_path).map_err(|error| {
             BuildError::Metadata(format!("{}: {error}", metadata_path.display()))
         })?;
         let digest = json_string_field(&source, "containerimage.digest")
             .ok_or_else(|| BuildError::Metadata("missing `containerimage.digest`".to_owned()))?;
+        let digest = ImageDigest::new(digest).map_err(BuildError::Metadata)?;
+        let platform_digests = if platforms.len() == 1 {
+            vec![PlatformDigest {
+                platform: platforms[0],
+                digest: digest.clone(),
+            }]
+        } else {
+            self.inspect_platform_digests(request, platforms, cancellation)?
+        };
         Ok(BuiltImage {
             image: request.image.clone(),
-            digest: ImageDigest::new(digest).map_err(BuildError::Metadata)?,
+            digest,
+            platform_digests,
         })
+    }
+
+    fn ensure_platform_capabilities(
+        &self,
+        builder: &Builder,
+        platforms: &[Platform],
+        cancellation: &dyn Cancellation,
+    ) -> Result<(), BuildError> {
+        let native = self
+            .native_platform
+            .or_else(native_platform)
+            .ok_or_else(|| {
+                BuildError::Capability(format!(
+                    "host architecture `{}` is unsupported; expected amd64 or arm64",
+                    std::env::consts::ARCH
+                ))
+            })?;
+        let cross = platforms
+            .iter()
+            .copied()
+            .filter(|platform| *platform != native)
+            .collect::<Vec<_>>();
+        if cross.is_empty() {
+            return Ok(());
+        }
+
+        let mut args = vec!["buildx".to_owned(), "inspect".to_owned()];
+        if let Some(name) = match builder {
+            Builder::Existing(name) => name.as_deref(),
+            Builder::Ephemeral { name } => Some(name.as_str()),
+        } {
+            args.push(name.to_owned());
+        }
+        args.push("--bootstrap".to_owned());
+        let invocation = ProcessInvocation {
+            program: "docker".to_owned(),
+            args,
+            current_dir: None,
+        };
+        let output = self.output(
+            "inspect Buildx cross-platform capability",
+            &invocation,
+            cancellation,
+        )?;
+        let missing = cross
+            .into_iter()
+            .filter(|platform| !builder_advertises_platform(&output.stdout, *platform))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(BuildError::Capability(format!(
+                "builder does not advertise {}; install QEMU/binfmt or attach a native node, then verify `docker buildx inspect --bootstrap`",
+                join_platforms(&missing)
+            )))
+        }
+    }
+
+    fn inspect_platform_digests(
+        &self,
+        request: &BuildRequest<'_>,
+        platforms: &[Platform],
+        cancellation: &dyn Cancellation,
+    ) -> Result<Vec<PlatformDigest>, BuildError> {
+        let manifest = match &request.options.output {
+            ImageOutput::Push => {
+                let invocation = ProcessInvocation {
+                    program: "docker".to_owned(),
+                    args: vec![
+                        "buildx".to_owned(),
+                        "imagetools".to_owned(),
+                        "inspect".to_owned(),
+                        "--raw".to_owned(),
+                        request.image.to_string(),
+                    ],
+                    current_dir: None,
+                };
+                self.output(
+                    "inspect pushed multi-platform manifest",
+                    &invocation,
+                    cancellation,
+                )?
+                .stdout
+            }
+            ImageOutput::OciDirectory(path) => {
+                return parse_oci_platform_digests(path, platforms);
+            }
+            ImageOutput::Load => unreachable!("multi-platform load is rejected before execution"),
+        };
+        parse_platform_digests(&manifest, platforms)
     }
 
     fn remove_builder(&self, name: &str) -> Result<(), BuildError> {
@@ -416,9 +539,37 @@ impl<E: ProcessExecutor> BuildKit<E> {
         }
         Ok(())
     }
+
+    fn output(
+        &self,
+        operation: &'static str,
+        invocation: &ProcessInvocation,
+        cancellation: &dyn Cancellation,
+    ) -> Result<ProcessOutput, BuildError> {
+        let output = self
+            .executor
+            .execute(invocation, cancellation)
+            .map_err(|source| BuildError::Process { operation, source })?;
+        if output.interrupted {
+            return Err(BuildError::Interrupted {
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+        if output.exit_code != Some(0) {
+            return Err(BuildError::Failed {
+                operation,
+                exit_code: output.exit_code,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+        Ok(output)
+    }
 }
 
-fn validate_options(options: &BuildOptions) -> Result<(), BuildError> {
+fn validate_request(request: &BuildRequest<'_>) -> Result<Vec<Platform>, BuildError> {
+    let options = &request.options;
     if let Builder::Ephemeral { name } = &options.builder {
         let valid = !name.is_empty()
             && name.len() <= 64
@@ -439,11 +590,52 @@ fn validate_options(options: &BuildOptions) -> Result<(), BuildError> {
             )));
         }
     }
-    Ok(())
+    let platforms = if options.platforms.is_empty() {
+        vec![request.plan.platform]
+    } else {
+        options.platforms.clone()
+    };
+    let unique = platforms.iter().copied().collect::<BTreeSet<_>>();
+    if unique.len() != platforms.len() {
+        return Err(BuildError::InvalidRequest(
+            "target platforms must not contain duplicates".to_owned(),
+        ));
+    }
+    let unsupported = platforms
+        .iter()
+        .copied()
+        .filter(|platform| !request.plan.target_platforms.contains(platform))
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        return Err(BuildError::InvalidRequest(format!(
+            "template plan does not support requested platform(s): {}",
+            join_platforms(&unsupported)
+        )));
+    }
+    if platforms.len() > 1 && matches!(options.output, ImageOutput::Load) {
+        return Err(BuildError::InvalidRequest(
+            "multi-platform images cannot use `--load`; select push or an OCI directory output"
+                .to_owned(),
+        ));
+    }
+    if let ImageOutput::OciDirectory(path) = &options.output {
+        let path = path.to_string_lossy();
+        if path.is_empty()
+            || path
+                .bytes()
+                .any(|byte| matches!(byte, b',' | b'\n' | b'\r'))
+        {
+            return Err(BuildError::InvalidRequest(
+                "OCI output directory must be non-empty and contain no comma or newline".to_owned(),
+            ));
+        }
+    }
+    Ok(platforms)
 }
 
 fn build_invocation(
     request: &BuildRequest<'_>,
+    platforms: &[Platform],
     metadata_path: &Path,
 ) -> Result<ProcessInvocation, BuildError> {
     let context = request.catalog_root.join(&request.plan.build_context);
@@ -456,7 +648,7 @@ fn build_invocation(
     }
     args.extend([
         "--platform".to_owned(),
-        request.plan.platform.to_string(),
+        join_platforms(platforms),
         "--progress".to_owned(),
         request.options.progress.as_str().to_owned(),
         "--metadata-file".to_owned(),
@@ -464,15 +656,19 @@ fn build_invocation(
         "--tag".to_owned(),
         request.image.to_string(),
     ]);
-    args.push(
-        match request.options.output {
-            ImageOutput::Load => "--load",
-            ImageOutput::Push => "--push",
+    match &request.options.output {
+        ImageOutput::Load => args.push("--load".to_owned()),
+        ImageOutput::Push => args.push("--push".to_owned()),
+        ImageOutput::OciDirectory(path) => {
+            push_pair(
+                &mut args,
+                "--output",
+                format!("type=oci,dest={},tar=false", path.to_string_lossy()),
+            );
         }
-        .to_owned(),
-    );
+    }
 
-    let reserved = build_arguments(request.plan)?;
+    let reserved = build_arguments(request.plan, platforms)?;
     let reserved_names = reserved.keys().cloned().collect::<BTreeSet<_>>();
     for (name, value) in reserved
         .into_iter()
@@ -520,7 +716,168 @@ fn builder_is_missing(stderr: &str) -> bool {
         || message.contains("does not exist")
 }
 
-fn build_arguments(plan: &TemplatePlan) -> Result<BTreeMap<String, String>, BuildError> {
+fn native_platform() -> Option<Platform> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some(Platform::LinuxAmd64),
+        "aarch64" => Some(Platform::LinuxArm64),
+        _ => None,
+    }
+}
+
+fn join_platforms(platforms: &[Platform]) -> String {
+    platforms
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn builder_advertises_platform(output: &str, platform: Platform) -> bool {
+    output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("Platforms:")
+            .is_some_and(|values| {
+                values.split(',').any(|value| {
+                    value
+                        .trim()
+                        .trim_end_matches('*')
+                        .split_once('/')
+                        .is_some_and(|(os, architecture)| {
+                            format!("{os}/{architecture}") == platform.as_str()
+                        })
+                })
+            })
+    })
+}
+
+fn parse_platform_digests(
+    source: &str,
+    requested: &[Platform],
+) -> Result<Vec<PlatformDigest>, BuildError> {
+    let value: Value = serde_yaml::from_str(source)
+        .map_err(|error| BuildError::Metadata(format!("invalid image index JSON: {error}")))?;
+    let mut found = BTreeMap::new();
+    collect_platform_descriptors(&value, &mut found)?;
+    finish_platform_digests(found, requested)
+}
+
+fn parse_oci_platform_digests(
+    layout: &Path,
+    requested: &[Platform],
+) -> Result<Vec<PlatformDigest>, BuildError> {
+    let source =
+        fs::read_to_string(layout.join("index.json")).map_err(|source| BuildError::Process {
+            operation: "read OCI image index",
+            source,
+        })?;
+    let value: Value = serde_yaml::from_str(&source)
+        .map_err(|error| BuildError::Metadata(format!("invalid OCI index JSON: {error}")))?;
+    let mut found = BTreeMap::new();
+    let mut pending = vec![value];
+    let mut visited = BTreeSet::new();
+    while let Some(index) = pending.pop() {
+        collect_platform_descriptors(&index, &mut found)?;
+        let manifests = index
+            .get("manifests")
+            .and_then(Value::as_sequence)
+            .ok_or_else(|| BuildError::Metadata("OCI output is not an image index".to_owned()))?;
+        for descriptor in manifests {
+            if descriptor.get("platform").is_some() {
+                continue;
+            }
+            let Some(digest) = descriptor.get("digest").and_then(Value::as_str) else {
+                continue;
+            };
+            let digest = ImageDigest::new(digest).map_err(BuildError::Metadata)?;
+            if !visited.insert(digest.as_str().to_owned()) {
+                continue;
+            }
+            let hex = digest
+                .as_str()
+                .strip_prefix("sha256:")
+                .expect("validated digest has sha256 prefix");
+            let blob = layout.join("blobs").join("sha256").join(hex);
+            let source = fs::read_to_string(&blob).map_err(|source| BuildError::Process {
+                operation: "read nested OCI image index",
+                source,
+            })?;
+            let nested: Value = serde_yaml::from_str(&source).map_err(|error| {
+                BuildError::Metadata(format!("invalid nested OCI index JSON: {error}"))
+            })?;
+            if nested.get("manifests").is_some() {
+                pending.push(nested);
+            }
+        }
+    }
+    finish_platform_digests(found, requested)
+}
+
+fn collect_platform_descriptors(
+    value: &Value,
+    found: &mut BTreeMap<Platform, ImageDigest>,
+) -> Result<(), BuildError> {
+    let manifests = value
+        .get("manifests")
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| BuildError::Metadata("image output is not a manifest list".to_owned()))?;
+    for descriptor in manifests {
+        let Some(platform) = descriptor.get("platform") else {
+            continue;
+        };
+        let platform = match (
+            platform.get("os").and_then(Value::as_str),
+            platform.get("architecture").and_then(Value::as_str),
+        ) {
+            (Some("linux"), Some("amd64")) => Platform::LinuxAmd64,
+            (Some("linux"), Some("arm64")) => Platform::LinuxArm64,
+            _ => continue,
+        };
+        let digest = descriptor
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BuildError::Metadata(format!("manifest for {platform} has no digest"))
+            })?;
+        let digest = ImageDigest::new(digest).map_err(BuildError::Metadata)?;
+        if let Some(previous) = found.insert(platform, digest.clone())
+            && previous != digest
+        {
+            return Err(BuildError::Metadata(format!(
+                "manifest list contains duplicate {platform} entries"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn finish_platform_digests(
+    found: BTreeMap<Platform, ImageDigest>,
+    requested: &[Platform],
+) -> Result<Vec<PlatformDigest>, BuildError> {
+    let missing = requested
+        .iter()
+        .copied()
+        .filter(|platform| !found.contains_key(platform))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(BuildError::Metadata(format!(
+            "manifest list is missing requested platform(s): {}",
+            join_platforms(&missing)
+        )));
+    }
+    Ok(requested
+        .iter()
+        .map(|platform| PlatformDigest {
+            platform: *platform,
+            digest: found[platform].clone(),
+        })
+        .collect())
+}
+
+fn build_arguments(
+    plan: &TemplatePlan,
+    platforms: &[Platform],
+) -> Result<BTreeMap<String, String>, BuildError> {
     let mut arguments = BTreeMap::from([
         ("BASE_IMAGE".to_owned(), plan.base_image.clone()),
         (
@@ -531,7 +888,10 @@ fn build_arguments(plan: &TemplatePlan) -> Result<BTreeMap<String, String>, Buil
             "REPO_SANDBOX_TEMPLATE_VERSION".to_owned(),
             plan.template_version.clone(),
         ),
-        ("REPO_SANDBOX_PLAN_DIGEST".to_owned(), plan_digest(plan)),
+        (
+            "REPO_SANDBOX_PLAN_DIGEST".to_owned(),
+            plan_digest_for_platforms(plan, platforms),
+        ),
     ]);
     for (name, value) in &plan.parameters {
         let name = parameter_argument_name(name)?;
@@ -569,15 +929,21 @@ fn parameter_argument_name(name: &str) -> Result<String, BuildError> {
 
 /// Stable fingerprint used by the Dockerfile so plan changes invalidate image configuration.
 pub fn plan_digest(plan: &TemplatePlan) -> String {
+    plan_digest_for_platforms(plan, &[plan.platform])
+}
+
+fn plan_digest_for_platforms(plan: &TemplatePlan, platforms: &[Platform]) -> String {
     let mut hasher = Sha256::new();
     for value in [
         plan.template_id.as_str(),
         plan.template_version.as_str(),
         plan.base_image.as_str(),
-        plan.platform.as_str(),
         &plan.build_context.to_string_lossy(),
     ] {
         hash_field(&mut hasher, value);
+    }
+    for platform in platforms {
+        hash_field(&mut hasher, platform.as_str());
     }
     for (name, value) in &plan.parameters {
         hash_field(&mut hasher, name);
@@ -639,6 +1005,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum BuildBehavior {
         Success,
+        MissingCrossPlatform,
         Failure,
         Interrupted,
         CreateConflict,
@@ -671,6 +1038,21 @@ mod tests {
         ) -> io::Result<ProcessOutput> {
             self.invocations.lock().unwrap().push(invocation.clone());
             let operation = invocation.args.get(1).map(String::as_str);
+            if operation == Some("inspect")
+                && invocation.args.iter().any(|arg| arg == "--bootstrap")
+            {
+                let platforms = if matches!(self.behavior, BuildBehavior::MissingCrossPlatform) {
+                    "linux/amd64"
+                } else {
+                    "linux/amd64, linux/arm64, linux/arm64/v8"
+                };
+                return Ok(ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: format!("Name: test\nStatus: running\nPlatforms: {platforms}"),
+                    stderr: String::new(),
+                    interrupted: false,
+                });
+            }
             if operation == Some("inspect") {
                 if matches!(self.behavior, BuildBehavior::ExistingName) {
                     return Ok(ProcessOutput {
@@ -699,7 +1081,7 @@ mod tests {
             let is_build = operation == Some("build");
             if is_build {
                 match self.behavior {
-                    BuildBehavior::Success => {
+                    BuildBehavior::Success | BuildBehavior::MissingCrossPlatform => {
                         let index = invocation
                             .args
                             .iter()
@@ -730,6 +1112,18 @@ mod tests {
                     BuildBehavior::ExistingName => unreachable!("inspect fails before build"),
                 }
             }
+            if operation == Some("imagetools") {
+                return Ok(ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: format!(
+                        r#"{{"schemaVersion":2,"manifests":[{{"digest":"sha256:{}","platform":{{"os":"linux","architecture":"amd64"}}}},{{"digest":"sha256:{}","platform":{{"os":"linux","architecture":"arm64","variant":"v8"}}}}]}}"#,
+                        "b".repeat(64),
+                        "c".repeat(64)
+                    ),
+                    stderr: String::new(),
+                    interrupted: false,
+                });
+            }
             Ok(ProcessOutput {
                 exit_code: Some(0),
                 stdout: String::new(),
@@ -745,6 +1139,7 @@ mod tests {
             template_version: "1.0.0".to_owned(),
             base_image: "docker.io/library/rust:1.97.0-bookworm".to_owned(),
             platform: Platform::LinuxAmd64,
+            target_platforms: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
             build_context: PathBuf::from("templates/rust-bazel/context"),
             parameters: BTreeMap::from([
                 ("bazelisk_version".to_owned(), "1.27.0".to_owned()),
@@ -883,6 +1278,107 @@ mod tests {
                 .join("templates/rust-bazel/context")
                 .to_string_lossy()
         );
+    }
+
+    #[test]
+    fn multi_platform_push_builds_and_verifies_both_manifest_digests() {
+        let executor = FakeExecutor::new(BuildBehavior::Success);
+        let plan = plan();
+        let result = BuildKit::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(
+                request(
+                    &plan,
+                    BuildOptions {
+                        output: ImageOutput::Push,
+                        platforms: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
+                        ..BuildOptions::default()
+                    },
+                ),
+                &NeverCancelled,
+            )
+            .unwrap();
+        assert_eq!(result.platform_digests.len(), 2);
+        assert_eq!(result.platform_digests[0].platform, Platform::LinuxAmd64);
+        assert_eq!(
+            result.platform_digests[0].digest.as_str(),
+            format!("sha256:{}", "b".repeat(64))
+        );
+        assert_eq!(result.platform_digests[1].platform, Platform::LinuxArm64);
+
+        let invocations = executor.invocations();
+        let build = invocations
+            .iter()
+            .find(|call| call.args.get(1).map(String::as_str) == Some("build"))
+            .unwrap();
+        assert_eq!(
+            value_after(&build.args, "--platform"),
+            "linux/amd64,linux/arm64"
+        );
+        assert!(build.args.contains(&"--push".to_owned()));
+        assert!(invocations.iter().any(|call| call.args.starts_with(&[
+            "buildx".to_owned(),
+            "imagetools".to_owned(),
+            "inspect".to_owned(),
+            "--raw".to_owned()
+        ])));
+    }
+
+    #[test]
+    fn multi_platform_load_and_duplicate_targets_fail_before_docker() {
+        let executor = FakeExecutor::new(BuildBehavior::Success);
+        let plan = plan();
+        for platforms in [
+            vec![Platform::LinuxAmd64, Platform::LinuxArm64],
+            vec![Platform::LinuxAmd64, Platform::LinuxAmd64],
+        ] {
+            let error = BuildKit::new(&executor)
+                .build(
+                    request(
+                        &plan,
+                        BuildOptions {
+                            platforms,
+                            ..BuildOptions::default()
+                        },
+                    ),
+                    &NeverCancelled,
+                )
+                .unwrap_err();
+            assert!(matches!(error, BuildError::InvalidRequest(_)));
+        }
+        assert!(executor.invocations().is_empty());
+    }
+
+    #[test]
+    fn missing_qemu_or_native_node_fails_before_build() {
+        let executor = FakeExecutor::new(BuildBehavior::MissingCrossPlatform);
+        let mut arm_plan = plan();
+        arm_plan.platform = Platform::LinuxArm64;
+        let error = BuildKit::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(request(&arm_plan, BuildOptions::default()), &NeverCancelled)
+            .unwrap_err();
+        assert!(matches!(error, BuildError::Capability(_)));
+        assert!(error.to_string().contains("QEMU/binfmt"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert!(invocations[0].args.contains(&"--bootstrap".to_owned()));
+        assert!(
+            !invocations
+                .iter()
+                .any(|call| call.args.get(1).map(String::as_str) == Some("build"))
+        );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_missing_requested_platform() {
+        let source = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"digest":"sha256:{}","platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#,
+            "d".repeat(64)
+        );
+        let error = parse_platform_digests(&source, &[Platform::LinuxAmd64, Platform::LinuxArm64])
+            .unwrap_err();
+        assert!(error.to_string().contains("linux/arm64"));
     }
 
     #[test]
@@ -1106,5 +1602,169 @@ LABEL org.opencontainers.image.title="${REPO_SANDBOX_TEMPLATE_ID}" \
             .execute(&cleanup, &NeverCancelled)
             .unwrap();
         assert_eq!(output.exit_code, Some(0), "{}", output.stderr);
+    }
+
+    /// Optional end-to-end check for both executable architectures and a local OCI index.
+    #[test]
+    #[ignore = "requires Docker buildx, busybox:1.36, and amd64/arm64 native nodes or QEMU/binfmt"]
+    fn docker_two_architecture_smoke_and_oci_manifest() {
+        let catalog = tempfile::tempdir().unwrap();
+        let context = catalog.path().join("context");
+        fs::create_dir(&context).unwrap();
+        fs::write(
+            context.join("Dockerfile"),
+            r#"FROM busybox:1.36
+RUN uname -m > /built-architecture
+CMD ["cat", "/built-architecture"]
+"#,
+        )
+        .unwrap();
+        let mut smoke_plan = plan();
+        smoke_plan.base_image = "busybox:1.36".to_owned();
+        smoke_plan.build_context = PathBuf::from("context");
+        smoke_plan.stages.clear();
+        let adapter = BuildKit::new(SystemProcessExecutor);
+        let run = |args: Vec<String>| {
+            SystemProcessExecutor
+                .execute(
+                    &ProcessInvocation {
+                        program: "docker".to_owned(),
+                        args,
+                        current_dir: None,
+                    },
+                    &NeverCancelled,
+                )
+                .unwrap()
+        };
+        let mut images = Vec::new();
+        for (platform, expected) in [
+            (Platform::LinuxAmd64, "x86_64"),
+            (Platform::LinuxArm64, "aarch64"),
+        ] {
+            smoke_plan.platform = platform;
+            let image = ImageRef::new(format!(
+                "repo-sandbox-issue10-{}:{}",
+                platform.as_str().replace('/', "-"),
+                std::process::id()
+            ))
+            .unwrap();
+            let built = adapter
+                .build(
+                    BuildRequest {
+                        plan: &smoke_plan,
+                        catalog_root: catalog.path(),
+                        image: image.clone(),
+                        options: BuildOptions {
+                            progress: Progress::Plain,
+                            ..BuildOptions::default()
+                        },
+                    },
+                    &NeverCancelled,
+                )
+                .unwrap();
+            assert_eq!(built.platform_digests[0].platform, platform);
+            let smoke = run(vec![
+                "run".to_owned(),
+                "--rm".to_owned(),
+                "--platform".to_owned(),
+                platform.to_string(),
+                image.to_string(),
+            ]);
+            assert_eq!(smoke.exit_code, Some(0), "{}", smoke.stderr);
+            assert_eq!(smoke.stdout.trim(), expected);
+            images.push(image);
+        }
+
+        let output = catalog.path().join("multi-arch-oci");
+        let multi = adapter
+            .build(
+                BuildRequest {
+                    plan: &smoke_plan,
+                    catalog_root: catalog.path(),
+                    image: ImageRef::new("repo-sandbox-issue10:multi").unwrap(),
+                    options: BuildOptions {
+                        progress: Progress::Plain,
+                        output: ImageOutput::OciDirectory(output),
+                        platforms: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
+                        ..BuildOptions::default()
+                    },
+                },
+                &NeverCancelled,
+            )
+            .unwrap();
+        assert_eq!(
+            multi
+                .platform_digests
+                .iter()
+                .map(|entry| entry.platform)
+                .collect::<Vec<_>>(),
+            [Platform::LinuxAmd64, Platform::LinuxArm64]
+        );
+        for image in images {
+            let _ = run(vec![
+                "image".to_owned(),
+                "rm".to_owned(),
+                "--force".to_owned(),
+                image.to_string(),
+            ]);
+        }
+    }
+
+    /// Optional registry check. Authentication and registry lifecycle remain Issue #11 concerns.
+    #[test]
+    #[ignore = "requires REPO_SANDBOX_MULTIARCH_TEST_IMAGE naming a writable disposable registry tag"]
+    fn docker_pushed_tag_contains_and_runs_both_platforms() {
+        let image = std::env::var("REPO_SANDBOX_MULTIARCH_TEST_IMAGE")
+            .expect("set REPO_SANDBOX_MULTIARCH_TEST_IMAGE to a disposable writable tag");
+        let catalog = tempfile::tempdir().unwrap();
+        fs::write(
+            catalog.path().join("Dockerfile"),
+            "FROM busybox:1.36\nCMD [\"uname\", \"-m\"]\n",
+        )
+        .unwrap();
+        let mut smoke_plan = plan();
+        smoke_plan.base_image = "busybox:1.36".to_owned();
+        smoke_plan.build_context = PathBuf::from(".");
+        smoke_plan.stages.clear();
+        let built = BuildKit::new(SystemProcessExecutor)
+            .build(
+                BuildRequest {
+                    plan: &smoke_plan,
+                    catalog_root: catalog.path(),
+                    image: ImageRef::new(&image).unwrap(),
+                    options: BuildOptions {
+                        progress: Progress::Plain,
+                        output: ImageOutput::Push,
+                        platforms: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
+                        ..BuildOptions::default()
+                    },
+                },
+                &NeverCancelled,
+            )
+            .unwrap();
+        assert_eq!(built.platform_digests.len(), 2);
+        for (platform, expected) in [
+            (Platform::LinuxAmd64, "x86_64"),
+            (Platform::LinuxArm64, "aarch64"),
+        ] {
+            let smoke = SystemProcessExecutor
+                .execute(
+                    &ProcessInvocation {
+                        program: "docker".to_owned(),
+                        args: vec![
+                            "run".to_owned(),
+                            "--rm".to_owned(),
+                            "--platform".to_owned(),
+                            platform.to_string(),
+                            image.clone(),
+                        ],
+                        current_dir: None,
+                    },
+                    &NeverCancelled,
+                )
+                .unwrap();
+            assert_eq!(smoke.exit_code, Some(0), "{}", smoke.stderr);
+            assert_eq!(smoke.stdout.trim(), expected);
+        }
     }
 }

@@ -346,6 +346,7 @@ name = "repo-sandbox-adapters"
 version = "0.1.0"
 dependencies = [
  "repo-sandbox-core",
+ "serde_yaml",
  "sha2",
  "tempfile",
  "tracing-subscriber",
