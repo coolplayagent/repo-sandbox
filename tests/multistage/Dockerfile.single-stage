@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.7
+# This is the checked-in pre-change central template plus the same task source.
+# It keeps exactly the same Rust, Cargo, C compiler, Git, CA and Bazel behavior;
+# its extra contents are the natural consequence of single-stage inheritance.
+ARG BASE_IMAGE=docker.io/library/rust:1.97.0-bookworm
+FROM ${BASE_IMAGE} AS task
+ARG TARGETARCH
+ARG RUST_VERSION=1.97.0
+ARG BAZELISK_VERSION=1.27.0
+ARG BAZEL_VERSION=8.3.1
+ARG SOURCE_DIGEST
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates curl git \
+    && case "$TARGETARCH" in amd64) bazel_arch=x86_64 ;; arm64) bazel_arch=arm64 ;; *) exit 64 ;; esac \
+    && curl --fail --location --show-error \
+      "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-${TARGETARCH}" \
+      --output /usr/local/bin/bazelisk \
+    && curl --fail --location --show-error \
+      "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-linux-${bazel_arch}" \
+      --output /usr/local/bin/bazel \
+    && chmod 0755 /usr/local/bin/bazel /usr/local/bin/bazelisk \
+    && rustup default "$RUST_VERSION" \
+    && ln -sf "$(rustup which --toolchain "$RUST_VERSION" rustc)" /usr/local/cargo/bin/rustc \
+    && ln -sf "$(rustup which --toolchain "$RUST_VERSION" rustdoc)" /usr/local/cargo/bin/rustdoc \
+    && rm -rf /var/lib/apt/lists/*
+COPY --link source/ /workspace/
+WORKDIR /workspace
+LABEL io.repo-sandbox.source.digest="${SOURCE_DIGEST}"

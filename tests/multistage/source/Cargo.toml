@@ -1,0 +1,10 @@
+[package]
+name = "multistage-smoke"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "multistage-smoke"
+path = "src/main.rs"
+
+[workspace]

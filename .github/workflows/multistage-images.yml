@@ -1,0 +1,31 @@
+name: Multistage image acceptance
+
+on:
+  pull_request:
+    paths:
+      - 'templates/**'
+      - 'crates/adapters/src/buildkit.rs'
+      - 'crates/adapters/src/task_image.rs'
+      - 'scripts/docker/multistage-acceptance.sh'
+      - 'tests/multistage/**'
+      - '.github/workflows/multistage-images.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-bazel-multistage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: amd64,arm64
+      - uses: docker/setup-buildx-action@v3
+        id: buildx
+      - name: Compare behavior, contents, cache reuse, and size
+        env:
+          REPO_SANDBOX_BUILDER: ${{ steps.buildx.outputs.name }}
+        run: scripts/docker/multistage-acceptance.sh

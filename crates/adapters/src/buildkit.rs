@@ -190,6 +190,56 @@ pub struct BuildRequest<'a> {
     pub catalog_root: &'a Path,
     pub image: ImageRef,
     pub options: BuildOptions,
+    target: ExportTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExportTarget {
+    Environment,
+    Task,
+}
+
+impl ExportTarget {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::Task => "task",
+        }
+    }
+}
+
+impl<'a> BuildRequest<'a> {
+    /// Construct a central-template build. The exported target is fixed so a
+    /// caller cannot select an assembly stage or leak its cache/secrets.
+    pub fn environment(
+        plan: &'a TemplatePlan,
+        catalog_root: &'a Path,
+        image: ImageRef,
+        options: BuildOptions,
+    ) -> Self {
+        Self {
+            plan,
+            catalog_root,
+            image,
+            options,
+            target: ExportTarget::Environment,
+        }
+    }
+
+    pub(crate) fn task(
+        plan: &'a TemplatePlan,
+        catalog_root: &'a Path,
+        image: ImageRef,
+        options: BuildOptions,
+    ) -> Self {
+        Self {
+            plan,
+            catalog_root,
+            image,
+            options,
+            target: ExportTarget::Task,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -655,6 +705,8 @@ fn build_invocation(
         metadata_path.to_string_lossy().into_owned(),
         "--tag".to_owned(),
         request.image.to_string(),
+        "--target".to_owned(),
+        request.target.as_str().to_owned(),
     ]);
     match &request.options.output {
         ImageOutput::Load => args.push("--load".to_owned()),
@@ -1155,12 +1207,12 @@ mod tests {
     }
 
     fn request(plan: &TemplatePlan, options: BuildOptions) -> BuildRequest<'_> {
-        BuildRequest {
+        BuildRequest::environment(
             plan,
-            catalog_root: Path::new("catalog root with spaces"),
-            image: ImageRef::new("registry.test/repo-sandbox/rust-bazel:test").unwrap(),
+            Path::new("catalog root with spaces"),
+            ImageRef::new("registry.test/repo-sandbox/rust-bazel:test").unwrap(),
             options,
-        }
+        )
     }
 
     fn value_after<'a>(args: &'a [String], flag: &str) -> &'a str {
@@ -1192,6 +1244,7 @@ mod tests {
         let invocations = executor.invocations();
         assert_eq!(invocations.len(), 2);
         for invocation in invocations {
+            assert_eq!(value_after(&invocation.args, "--target"), "environment");
             assert_eq!(
                 value_after(&invocation.args, "--cache-from"),
                 "type=registry,ref=registry.test/cache:rust"
@@ -1201,6 +1254,88 @@ mod tests {
                 "type=registry,ref=registry.test/cache:rust,mode=max"
             );
         }
+    }
+
+    #[test]
+    fn central_dockerfile_confines_assembly_inputs_to_named_stages() {
+        let dockerfile = include_str!("../../../templates/rust-bazel/context/Dockerfile");
+        let toolchain = dockerfile.find(" AS toolchain-build").unwrap();
+        let environment = dockerfile.find(" AS environment").unwrap();
+        assert!(toolchain < environment);
+        assert!(dockerfile.contains("COPY --from=toolchain-build /usr/local/cargo/"));
+        assert!(dockerfile.contains("COPY --from=toolchain-build /usr/local/rustup/"));
+        assert!(dockerfile.contains("COPY --from=toolchain-build /toolchain/bin/bazel"));
+        assert!(dockerfile.contains("COPY --from=toolchain-build /toolchain/bin/bazelisk"));
+        assert!(dockerfile.contains("--mount=type=secret,id=github_token,required=false"));
+        for cache in [
+            "repo-sandbox-apt-",
+            "repo-sandbox-cargo-registry-",
+            "repo-sandbox-cargo-git-",
+            "repo-sandbox-bazel-",
+            "repo-sandbox-toolchain-downloads-",
+        ] {
+            assert!(dockerfile.contains(cache), "missing cache mount {cache}");
+        }
+        let final_stage = &dockerfile[environment..];
+        assert!(
+            !final_stage
+                .contains("apt-get install --yes --no-install-recommends ca-certificates curl")
+        );
+        assert!(!final_stage.contains("/run/secrets/github_token"));
+        assert!(final_stage.contains("target=/root/.cache/bazel"));
+        assert!(final_stage.contains("rustup default \"$RUST_VERSION\""));
+        assert!(final_stage.contains("rustup which --toolchain \"$RUST_VERSION\" rustc"));
+        assert!(!final_stage.contains("/toolchain-downloads"));
+        assert!(!final_stage.contains("BAZELISK_HOME="));
+
+        let acceptance = include_str!("../../../scripts/docker/multistage-acceptance.sh");
+        for contract in [
+            "assert_cached_step \"$warm_log\" '[toolchain-build 2/2] RUN'",
+            "cold_environment_identity",
+            "environment_before_source_change",
+            "environment_after_source_change",
+            "restored_task_identity",
+            "test -z \"$(find /root/.cache",
+            "test ! -e /root/.cache/bazelisk",
+        ] {
+            assert!(
+                acceptance.contains(contract),
+                "missing acceptance contract {contract}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_is_a_structured_fixed_argument_not_a_caller_build_arg() {
+        let plan = plan();
+        let invocation = build_invocation(
+            &request(
+                &plan,
+                BuildOptions {
+                    build_args: BTreeMap::from([(
+                        "TARGET".to_owned(),
+                        "toolchain-build".to_owned(),
+                    )]),
+                    ..BuildOptions::default()
+                },
+            ),
+            &[Platform::LinuxAmd64],
+            Path::new("metadata.json"),
+        )
+        .unwrap();
+        assert_eq!(value_after(&invocation.args, "--target"), "environment");
+        assert!(
+            invocation
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--build-arg", "TARGET=toolchain-build"])
+        );
+        assert!(
+            !invocation
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--target", "toolchain-build"])
+        );
     }
 
     #[test]
@@ -1554,7 +1689,7 @@ mod tests {
         fs::write(
             context.join("Dockerfile"),
             r#"ARG BASE_IMAGE=scratch
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS environment
 ARG REPO_SANDBOX_TEMPLATE_ID
 ARG REPO_SANDBOX_TEMPLATE_VERSION
 ARG REPO_SANDBOX_PLAN_DIGEST
@@ -1574,15 +1709,15 @@ LABEL org.opencontainers.image.title="${REPO_SANDBOX_TEMPLATE_ID}" \
         for _ in 0..2 {
             let result = adapter
                 .build(
-                    BuildRequest {
-                        plan: &plan,
-                        catalog_root: catalog.path(),
-                        image: image.clone(),
-                        options: BuildOptions {
+                    BuildRequest::environment(
+                        &plan,
+                        catalog.path(),
+                        image.clone(),
+                        BuildOptions {
                             progress: Progress::Plain,
                             ..BuildOptions::default()
                         },
-                    },
+                    ),
                     &NeverCancelled,
                 )
                 .unwrap();
@@ -1613,7 +1748,7 @@ LABEL org.opencontainers.image.title="${REPO_SANDBOX_TEMPLATE_ID}" \
         fs::create_dir(&context).unwrap();
         fs::write(
             context.join("Dockerfile"),
-            r#"FROM busybox:1.36
+            r#"FROM busybox:1.36 AS environment
 RUN uname -m > /built-architecture
 CMD ["cat", "/built-architecture"]
 "#,
@@ -1650,15 +1785,15 @@ CMD ["cat", "/built-architecture"]
             .unwrap();
             let built = adapter
                 .build(
-                    BuildRequest {
-                        plan: &smoke_plan,
-                        catalog_root: catalog.path(),
-                        image: image.clone(),
-                        options: BuildOptions {
+                    BuildRequest::environment(
+                        &smoke_plan,
+                        catalog.path(),
+                        image.clone(),
+                        BuildOptions {
                             progress: Progress::Plain,
                             ..BuildOptions::default()
                         },
-                    },
+                    ),
                     &NeverCancelled,
                 )
                 .unwrap();
@@ -1678,17 +1813,17 @@ CMD ["cat", "/built-architecture"]
         let output = catalog.path().join("multi-arch-oci");
         let multi = adapter
             .build(
-                BuildRequest {
-                    plan: &smoke_plan,
-                    catalog_root: catalog.path(),
-                    image: ImageRef::new("repo-sandbox-issue10:multi").unwrap(),
-                    options: BuildOptions {
+                BuildRequest::environment(
+                    &smoke_plan,
+                    catalog.path(),
+                    ImageRef::new("repo-sandbox-issue10:multi").unwrap(),
+                    BuildOptions {
                         progress: Progress::Plain,
                         output: ImageOutput::OciDirectory(output),
                         platforms: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
                         ..BuildOptions::default()
                     },
-                },
+                ),
                 &NeverCancelled,
             )
             .unwrap();
@@ -1719,7 +1854,7 @@ CMD ["cat", "/built-architecture"]
         let catalog = tempfile::tempdir().unwrap();
         fs::write(
             catalog.path().join("Dockerfile"),
-            "FROM busybox:1.36\nCMD [\"uname\", \"-m\"]\n",
+            "FROM busybox:1.36 AS environment\nCMD [\"uname\", \"-m\"]\n",
         )
         .unwrap();
         let mut smoke_plan = plan();
@@ -1728,17 +1863,17 @@ CMD ["cat", "/built-architecture"]
         smoke_plan.stages.clear();
         let built = BuildKit::new(SystemProcessExecutor)
             .build(
-                BuildRequest {
-                    plan: &smoke_plan,
-                    catalog_root: catalog.path(),
-                    image: ImageRef::new(&image).unwrap(),
-                    options: BuildOptions {
+                BuildRequest::environment(
+                    &smoke_plan,
+                    catalog.path(),
+                    ImageRef::new(&image).unwrap(),
+                    BuildOptions {
                         progress: Progress::Plain,
                         output: ImageOutput::Push,
                         platforms: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
                         ..BuildOptions::default()
                     },
-                },
+                ),
                 &NeverCancelled,
             )
             .unwrap();

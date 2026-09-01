@@ -1,0 +1,8 @@
+# syntax=docker/dockerfile:1.7
+ARG ENVIRONMENT_IMAGE
+FROM ${ENVIRONMENT_IMAGE} AS environment
+FROM environment AS task
+ARG SOURCE_DIGEST
+COPY --link source/ /workspace/
+WORKDIR /workspace
+LABEL io.repo-sandbox.source.digest="${SOURCE_DIGEST}"

@@ -27,6 +27,13 @@ Each build uses an automatically removed temporary directory containing only:
 - a deny-by-default `.dockerignore`; and
 - the snapshot under `source/`.
 
+The generated Dockerfile names the pinned parent alias `environment` and the
+only exported final stage `task`. The adapter always supplies `--target task`;
+there is no caller-supplied target string. `COPY --link source/ /workspace/` is
+the sole source-dependent layer, so changing only repository content reuses the
+toolchain/environment image while producing a new snapshot digest, task label,
+identity and COPY layer.
+
 The adapter walks the snapshot without following symlinks, recomputes the exact
 #5 normalized path/mode/content manifest while copying, rejects digest or file
 count mismatches, and fails before Docker sees common Git or
