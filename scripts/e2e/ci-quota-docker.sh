@@ -63,6 +63,9 @@ start() {
   mount -o pquota "$loop_device" "$mountpoint"
   findmnt -rn -M "$mountpoint" -o OPTIONS | grep -Eq '(^|,)(pquota|prjquota)(,|$)'
   mkdir -p "$mountpoint/docker"
+  ip link add "$bridge" type bridge
+  ip address add "172.31.$subnet_octet.1/24" dev "$bridge"
+  ip link set "$bridge" up
 
   local runner_uid=${SUDO_UID:-1001}
   local runner_gid=${SUDO_GID:-121}
@@ -73,7 +76,6 @@ start() {
     "--pidfile=$state/dockerd.pid" \
     --storage-driver=overlay2 \
     "--bridge=$bridge" \
-    "--bip=172.31.$subnet_octet.1/24" \
     --iptables=false \
     --ip-forward=false \
     --ip-masq=false \
