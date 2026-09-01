@@ -1173,7 +1173,218 @@ fn display_safe_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Shutdown, TcpListener, TcpStream};
     use std::process::Stdio;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    struct LocalPublicGitHttp {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        server: Option<thread::JoinHandle<()>>,
+    }
+
+    impl LocalPublicGitHttp {
+        fn start(root: &Path) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let root = root.to_owned();
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let server = thread::spawn(move || {
+                let mut workers = Vec::new();
+                while !thread_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nodelay(true).unwrap();
+                            let root = root.clone();
+                            workers.push(thread::spawn(move || {
+                                serve_public_git_backend(stream, &root)
+                            }));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept local public Git HTTP request: {error}"),
+                    }
+                }
+                for worker in workers {
+                    worker.join().expect("public Git HTTP request worker");
+                }
+            });
+            Self {
+                port,
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn repository(&self) -> String {
+            format!("http://127.0.0.1:{}/repo.git", self.port)
+        }
+
+        fn stop(&mut self) {
+            self.shutdown();
+            assert!(
+                TcpStream::connect(("127.0.0.1", self.port)).is_err(),
+                "task-owned public Git HTTP port {} remained open",
+                self.port
+            );
+        }
+
+        fn shutdown(&mut self) {
+            if let Some(server) = self.server.take() {
+                self.stop.store(true, Ordering::Release);
+                let _ = TcpStream::connect(("127.0.0.1", self.port));
+                server.join().expect("task-owned public Git HTTP thread");
+            }
+        }
+    }
+
+    impl Drop for LocalPublicGitHttp {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    fn serve_public_git_backend(mut stream: TcpStream, root: &Path) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            if let Some(position) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break position + 4;
+            }
+            if request.len() >= 16 * 1024 {
+                return;
+            }
+            let count = match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(count) => count,
+            };
+            request.extend_from_slice(&chunk[..count]);
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+        let mut lines = headers.split("\r\n");
+        let first = lines.next().unwrap_or_default();
+        let mut fields = first.split_whitespace();
+        let method = fields.next().unwrap_or_default();
+        let target = fields.next().unwrap_or_default();
+        let (path_info, query) = target.split_once('?').unwrap_or((target, ""));
+        let relative = path_info.trim_start_matches('/');
+        let safe = matches!(method, "GET" | "POST")
+            && !relative.is_empty()
+            && Path::new(relative)
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)));
+        if !safe {
+            write_http_response(&mut stream, "404 Not Found", b"");
+            return;
+        }
+        let mut content_length = 0_usize;
+        let mut content_type = String::new();
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            match name.to_ascii_lowercase().as_str() {
+                "content-length" => content_length = value.trim().parse().unwrap_or(0),
+                "content-type" => content_type = value.trim().to_owned(),
+                _ => {}
+            }
+        }
+        while request.len().saturating_sub(header_end) < content_length {
+            let count = stream.read(&mut chunk).unwrap();
+            if count == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..count]);
+        }
+        let body = &request[header_end..header_end + content_length];
+        let mut child = Command::new("git")
+            .arg("http-backend")
+            .env("GIT_PROJECT_ROOT", root)
+            .env("GIT_HTTP_EXPORT_ALL", "1")
+            .env("REQUEST_METHOD", method)
+            .env("PATH_INFO", path_info)
+            .env("QUERY_STRING", query)
+            .env("CONTENT_TYPE", content_type)
+            .env("CONTENT_LENGTH", content_length.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(body).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "git http-backend: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let split = output
+            .stdout
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .map(|position| position + 4)
+            .expect("CGI header terminator");
+        let cgi_headers = String::from_utf8_lossy(&output.stdout[..split]);
+        let response_body = &output.stdout[split..];
+        let mut status = "200 OK";
+        let mut forwarded = Vec::new();
+        for line in cgi_headers.split("\r\n").filter(|line| !line.is_empty()) {
+            if let Some(value) = line.strip_prefix("Status: ") {
+                status = value;
+            } else if !line.to_ascii_lowercase().starts_with("content-length:") {
+                forwarded.push(line);
+            }
+        }
+        let headers = format!(
+            "HTTP/1.1 {status}\r\n{}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            forwarded.join("\r\n"),
+            response_body.len()
+        );
+        stream.write_all(headers.as_bytes()).unwrap();
+        stream.write_all(response_body).unwrap();
+        stream.flush().unwrap();
+        // Git/libcurl can reuse this connection for upload-pack. Keeping it
+        // alive avoids a Windows loopback RST between smart-HTTP requests; the
+        // client process closes it when the clone finishes, and the read
+        // timeout remains a bounded fallback.
+        serve_public_git_backend(stream, root);
+    }
+
+    fn write_http_response(stream: &mut TcpStream, status: &str, body: &[u8]) {
+        let headers = format!(
+            "HTTP/1.0 {status}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+        finish_http_connection(stream);
+    }
+
+    fn finish_http_connection(stream: &mut TcpStream) {
+        stream.shutdown(Shutdown::Write).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut discarded = [0_u8; 256];
+        loop {
+            match stream.read(&mut discarded) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
 
     fn run_git(repo: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -1383,6 +1594,134 @@ mod tests {
                 .trim(),
             "tracked"
         );
+    }
+
+    #[test]
+    fn public_http_remote_is_materialized_without_external_network() {
+        let source = repository();
+        let served = tempfile::tempdir().unwrap();
+        let bare = served.path().join("repo.git");
+        run_git(
+            served.path(),
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                source.path().to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        run_git(&bare, &["update-server-info"]);
+        let mut server = LocalPublicGitHttp::start(served.path());
+        let source = SourceSpec::RemoteGit {
+            repository: server.repository(),
+            git_ref: "HEAD".to_owned(),
+        };
+        // Git for Windows/libcurl can occasionally reset a just-closed
+        // loopback HTTP/1.x connection. Keep the fixture deterministic with a
+        // small bounded retry; every attempt still exercises the real HTTP
+        // transport and GitSnapshotter clone path.
+        let mut result = GitSnapshotter::default().create(&source, SnapshotOptions::default());
+        for _ in 1..3 {
+            if result.is_ok() {
+                break;
+            }
+            result = GitSnapshotter::default().create(&source, SnapshotOptions::default());
+        }
+        server.stop();
+        let snapshot = result.unwrap();
+        assert_eq!(
+            fs::read_to_string(snapshot.path().join("tracked.txt"))
+                .unwrap()
+                .trim_end(),
+            "tracked"
+        );
+        assert!(matches!(
+            snapshot.snapshot.origin,
+            SnapshotOrigin::RemoteGit { .. }
+        ));
+    }
+
+    #[test]
+    #[ignore = "opt-in: requires REPO_SANDBOX_E2E_HTTPS_URL/REF/USER/TOKEN for a disposable private repository"]
+    fn private_https_remote_opt_in() {
+        let repository = env::var("REPO_SANDBOX_E2E_HTTPS_URL").unwrap();
+        let git_ref = env::var("REPO_SANDBOX_E2E_HTTPS_REF").unwrap();
+        let username = env::var("REPO_SANDBOX_E2E_HTTPS_USER").unwrap();
+        let secret = env::var("REPO_SANDBOX_E2E_HTTPS_TOKEN").unwrap();
+        let snapshot = GitSnapshotter::default()
+            .with_authentication(GitAuthentication::HttpsToken {
+                username,
+                token: ExternalSecret::Environment("REPO_SANDBOX_E2E_HTTPS_TOKEN".to_owned()),
+            })
+            .create(
+                &SourceSpec::RemoteGit {
+                    repository,
+                    git_ref,
+                },
+                SnapshotOptions::default(),
+            )
+            .unwrap_or_else(|error| {
+                assert!(!error.to_string().contains(&secret));
+                panic!("private HTTPS snapshot failed: {error}")
+            });
+        assert!(snapshot.snapshot.file_count > 0);
+        assert!(!format!("{:?}", snapshot.snapshot).contains(&secret));
+    }
+
+    #[test]
+    #[ignore = "opt-in: requires a disposable private HTTPS repository and an explicitly invalid token"]
+    fn private_https_invalid_authentication_opt_in() {
+        let repository = env::var("REPO_SANDBOX_E2E_HTTPS_URL").unwrap();
+        let git_ref = env::var("REPO_SANDBOX_E2E_HTTPS_REF").unwrap();
+        let username = env::var("REPO_SANDBOX_E2E_HTTPS_USER").unwrap();
+        let secret = env::var("REPO_SANDBOX_E2E_HTTPS_INVALID_TOKEN").unwrap();
+        let error = GitSnapshotter::default()
+            .with_authentication(GitAuthentication::HttpsToken {
+                username,
+                token: ExternalSecret::Environment(
+                    "REPO_SANDBOX_E2E_HTTPS_INVALID_TOKEN".to_owned(),
+                ),
+            })
+            .create(
+                &SourceSpec::RemoteGit {
+                    repository,
+                    git_ref,
+                },
+                SnapshotOptions::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SnapshotError::Authentication(_)));
+        assert!(!error.to_string().contains(&secret));
+        println!("stage=snapshot authentication_failure=redacted");
+    }
+
+    #[test]
+    #[ignore = "opt-in: requires REPO_SANDBOX_E2E_SSH_URL/REF/KEY/KNOWN_HOSTS for a disposable private repository"]
+    fn private_ssh_remote_opt_in() {
+        let repository = env::var("REPO_SANDBOX_E2E_SSH_URL").unwrap();
+        let git_ref = env::var("REPO_SANDBOX_E2E_SSH_REF").unwrap();
+        let private_key = PathBuf::from(env::var("REPO_SANDBOX_E2E_SSH_KEY").unwrap());
+        let known_hosts = PathBuf::from(env::var("REPO_SANDBOX_E2E_SSH_KNOWN_HOSTS").unwrap());
+        let key_material = fs::read_to_string(&private_key).unwrap();
+        let snapshot = GitSnapshotter::default()
+            .with_authentication(GitAuthentication::SshKey {
+                private_key,
+                known_hosts: Some(known_hosts),
+            })
+            .create(
+                &SourceSpec::RemoteGit {
+                    repository,
+                    git_ref,
+                },
+                SnapshotOptions::default(),
+            )
+            .unwrap_or_else(|error| {
+                assert!(!error.to_string().contains(&key_material));
+                panic!("private SSH snapshot failed: {error}")
+            });
+        assert!(snapshot.snapshot.file_count > 0);
+        assert!(!format!("{:?}", snapshot.snapshot).contains(&key_material));
     }
 
     #[test]

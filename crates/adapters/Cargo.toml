@@ -8,8 +8,13 @@ version.workspace = true
 name = "repo_sandbox_adapters"
 path = "src/lib.rs"
 
+[[bin]]
+name = "e2e-matrix"
+path = "e2e/e2e_matrix.rs"
+
 [dependencies]
 repo-sandbox-core = { path = "../core" }
+serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true

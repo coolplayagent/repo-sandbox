@@ -1452,4 +1452,144 @@ mod tests {
         assert!(report.artifact_error.is_none());
         assert!(report.cleanup_error.is_none());
     }
+
+    /// Real failure injection for stage attribution, timeouts and retained diagnostics.
+    /// Every container has a per-process ownership label; the one deliberately retained
+    /// container is verified by label before this test removes that exact ID.
+    #[test]
+    #[ignore = "requires an accessible Linux Docker daemon and busybox:1.36"]
+    fn docker_build_test_timeout_and_keep_on_failure_matrix() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = || {
+            let mut request = spec(true);
+            request.image = ImageRef::new("busybox:1.36").unwrap();
+            request.resources = RunResources {
+                cpu_count: 1,
+                memory_mb: 128,
+                temporary_storage_mb: 32,
+            };
+            request.config_summary.artifact_directories.clear();
+            request.artifact_export_root = None;
+            request
+        };
+
+        let mut build_failure = base();
+        build_failure.task_id = format!("e2e-build-{unique}");
+        build_failure.build = vec![RunStep {
+            name: "compile-dogfood".to_owned(),
+            command: "echo stage=build; exit 41".to_owned(),
+        }];
+        build_failure.test = vec![RunStep {
+            name: "must-not-run".to_owned(),
+            command: "exit 99".to_owned(),
+        }];
+        let build_report = DockerRunner::new(SystemDockerExecutor, SystemClock::default())
+            .run(&build_failure)
+            .unwrap();
+        assert_eq!(
+            build_report.status,
+            RunStatus::CommandFailed {
+                phase: StepPhase::Build,
+                step: "compile-dogfood".to_owned(),
+                exit_code: Some(41),
+            }
+        );
+        assert_eq!(build_report.steps.len(), 1);
+        assert_eq!(build_report.cleanup, CleanupResult::Removed);
+
+        let mut test_failure = base();
+        test_failure.task_id = format!("e2e-test-{unique}");
+        test_failure.build = vec![RunStep {
+            name: "compile-dogfood".to_owned(),
+            command: "echo stage=build".to_owned(),
+        }];
+        test_failure.test = vec![RunStep {
+            name: "unit-dogfood".to_owned(),
+            command: "echo stage=test >&2; exit 42".to_owned(),
+        }];
+        let test_report = DockerRunner::new(SystemDockerExecutor, SystemClock::default())
+            .run(&test_failure)
+            .unwrap();
+        assert_eq!(
+            test_report.status,
+            RunStatus::CommandFailed {
+                phase: StepPhase::Test,
+                step: "unit-dogfood".to_owned(),
+                exit_code: Some(42),
+            }
+        );
+        assert_eq!(test_report.cleanup, CleanupResult::Removed);
+
+        let mut timeout = base();
+        timeout.task_id = format!("e2e-timeout-{unique}");
+        timeout.timeout_ms = 2_000;
+        timeout.build = vec![RunStep {
+            name: "bounded-build".to_owned(),
+            command: "echo stage=build-timeout; sleep 30".to_owned(),
+        }];
+        timeout.test = vec![RunStep {
+            name: "must-not-run".to_owned(),
+            command: "exit 99".to_owned(),
+        }];
+        let timeout_report = DockerRunner::new(SystemDockerExecutor, SystemClock::default())
+            .run(&timeout)
+            .unwrap();
+        assert_eq!(timeout_report.status, RunStatus::TimedOut);
+        assert_eq!(timeout_report.cleanup, CleanupResult::Removed);
+
+        let mut retained = base();
+        retained.task_id = format!("e2e-keep-{unique}");
+        retained.keep_on_failure = true;
+        retained.build = vec![RunStep {
+            name: "retained-build".to_owned(),
+            command: "echo stage=build-retained; exit 43".to_owned(),
+        }];
+        retained.test = vec![RunStep {
+            name: "must-not-run".to_owned(),
+            command: "exit 99".to_owned(),
+        }];
+        let retained_report = DockerRunner::new(SystemDockerExecutor, SystemClock::default())
+            .run(&retained)
+            .unwrap();
+        assert_eq!(retained_report.cleanup, CleanupResult::RetainedOnFailure);
+        let container_id = retained_report.container_id.clone().unwrap();
+        let inspect = ProcessInvocation {
+            program: "docker".to_owned(),
+            args: vec![
+                "container".to_owned(),
+                "inspect".to_owned(),
+                "--format".to_owned(),
+                format!("{{{{ index .Config.Labels \"{TASK_LABEL}\" }}}}"),
+                container_id.clone(),
+            ],
+            current_dir: None,
+        };
+        let inspected = SystemDockerExecutor
+            .execute(&inspect, CLEANUP_TIMEOUT)
+            .unwrap();
+        assert_eq!(inspected.exit_code, Some(0));
+        assert_eq!(inspected.stdout.trim(), retained.task_id);
+        let remove = docker(vec!["container", "rm", "--force", &container_id]);
+        let removed = SystemDockerExecutor
+            .execute(&remove, CLEANUP_TIMEOUT)
+            .unwrap();
+        assert_eq!(removed.exit_code, Some(0), "{}", removed.stderr);
+
+        let serialized =
+            serde_json::to_string(&[build_report, test_report, timeout_report, retained_report])
+                .unwrap();
+        assert!(!serialized.contains("issue16-private-credential-marker"));
+        println!("stage=build failure_exit=41");
+        println!("stage=test failure_exit=42");
+        println!("stage=timeout status=timed_out");
+        println!("stage=cleanup status=retained_then_owned_removed");
+        println!("credential_scan=passed");
+    }
 }

@@ -18,6 +18,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
+retry_external_build() {
+  local attempt=1
+  local maximum=3
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    if (( attempt >= maximum )); then
+      echo "external build failed after $maximum attempts" >&2
+      return 1
+    fi
+    echo "external build attempt $attempt failed; retrying" >&2
+    sleep $((attempt * 5))
+    attempt=$((attempt + 1))
+  done
+}
+
 cp -R "$repo_root/tests/multistage/." "$temporary/context"
 cp "$temporary/context/source/src/main.rs" "$temporary/main.rs.original"
 printf '%s\n' 'issue1-secret-marker-must-not-leak' >"$temporary/github-token"
@@ -43,12 +60,14 @@ for architecture in amd64 arm64; do
   cold_log="$temporary/environment-$architecture-cold.log"
   warm_log="$temporary/environment-$architecture-warm.log"
 
-  docker buildx build "${builder_args[@]}" --platform "$platform" --target environment \
+  retry_external_build docker buildx build "${builder_args[@]}" --provenance=false \
+    --platform "$platform" --target environment \
     --secret "id=github_token,src=$temporary/github-token" \
     --cache-to "type=local,dest=$cache_cold,mode=max" --progress plain --load \
     --tag "$environment" "$repo_root/templates/rust-bazel/context" 2>&1 | tee "$cold_log"
   cold_environment_identity=$(docker image inspect "$environment" --format '{{.Id}}')
-  docker buildx build "${builder_args[@]}" --platform "$platform" --target environment \
+  retry_external_build docker buildx build "${builder_args[@]}" --provenance=false \
+    --platform "$platform" --target environment \
     --secret "id=github_token,src=$temporary/github-token" \
     --cache-from "type=local,src=$cache_cold" --cache-to "type=local,dest=$cache_warm,mode=max" \
     --progress plain --load --tag "$environment" \
@@ -67,7 +86,7 @@ for architecture in amd64 arm64; do
 
   source_digest=$(tar -C "$temporary/context/source" --sort=name --mtime='UTC 1970-01-01' \
     --owner=0 --group=0 --numeric-owner -cf - . | sha256sum | awk '{print "sha256:"$1}')
-  docker build --platform "$platform" --target task \
+  retry_external_build docker build --provenance=false --platform "$platform" --target task \
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
     --progress plain --tag "$task" -f "$temporary/context/Dockerfile.task" "$temporary/context"
   environment_before_source_change=$(docker image inspect "$environment" --format '{{.Id}}')
@@ -79,7 +98,7 @@ for architecture in amd64 arm64; do
   changed_digest=$(tar -C "$temporary/context/source" --sort=name --mtime='UTC 1970-01-01' \
     --owner=0 --group=0 --numeric-owner -cf - . | sha256sum | awk '{print "sha256:"$1}')
   task_log="$temporary/task-$architecture-source-change.log"
-  docker build --platform "$platform" --target task \
+  retry_external_build docker build --provenance=false --platform "$platform" --target task \
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$changed_digest" \
     --progress plain --tag "$task" -f "$temporary/context/Dockerfile.task" \
     "$temporary/context" 2>&1 | tee "$task_log"
@@ -95,7 +114,7 @@ for architecture in amd64 arm64; do
   # Restore the exact original source and rebuild the final task. From here on,
   # task and baseline contain byte-identical business input and digest labels.
   cp "$temporary/main.rs.original" "$temporary/context/source/src/main.rs"
-  docker build --platform "$platform" --target task \
+  retry_external_build docker build --provenance=false --platform "$platform" --target task \
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
     --progress plain --tag "$task" -f "$temporary/context/Dockerfile.task" "$temporary/context"
   labels=$(docker image inspect "$task" --format '{{json .Config.Labels}}')
@@ -105,7 +124,8 @@ for architecture in amd64 arm64; do
   printf '%s restored task identity=%s source_digest=%s\n' \
     "$architecture" "$restored_task_identity" "$source_digest"
 
-  docker buildx build "${builder_args[@]}" --platform "$platform" --target task \
+  retry_external_build docker buildx build "${builder_args[@]}" --provenance=false \
+    --platform "$platform" --target task \
     --build-arg "SOURCE_DIGEST=$source_digest" --progress plain --load --tag "$baseline" \
     -f "$temporary/context/Dockerfile.single-stage" "$temporary/context"
 
