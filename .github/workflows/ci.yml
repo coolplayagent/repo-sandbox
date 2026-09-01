@@ -14,7 +14,6 @@ concurrency:
 
 env:
   BAZEL_CACHE_NAMESPACE: bazel-ci-v1
-  BUILDKIT_CACHE_NAMESPACE: buildkit-e2e-v1
 
 jobs:
   bazel-quality:
@@ -23,7 +22,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout the tested commit without credentials
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install checksum-pinned Bazelisk
@@ -33,7 +32,7 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal --component clippy --component rustfmt
           rustup default 1.97.0
       - name: Restore Bazel cache namespace
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/bazel
@@ -42,9 +41,9 @@ jobs:
           restore-keys: |
             ${{ env.BAZEL_CACHE_NAMESPACE }}-${{ runner.os }}-${{ runner.arch }}-
       - name: Bazel build
-        run: bazelisk build //...
+        run: bazelisk build --action_env=PATH //...
       - name: Bazel unit tests
-        run: bazelisk test //...
+        run: bazelisk test --action_env=PATH //...
       - name: Rust formatting and lint contracts
         run: |
           cargo fmt --all -- --check
@@ -67,7 +66,7 @@ jobs:
     timeout-minutes: 55
     steps:
       - name: Checkout the tested commit without credentials
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the repository Rust toolchain
@@ -75,7 +74,7 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal
           rustup default 1.97.0
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
         with:
           platforms: amd64,arm64
           cache-image: false
@@ -86,14 +85,14 @@ jobs:
           docker_host=$(sudo scripts/e2e/ci-quota-docker.sh start "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT")
           echo "DOCKER_HOST=$docker_host" >> "$GITHUB_ENV"
           export DOCKER_HOST="$docker_host"
-          builder="${BUILDKIT_CACHE_NAMESPACE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          builder=$(scripts/e2e/ci-quota-docker.sh builder-name "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT")
           docker buildx create --name "$builder" --driver docker-container --driver-opt network=host --use
           echo "REPO_SANDBOX_BUILDER=$builder" >> "$GITHUB_ENV"
       - name: Run required runner integration scenarios
         run: cargo run -p repo-sandbox-adapters --bin e2e-matrix -- --target docker
       - name: Upload scenario logs and reports
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-matrix-results-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/e2e/

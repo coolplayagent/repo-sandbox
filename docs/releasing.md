@@ -12,7 +12,9 @@ reference Actions secrets, and checks out without persisted credentials. The
 same behavior therefore applies to same-repository and fork pull requests;
 neither can publish a release. Bazel cache keys begin with `bazel-ci-v1`.
 BuildKit uses a task-owned daemon and builder whose name begins with
-`buildkit-e2e-v1`; it never restores from or writes to the Bazel namespace.
+`buildkit-e2e-v1`; the same validated helper derives that exact name for both
+creation and ownership-scoped cleanup, and it never restores from or writes to
+the Bazel namespace.
 Release Bazel caches use a third prefix, `bazel-release-v1`, so untrusted PR
 cache entries cannot become release inputs.
 

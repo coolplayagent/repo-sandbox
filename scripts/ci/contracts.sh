@@ -17,7 +17,10 @@ grep -Fq 'permissions:' "$ci"
 grep -Fq 'contents: read' "$ci"
 grep -Fq 'persist-credentials: false' "$ci"
 grep -Fq 'bazel-ci-v1' "$ci"
-grep -Fq 'buildkit-e2e-v1' "$ci"
+grep -Fq 'ci-quota-docker.sh builder-name' "$ci"
+grep -Fq 'builder=$(builder_name)' "$root/scripts/e2e/ci-quota-docker.sh"
+[[ $("$root/scripts/e2e/ci-quota-docker.sh" builder-name "${TMPDIR:-/tmp}" 12345 6) == \
+  buildkit-e2e-v1-12345-6 ]]
 grep -Fq 'contents: write' "$release"
 [[ $(grep -c 'contents: write' "$release") -eq 1 ]]
 grep -Fq 'environment: release' "$release"
