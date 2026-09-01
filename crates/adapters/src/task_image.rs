@@ -164,11 +164,11 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
         let result = self
             .buildkit
             .build(
-                BuildRequest {
-                    plan: &plan,
-                    catalog_root: context.path(),
+                BuildRequest::task(
+                    &plan,
+                    context.path(),
                     image,
-                    options: BuildOptions {
+                    BuildOptions {
                         progress: request.options.progress,
                         output: ImageOutput::Load,
                         cache: request.options.cache,
@@ -176,7 +176,7 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
                         build_args,
                         ..BuildOptions::default()
                     },
-                },
+                ),
                 cancellation,
             )
             .map_err(TaskImageError::Build)?;
@@ -265,8 +265,10 @@ fn write_context(
 }
 
 fn dockerfile() -> &'static str {
-    r#"ARG BASE_IMAGE
-FROM ${BASE_IMAGE}
+    r#"# syntax=docker/dockerfile:1.7
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS environment
+FROM environment AS task
 ARG TASK_CREATED
 ARG TASK_SOURCE_COMMIT
 ARG TASK_SOURCE_DIGEST
@@ -422,6 +424,8 @@ mod tests {
                 assert!(ignore.contains("source/**/.git"));
                 assert!(ignore.contains("source/**/.env.*"));
                 let dockerfile = fs::read_to_string(context.join("Dockerfile"))?;
+                assert!(dockerfile.contains("FROM ${BASE_IMAGE} AS environment"));
+                assert!(dockerfile.contains("FROM environment AS task"));
                 assert!(dockerfile.contains("COPY --link source/ /workspace/"));
                 assert!(!dockerfile.contains("ENTRYPOINT"));
                 let metadata = PathBuf::from(value_after(&invocation.args, "--metadata-file"));
@@ -535,6 +539,7 @@ mod tests {
             && pair[1] == format!("TASK_SOURCE_DIGEST=sha256:{}", materialized.snapshot.id)));
         assert!(args.windows(2).any(|pair| pair == ["--build-arg", "TASK_CONFIG_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]));
         assert!(args.windows(2).any(|pair| pair == ["--build-arg", "BASE_IMAGE=repo-sandbox/environment:stable@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]));
+        assert_eq!(value_after(args, "--target"), "task");
     }
 
     #[test]

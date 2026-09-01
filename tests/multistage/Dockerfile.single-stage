@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1.7
+# This is the checked-in pre-change central template plus the same task source.
+# It keeps exactly the same Rust, Cargo, C compiler, Git, CA and Bazel behavior;
+# its extra contents are the natural consequence of single-stage inheritance.
+ARG BASE_IMAGE=docker.io/library/rust:1.97.0-bookworm
+FROM ${BASE_IMAGE} AS task
+ARG TARGETARCH
+ARG BAZELISK_VERSION=1.27.0
+ARG SOURCE_DIGEST
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates curl git \
+    && curl --fail --location --show-error \
+      "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-${TARGETARCH}" \
+      --output /usr/local/bin/bazel \
+    && chmod 0755 /usr/local/bin/bazel \
+    && rm -rf /var/lib/apt/lists/*
+COPY --link source/ /workspace/
+WORKDIR /workspace
+LABEL io.repo-sandbox.source.digest="${SOURCE_DIGEST}"

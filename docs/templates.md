@@ -19,6 +19,14 @@ and core tests statically parse and plan the embedded catalog. Central paths are
 ordinary checked-in files; no symlinks or init-dev-compatible filename
 conventions are required.
 
+The central Rust+Bazel Dockerfile has two named stages. `toolchain-build` owns
+the large upstream assembly image, the downloader, optional BuildKit secret,
+and transient installation state. `environment` starts from Debian slim,
+installs only task-runtime build dependencies, and copies the Rust/Cargo and
+Bazel toolchain across an explicit `COPY --from=toolchain-build` boundary. Apt,
+Cargo and Bazel paths use locked, architecture-specific BuildKit cache mounts;
+those mounts and `/run/secrets` are never committed to a layer.
+
 Inspect a repository selection without building or pulling an image:
 
 ```console
@@ -65,6 +73,20 @@ resolved parameters, platform, contexts, component versions, and dependency
 edges. The Dockerfile records this digest as an OCI label, so changed template
 inputs invalidate the final image configuration while BuildKit remains free to
 reuse unchanged installation layers.
+
+Environment requests always pass the structured `--target environment`. The
+target is not a public build option and cannot be replaced by a build argument,
+so a caller cannot export `toolchain-build`. Task image construction has the
+only internal path to `--target task`.
+
+`scripts/docker/multistage-acceptance.sh` is the CI and local acceptance entry
+point. For amd64 and arm64 it runs Cargo tests and a Bazel build in both the
+generated task image and the checked-in pre-change single-stage baseline,
+checks layer/filesystem content and source digest labels, demonstrates warm
+environment and source-only task cache reuse, and prints compressed `docker
+save | gzip` plus unpacked engine sizes. The job fails unless the final task
+image is at least 10% smaller on each architecture. The baseline preserves the
+same toolchain and commands and is not padded with synthetic data.
 
 When an ephemeral builder is requested, the adapter first inspects the name and
 rejects an existing builder as unowned. It then creates the builder without
