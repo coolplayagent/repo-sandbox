@@ -4,9 +4,10 @@ use crate::buildkit::{
     BuildKit, BuildOptions, BuildRequest, Builder, CacheConfig, Cancellation, ImageOutput,
     ProcessExecutor, Progress,
 };
+use crate::snapshot::MaterializedSnapshot;
 use repo_sandbox_core::build::{BuiltImage, ImageRef};
 use repo_sandbox_core::config::Platform;
-use repo_sandbox_core::snapshot::SourceSnapshot;
+use repo_sandbox_core::snapshot::SnapshotError;
 use repo_sandbox_core::task_image::{
     ConfigurationDigest, TaskImageIdentity, TaskImageInputs, source_commit, task_image_identity,
 };
@@ -60,8 +61,7 @@ impl Default for TaskImageOptions {
 
 pub struct TaskImageRequest<'a> {
     pub environment: &'a BuiltImage,
-    pub snapshot: &'a SourceSnapshot,
-    pub snapshot_root: &'a Path,
+    pub materialized: &'a MaterializedSnapshot,
     pub template_id: &'a str,
     pub template_version: &'a str,
     pub platform: Platform,
@@ -86,6 +86,7 @@ pub enum TaskImageError {
         operation: &'static str,
         source: io::Error,
     },
+    Snapshot(SnapshotError),
     Build(crate::buildkit::BuildError),
 }
 
@@ -96,6 +97,7 @@ impl Display for TaskImageError {
                 write!(formatter, "invalid task image request: {message}")
             }
             Self::Context { operation, source } => write!(formatter, "{operation}: {source}"),
+            Self::Snapshot(error) => Display::fmt(error, formatter),
             Self::Build(error) => Display::fmt(error, formatter),
         }
     }
@@ -106,6 +108,7 @@ impl Error for TaskImageError {
         match self {
             Self::Context { source, .. } => Some(source),
             Self::Build(error) => Some(error),
+            Self::Snapshot(error) => Some(error),
             Self::InvalidRequest(_) => None,
         }
     }
@@ -132,10 +135,11 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
         validate_request(&request)?;
         let identity = task_image_identity(&TaskImageInputs {
             environment_digest: &request.environment.digest,
-            snapshot: request.snapshot,
+            snapshot: &request.materialized.snapshot,
             template_id: request.template_id,
             template_version: request.template_version,
             configuration_digest: request.configuration_digest,
+            created: request.created,
         });
         let image = ImageRef::new(format!("{}:{}", request.repository, identity.tag()))
             .map_err(TaskImageError::InvalidRequest)?;
@@ -194,7 +198,7 @@ fn validate_request(request: &TaskImageRequest<'_>) -> Result<(), TaskImageError
         ));
     }
     validate_repository(request.repository)?;
-    let metadata = fs::symlink_metadata(request.snapshot_root)
+    let metadata = fs::symlink_metadata(request.materialized.path())
         .map_err(context_error("inspect source snapshot"))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(TaskImageError::InvalidRequest(
@@ -242,11 +246,15 @@ fn write_context(
         .map_err(context_error("write task .dockerignore"))?;
     let destination = root.join("source");
     fs::create_dir(&destination).map_err(context_error("create source context"))?;
-    let copied = copy_snapshot(request.snapshot_root, &destination)?;
-    if copied != request.snapshot.file_count {
+    validate_context_paths(request.materialized.path())?;
+    let copied = request
+        .materialized
+        .copy_verified_to(&destination)
+        .map_err(TaskImageError::Snapshot)?;
+    if copied != request.materialized.snapshot.file_count {
         return Err(TaskImageError::InvalidRequest(format!(
             "snapshot file count is {}, but materialized tree contains {copied}",
-            request.snapshot.file_count
+            request.materialized.snapshot.file_count
         )));
     }
     // Keep this referenced here so context construction and label construction cannot
@@ -289,13 +297,13 @@ fn labels(
         ("TASK_CREATED", request.created.to_owned()),
         (
             "TASK_SOURCE_COMMIT",
-            source_commit(request.snapshot)
+            source_commit(&request.materialized.snapshot)
                 .unwrap_or("local")
                 .to_owned(),
         ),
         (
             "TASK_SOURCE_DIGEST",
-            format!("sha256:{}", request.snapshot.id),
+            format!("sha256:{}", request.materialized.snapshot.id),
         ),
         ("TASK_TEMPLATE_ID", request.template_id.to_owned()),
         ("TASK_TEMPLATE_VERSION", request.template_version.to_owned()),
@@ -311,8 +319,7 @@ fn labels(
     ]
 }
 
-fn copy_snapshot(source: &Path, destination: &Path) -> Result<usize, TaskImageError> {
-    let mut count = 0;
+fn validate_context_paths(source: &Path) -> Result<(), TaskImageError> {
     for entry in fs::read_dir(source).map_err(context_error("read source snapshot"))? {
         let entry = entry.map_err(context_error("read source snapshot entry"))?;
         let name = entry.file_name();
@@ -322,7 +329,6 @@ fn copy_snapshot(source: &Path, destination: &Path) -> Result<usize, TaskImageEr
                 "snapshot contains forbidden metadata or credential path `{name_text}`"
             )));
         }
-        let target = destination.join(&name);
         let metadata = fs::symlink_metadata(entry.path())
             .map_err(context_error("inspect source snapshot entry"))?;
         if metadata.file_type().is_symlink() {
@@ -331,18 +337,15 @@ fn copy_snapshot(source: &Path, destination: &Path) -> Result<usize, TaskImageEr
             ));
         }
         if metadata.is_dir() {
-            fs::create_dir(&target).map_err(context_error("create source context directory"))?;
-            count += copy_snapshot(&entry.path(), &target)?;
+            validate_context_paths(&entry.path())?;
         } else if metadata.is_file() {
-            fs::copy(entry.path(), target).map_err(context_error("copy source snapshot file"))?;
-            count += 1;
         } else {
             return Err(TaskImageError::InvalidRequest(
                 "snapshot context cannot contain special files".to_owned(),
             ));
         }
     }
-    Ok(count)
+    Ok(())
 }
 
 fn forbidden_name(name: &str) -> bool {
@@ -374,9 +377,13 @@ mod tests {
     use crate::buildkit::{
         NeverCancelled, ProcessInvocation, ProcessOutput, SystemProcessExecutor,
     };
+    use crate::snapshot::GitSnapshotter;
     use repo_sandbox_core::build::ImageDigest;
-    use repo_sandbox_core::snapshot::{SnapshotId, SnapshotOrigin};
+    use repo_sandbox_core::snapshot::{
+        CleanupPolicy, GitAuthentication, SnapshotOptions, SourceSpec,
+    };
     use repo_sandbox_core::task_image::TASK_WORKDIR;
+    use std::process::Command;
     use std::sync::Mutex;
 
     const RESULT_DIGEST: &str =
@@ -403,10 +410,13 @@ mod tests {
             self.invocations.lock().unwrap().push(invocation.clone());
             if invocation.args.get(1).map(String::as_str) == Some("build") {
                 let context = PathBuf::from(invocation.args.last().unwrap());
-                assert_eq!(
-                    fs::read_to_string(context.join("source/src/lib.rs"))?,
-                    "pub fn answer() -> u8 { 42 }\n"
-                );
+                let example = context.join("source/src/lib.rs");
+                if example.exists() {
+                    assert_eq!(
+                        fs::read_to_string(example)?,
+                        "pub fn answer() -> u8 { 42 }\n"
+                    );
+                }
                 let ignore = fs::read_to_string(context.join(".dockerignore"))?;
                 assert!(ignore.contains("source/**/.git"));
                 assert!(ignore.contains("source/**/.env.*"));
@@ -433,15 +443,32 @@ mod tests {
         &args[index + 1]
     }
 
-    fn snapshot(root: &Path, files: usize) -> SourceSnapshot {
-        SourceSnapshot {
-            id: SnapshotId::parse("b".repeat(64)).unwrap(),
-            origin: SnapshotOrigin::Local {
-                canonical_root: root.to_owned(),
-            },
-            file_count: files,
-            recurse_submodules: false,
+    fn materialize(files: &[(&str, &str)]) -> (tempfile::TempDir, MaterializedSnapshot) {
+        let repository = tempfile::tempdir().unwrap();
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        for (path, contents) in files {
+            let path = repository.path().join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, contents).unwrap();
         }
+        let materialized = GitSnapshotter::default()
+            .with_authentication(GitAuthentication::None)
+            .create(
+                &SourceSpec::LocalDirectory(repository.path().to_owned()),
+                SnapshotOptions {
+                    recurse_submodules: false,
+                    cleanup: CleanupPolicy::Delete,
+                },
+            )
+            .unwrap();
+        (repository, materialized)
     }
 
     fn environment() -> BuiltImage {
@@ -457,14 +484,12 @@ mod tests {
 
     fn request<'a>(
         environment: &'a BuiltImage,
-        snapshot: &'a SourceSnapshot,
-        root: &'a Path,
+        materialized: &'a MaterializedSnapshot,
         config: &'a ConfigurationDigest,
     ) -> TaskImageRequest<'a> {
         TaskImageRequest {
             environment,
-            snapshot,
-            snapshot_root: root,
+            materialized,
             template_id: "rust-bazel",
             template_version: "1.0.0",
             platform: Platform::LinuxAmd64,
@@ -477,26 +502,20 @@ mod tests {
 
     #[test]
     fn creates_minimal_context_and_content_addressed_tag() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("src")).unwrap();
-        fs::write(
-            root.path().join("src/lib.rs"),
-            "pub fn answer() -> u8 { 42 }\n",
-        )
-        .unwrap();
-        let source = snapshot(root.path(), 1);
+        let (_repository, materialized) =
+            materialize(&[("src/lib.rs", "pub fn answer() -> u8 { 42 }\n")]);
         let environment = environment();
         let config = config();
         let executor = InspectingExecutor::new();
         let first = TaskImageBuilder::new(&executor)
             .build(
-                request(&environment, &source, root.path(), &config),
+                request(&environment, &materialized, &config),
                 &NeverCancelled,
             )
             .unwrap();
         let second = TaskImageBuilder::new(&executor)
             .build(
-                request(&environment, &source, root.path(), &config),
+                request(&environment, &materialized, &config),
                 &NeverCancelled,
             )
             .unwrap();
@@ -506,7 +525,8 @@ mod tests {
 
         let invocations = executor.invocations.lock().unwrap();
         let args = &invocations[0].args;
-        assert!(args.windows(2).any(|pair| pair == ["--build-arg", "TASK_SOURCE_DIGEST=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]));
+        assert!(args.windows(2).any(|pair| pair[0] == "--build-arg"
+            && pair[1] == format!("TASK_SOURCE_DIGEST=sha256:{}", materialized.snapshot.id)));
         assert!(args.windows(2).any(|pair| pair == ["--build-arg", "TASK_CONFIG_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]));
         assert!(args.windows(2).any(|pair| pair == ["--build-arg", "BASE_IMAGE=repo-sandbox/environment:stable@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]));
     }
@@ -526,21 +546,20 @@ mod tests {
             ".git-credentials",
             ".npmrc",
         ] {
-            let root = tempfile::tempdir().unwrap();
-            let path = root.path().join(forbidden);
+            let (_repository, materialized) = materialize(&[("safe.txt", "safe")]);
+            let path = materialized.path().join(forbidden);
             if forbidden.starts_with('.') && matches!(forbidden, ".docker" | ".ssh" | ".aws") {
                 fs::create_dir(&path).unwrap();
                 fs::write(path.join("credentials"), "injected secret").unwrap();
             } else {
                 fs::write(path, "injected secret").unwrap();
             }
-            let source = snapshot(root.path(), 1);
             let environment = environment();
             let config = config();
             let executor = InspectingExecutor::new();
             let error = TaskImageBuilder::new(&executor)
                 .build(
-                    request(&environment, &source, root.path(), &config),
+                    request(&environment, &materialized, &config),
                     &NeverCancelled,
                 )
                 .unwrap_err();
@@ -550,23 +569,12 @@ mod tests {
     }
 
     #[test]
-    fn file_count_mismatch_and_tagged_repository_are_rejected() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("source.rs"), "safe").unwrap();
-        let source = snapshot(root.path(), 2);
+    fn tagged_repository_is_rejected() {
+        let (_repository, materialized) = materialize(&[("source.rs", "safe")]);
         let environment = environment();
         let config = config();
         let executor = InspectingExecutor::new();
-        let error = TaskImageBuilder::new(&executor)
-            .build(
-                request(&environment, &source, root.path(), &config),
-                &NeverCancelled,
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("file count"));
-
-        let source = snapshot(root.path(), 1);
-        let mut tagged = request(&environment, &source, root.path(), &config);
+        let mut tagged = request(&environment, &materialized, &config);
         tagged.repository = "repo-sandbox/task:latest";
         assert!(
             TaskImageBuilder::new(&executor)
@@ -575,14 +583,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn same_file_count_content_and_path_tampering_fail_before_docker() {
+        for mutate in ["content", "path"] {
+            let (_repository, materialized) = materialize(&[("source.rs", "safe")]);
+            if mutate == "content" {
+                fs::write(materialized.path().join("source.rs"), "evil").unwrap();
+            } else {
+                fs::rename(
+                    materialized.path().join("source.rs"),
+                    materialized.path().join("replacement.rs"),
+                )
+                .unwrap();
+            }
+            let environment = environment();
+            let config = config();
+            let executor = InspectingExecutor::new();
+            let error = TaskImageBuilder::new(&executor)
+                .build(
+                    request(&environment, &materialized, &config),
+                    &NeverCancelled,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("snapshot"));
+            assert!(executor.invocations.lock().unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mode_tampering_fails_before_docker() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_repository, materialized) = materialize(&[("source.sh", "echo safe\n")]);
+        fs::set_permissions(
+            materialized.path().join("source.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let environment = environment();
+        let config = config();
+        let executor = InspectingExecutor::new();
+        let error = TaskImageBuilder::new(&executor)
+            .build(
+                request(&environment, &materialized, &config),
+                &NeverCancelled,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("mode changed"));
+        assert!(executor.invocations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn different_created_labels_cannot_reuse_a_tag() {
+        let (_repository, materialized) = materialize(&[("source.rs", "safe")]);
+        let environment = environment();
+        let config = config();
+        let executor = InspectingExecutor::new();
+        let first = TaskImageBuilder::new(&executor)
+            .build(
+                request(&environment, &materialized, &config),
+                &NeverCancelled,
+            )
+            .unwrap();
+        let mut changed = request(&environment, &materialized, &config);
+        changed.created = "2026-09-01T00:00:01Z";
+        let second = TaskImageBuilder::new(&executor)
+            .build(changed, &NeverCancelled)
+            .unwrap();
+        assert_ne!(first.identity, second.identity);
+        assert_ne!(first.image.image, second.image.image);
+    }
+
     /// Optional end-to-end check. It validates labels, history, exported files, and workdir.
     #[test]
     #[ignore = "requires an accessible Linux Docker daemon, buildx, and busybox:1.36"]
     fn docker_task_image_contains_only_snapshot_source() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("answer.txt"), "42\n").unwrap();
-        let mut source = snapshot(root.path(), 1);
-        source.id = single_file_digest("answer.txt", b"42\n");
+        let (root, materialized) = materialize(&[("answer.txt", "42\n")]);
         let run = |args: Vec<String>| {
             SystemProcessExecutor
                 .execute(
@@ -612,7 +688,7 @@ mod tests {
         let config = config();
         let built = TaskImageBuilder::new(SystemProcessExecutor)
             .build(
-                request(&environment, &source, root.path(), &config),
+                request(&environment, &materialized, &config),
                 &NeverCancelled,
             )
             .unwrap();
@@ -628,7 +704,7 @@ mod tests {
         assert!(
             inspect
                 .stdout
-                .contains(request_source_digest(&source).as_str())
+                .contains(format!("sha256:{}", materialized.snapshot.id).as_str())
         );
         assert!(inspect.stdout.contains(TASK_WORKDIR));
         let history = run(vec!["history".into(), "--no-trunc".into(), image.clone()]);
@@ -672,22 +748,5 @@ mod tests {
         assert!(!paths.lines().any(|path| path.contains("/.env")));
         let _ = run(vec!["rm".into(), "--force".into(), container_id]);
         let _ = run(vec!["image".into(), "rm".into(), "--force".into(), image]);
-    }
-
-    fn single_file_digest(path: &str, contents: &[u8]) -> SnapshotId {
-        use sha2::{Digest, Sha256};
-        let content = Sha256::digest(contents);
-        let mut manifest = Sha256::new();
-        manifest.update(b"file\0");
-        manifest.update(path.as_bytes());
-        manifest.update(b"\0");
-        manifest.update(0o100644_u32.to_be_bytes());
-        manifest.update((contents.len() as u64).to_be_bytes());
-        manifest.update(content);
-        SnapshotId::parse(format!("{:x}", manifest.finalize())).unwrap()
-    }
-
-    fn request_source_digest(snapshot: &SourceSnapshot) -> String {
-        format!("sha256:{}", snapshot.id)
     }
 }

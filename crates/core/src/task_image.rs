@@ -65,6 +65,9 @@ pub struct TaskImageInputs<'a> {
     pub template_id: &'a str,
     pub template_version: &'a str,
     pub configuration_digest: &'a ConfigurationDigest,
+    /// Reproducible OCI creation time. It participates in identity so one tag
+    /// can never name two image configurations with different timestamps.
+    pub created: &'a str,
 }
 
 /// Versioned, length-delimited content identity. Field boundaries cannot collide.
@@ -80,6 +83,7 @@ pub fn task_image_identity(inputs: &TaskImageInputs<'_>) -> TaskImageIdentity {
     hash_field(&mut hasher, inputs.template_id);
     hash_field(&mut hasher, inputs.template_version);
     hash_field(&mut hasher, inputs.configuration_digest.as_str());
+    hash_field(&mut hasher, inputs.created);
     TaskImageIdentity(format!("{:x}", hasher.finalize()))
 }
 
@@ -120,6 +124,7 @@ mod tests {
             template_id: "rust-bazel",
             template_version: "1.0.0",
             configuration_digest: config,
+            created: "2026-09-01T00:00:00Z",
         })
     }
 
@@ -151,5 +156,24 @@ mod tests {
         let prefixed = ConfigurationDigest::parse(format!("sha256:{}", "a".repeat(64))).unwrap();
         assert_eq!(bare, prefixed);
         assert!(ConfigurationDigest::parse("A".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn different_creation_metadata_cannot_share_an_identity_tag() {
+        let source = snapshot('a');
+        let config = ConfigurationDigest::parse("c".repeat(64)).unwrap();
+        let environment = ImageDigest::new(format!("sha256:{}", "e".repeat(64))).unwrap();
+        let inputs = |created| TaskImageInputs {
+            environment_digest: &environment,
+            snapshot: &source,
+            template_id: "rust-bazel",
+            template_version: "1.0.0",
+            configuration_digest: &config,
+            created,
+        };
+        assert_ne!(
+            task_image_identity(&inputs("2026-09-01T00:00:00Z")),
+            task_image_identity(&inputs("2026-09-01T00:00:01Z"))
+        );
     }
 }

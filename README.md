@@ -53,8 +53,8 @@ LFS sources are rejected in v1.
 
 Task images combine a resolved environment image with exactly one immutable
 source snapshot at `/workspace`. Their tag is derived from environment, source,
-template, and configuration digests; OCI labels retain those inputs plus the
-build timestamp. See [`docs/task-images.md`](docs/task-images.md) for the
+template, configuration, and creation-time metadata; OCI labels retain those
+inputs. See [`docs/task-images.md`](docs/task-images.md) for the
 security and identity contract.
 
 `Cargo.toml` and `Cargo.lock` describe Rust packages and third-party dependency

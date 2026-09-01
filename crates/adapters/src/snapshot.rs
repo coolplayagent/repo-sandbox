@@ -19,6 +19,7 @@ pub struct MaterializedSnapshot {
     pub snapshot: SourceSnapshot,
     path: PathBuf,
     temporary: Option<TempDir>,
+    manifest: Vec<SnapshotManifestEntry>,
 }
 
 impl MaterializedSnapshot {
@@ -28,6 +29,15 @@ impl MaterializedSnapshot {
 
     pub fn is_automatically_cleaned(&self) -> bool {
         self.temporary.is_some()
+    }
+
+    /// Recompute the #5 normalized manifest while copying the snapshot.
+    ///
+    /// This detects same-file-count content, path, and (where representable)
+    /// mode changes made after materialization. The destination may contain
+    /// partial data on error and must remain private until this returns `Ok`.
+    pub fn copy_verified_to(&self, destination: &Path) -> Result<usize, SnapshotError> {
+        copy_and_verify_materialized(&self.path, destination, &self.manifest, &self.snapshot.id)
     }
 }
 
@@ -153,7 +163,7 @@ impl GitSnapshotter {
         };
 
         reject_lfs(&files)?;
-        let (id, file_count) = copy_and_digest(files, &checkout)?;
+        let (id, file_count, manifest) = copy_and_digest(files, &checkout)?;
         let (path, temporary) = match options.cleanup {
             CleanupPolicy::Delete => (checkout, Some(staging)),
             CleanupPolicy::Keep => {
@@ -170,6 +180,7 @@ impl GitSnapshotter {
             },
             path,
             temporary,
+            manifest,
         })
     }
 
@@ -188,6 +199,13 @@ impl GitSnapshotter {
 struct SourceFile {
     relative: String,
     source: Option<PathBuf>,
+    virtual_content: Option<Vec<u8>>,
+    mode: u32,
+}
+
+#[derive(Clone, Debug)]
+struct SnapshotManifestEntry {
+    relative: String,
     virtual_content: Option<Vec<u8>>,
     mode: u32,
 }
@@ -451,7 +469,7 @@ fn reject_lfs(files: &[SourceFile]) -> Result<(), SnapshotError> {
 fn copy_and_digest(
     mut files: Vec<SourceFile>,
     destination: &Path,
-) -> Result<(SnapshotId, usize), SnapshotError> {
+) -> Result<(SnapshotId, usize, Vec<SnapshotManifestEntry>), SnapshotError> {
     files.sort_by(|left, right| left.relative.as_bytes().cmp(right.relative.as_bytes()));
     let mut manifest = Sha256::new();
     for file in &files {
@@ -483,18 +501,172 @@ fn copy_and_digest(
             content.update(bytes);
             length = bytes.len() as u64;
         }
-        manifest.update(b"file\0");
-        manifest.update(file.relative.as_bytes());
-        manifest.update(b"\0");
-        manifest.update(file.mode.to_be_bytes());
-        manifest.update(length.to_be_bytes());
-        manifest.update(content.finalize());
+        hash_manifest_entry(
+            &mut manifest,
+            &file.relative,
+            file.mode,
+            length,
+            content.finalize(),
+        );
     }
     let digest = format!("{:x}", manifest.finalize());
+    let normalized_manifest = files
+        .iter()
+        .map(|file| SnapshotManifestEntry {
+            relative: file.relative.clone(),
+            virtual_content: file.virtual_content.clone(),
+            mode: file.mode,
+        })
+        .collect();
     Ok((
         SnapshotId::parse(digest)?,
         files.iter().filter(|file| file.source.is_some()).count(),
+        normalized_manifest,
     ))
+}
+
+fn copy_and_verify_materialized(
+    source: &Path,
+    destination: &Path,
+    expected: &[SnapshotManifestEntry],
+    expected_id: &SnapshotId,
+) -> Result<usize, SnapshotError> {
+    let mut actual = Vec::new();
+    collect_materialized_files(source, Path::new(""), &mut actual)?;
+    actual.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let expected_paths = expected
+        .iter()
+        .filter(|entry| entry.virtual_content.is_none())
+        .map(|entry| entry.relative.as_str())
+        .collect::<Vec<_>>();
+    let actual_paths = actual
+        .iter()
+        .map(|(relative, _, _)| relative.as_str())
+        .collect::<Vec<_>>();
+    if actual_paths != expected_paths {
+        return Err(SnapshotError::InvalidInput(
+            "materialized snapshot paths changed after creation".into(),
+        ));
+    }
+
+    let actual_by_path = actual
+        .into_iter()
+        .map(|entry| (entry.0.clone(), entry))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut digest = Sha256::new();
+    for entry in expected {
+        let (length, content_digest) = if let Some(content) = &entry.virtual_content {
+            (content.len() as u64, Sha256::digest(content))
+        } else {
+            let (_, path, actual_mode) = &actual_by_path[&entry.relative];
+            if mode_changed(entry.mode, *actual_mode) {
+                return Err(SnapshotError::InvalidInput(format!(
+                    "materialized snapshot mode changed: {}",
+                    entry.relative
+                )));
+            }
+            let target = destination.join(Path::new(&entry.relative));
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(io_error("create verified snapshot directory"))?;
+            }
+            let mut input =
+                File::open(path).map_err(io_error("read materialized snapshot file"))?;
+            let mut output =
+                File::create(&target).map_err(io_error("copy verified snapshot file"))?;
+            let mut content = Sha256::new();
+            let mut length = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let count = input
+                    .read(&mut buffer)
+                    .map_err(io_error("read materialized snapshot file"))?;
+                if count == 0 {
+                    break;
+                }
+                output
+                    .write_all(&buffer[..count])
+                    .map_err(io_error("copy verified snapshot file"))?;
+                content.update(&buffer[..count]);
+                length += count as u64;
+            }
+            apply_mode(&target, entry.mode)?;
+            (length, content.finalize())
+        };
+        hash_manifest_entry(
+            &mut digest,
+            &entry.relative,
+            entry.mode,
+            length,
+            content_digest,
+        );
+    }
+    let actual_id = SnapshotId::parse(format!("{:x}", digest.finalize()))?;
+    if &actual_id != expected_id {
+        return Err(SnapshotError::InvalidInput(format!(
+            "materialized snapshot digest changed: expected {expected_id}, got {actual_id}"
+        )));
+    }
+    Ok(expected_paths.len())
+}
+
+fn collect_materialized_files(
+    root: &Path,
+    prefix: &Path,
+    files: &mut Vec<(String, PathBuf, u32)>,
+) -> Result<(), SnapshotError> {
+    for entry in fs::read_dir(root).map_err(io_error("read materialized snapshot"))? {
+        let entry = entry.map_err(io_error("read materialized snapshot entry"))?;
+        let relative = prefix.join(entry.file_name());
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(io_error("inspect materialized snapshot entry"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(SnapshotError::Unsupported(format!(
+                "symbolic links are not supported in a materialized snapshot: {}",
+                display_safe_path(&relative)
+            )));
+        }
+        if metadata.is_dir() {
+            collect_materialized_files(&entry.path(), &relative, files)?;
+        } else if metadata.is_file() {
+            files.push((
+                normalized_path(&relative)?,
+                entry.path(),
+                regular_mode(&metadata),
+            ));
+        } else {
+            return Err(SnapshotError::Unsupported(format!(
+                "special files are not supported in a materialized snapshot: {}",
+                display_safe_path(&relative)
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn mode_changed(expected: u32, actual: u32) -> bool {
+    expected != actual
+}
+
+#[cfg(not(unix))]
+fn mode_changed(_expected: u32, _actual: u32) -> bool {
+    false
+}
+
+fn hash_manifest_entry(
+    manifest: &mut Sha256,
+    relative: &str,
+    mode: u32,
+    length: u64,
+    content_digest: impl AsRef<[u8]>,
+) {
+    manifest.update(b"file\0");
+    manifest.update(relative.as_bytes());
+    manifest.update(b"\0");
+    manifest.update(mode.to_be_bytes());
+    manifest.update(length.to_be_bytes());
+    manifest.update(content_digest);
 }
 
 fn index_entry(repository: &Path, relative: &Path) -> Result<Option<IndexEntry>, SnapshotError> {
