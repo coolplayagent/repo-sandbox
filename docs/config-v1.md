@@ -42,6 +42,7 @@ The `plan`, `build`, and `verify` routes accept only these runtime options:
 | `--push` | request a future image push |
 | `--report-path PATH` | future report destination |
 | `--keep-on-failure` | retain a failed sandbox |
+| `--recurse-submodules` | recursively materialize Git submodules in the source snapshot |
 
 When `--platform` is absent, the configured platform is used. No CLI option can
 replace the image, timeout, resources, environment policy, secrets, artifacts,
