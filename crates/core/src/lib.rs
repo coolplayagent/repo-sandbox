@@ -6,6 +6,7 @@ pub mod config;
 pub mod doctor;
 pub mod exit_code;
 pub mod snapshot;
+pub mod template;
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};

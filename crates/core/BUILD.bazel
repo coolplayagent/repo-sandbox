@@ -4,6 +4,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 rust_library(
     name = "core",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = ["//templates:catalog"],
     aliases = aliases(),
     crate_name = "repo_sandbox_core",
     deps = all_crate_deps(normal = True),

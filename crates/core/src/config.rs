@@ -1,5 +1,6 @@
 use serde::Deserialize;
-use std::collections::HashSet;
+use serde::de::IntoDeserializer;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::{Component, Path, PathBuf};
@@ -9,7 +10,10 @@ use std::str::FromStr;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub version: ConfigVersion,
-    pub template: Template,
+    pub template: TemplateSelection,
+    /// The pre-template-catalog v1 shape is accepted so existing repositories
+    /// get a plan-time migration error instead of a YAML deserialization error.
+    pub legacy: Option<LegacyTemplate>,
     pub build: Vec<Step>,
     pub test: Vec<Step>,
 }
@@ -20,7 +24,7 @@ pub enum ConfigVersion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Template {
+pub struct LegacyTemplate {
     pub name: String,
     pub platform: Platform,
     pub image: String,
@@ -28,6 +32,22 @@ pub struct Template {
     pub resources: Resources,
     pub environment: Environment,
     pub artifacts: Artifacts,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemplateSelection {
+    pub id: String,
+    pub parameters: BTreeMap<String, String>,
+}
+
+impl TemplateSelection {
+    pub fn platform(&self) -> Result<Platform, ConfigError> {
+        self.parameters
+            .get("platform")
+            .ok_or_else(|| ConfigError::new("$.template.parameters.platform", "is required"))?
+            .parse()
+            .map_err(|message| ConfigError::new("$.template.parameters.platform", message))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -126,7 +146,11 @@ impl ExecutionRequest {
         Self {
             repository: cli.repository,
             git_ref: cli.git_ref,
-            platform: cli.platform.unwrap_or(config.template.platform),
+            platform: cli
+                .platform
+                .or_else(|| config.legacy.as_ref().map(|template| template.platform))
+                .or_else(|| config.template.platform().ok())
+                .expect("validated configurations always define a platform"),
             push: cli.push,
             report: cli.report,
             keep_on_failure: cli.keep_on_failure,
@@ -166,14 +190,24 @@ impl Error for ConfigError {}
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     version: u8,
-    template: RawTemplate,
+    template: serde_yaml::Value,
+    #[serde(default)]
     build: Vec<RawStep>,
+    #[serde(default)]
     test: Vec<RawStep>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTemplate {
+struct RawTemplateSelection {
+    id: String,
+    #[serde(default)]
+    parameters: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLegacyTemplate {
     name: String,
     platform: Platform,
     image: String,
@@ -243,31 +277,87 @@ impl RawConfig {
         if self.version != 1 {
             return Err(ConfigError::new("$.version", "expected version 1"));
         }
-        require_non_empty("$.template.name", &self.template.name)?;
-        require_non_empty("$.template.image", &self.template.image)?;
-        if self.template.timeout_seconds == 0 {
+        let RawConfig {
+            template,
+            build,
+            test,
+            ..
+        } = self;
+        let is_selection = template
+            .as_mapping()
+            .is_some_and(|mapping| mapping.contains_key("id"));
+        if is_selection {
+            Self::validate_selection(parse_template_value(template)?, build, test)
+        } else {
+            Self::validate_legacy(parse_template_value(template)?, build, test)
+        }
+    }
+
+    fn validate_selection(
+        template: RawTemplateSelection,
+        build: Vec<RawStep>,
+        test: Vec<RawStep>,
+    ) -> Result<Config, ConfigError> {
+        require_non_empty("$.template.id", &template.id)?;
+        for name in template.parameters.keys() {
+            require_non_empty("$.template.parameters", name)?;
+        }
+        let selection = TemplateSelection {
+            id: template.id,
+            parameters: template.parameters,
+        };
+        selection.platform()?;
+        if !build.is_empty() {
+            return Err(ConfigError::new(
+                "$.build",
+                "central templates own build steps; remove this field",
+            ));
+        }
+        if !test.is_empty() {
+            return Err(ConfigError::new(
+                "$.test",
+                "central templates own test steps; remove this field",
+            ));
+        }
+        Ok(Config {
+            version: ConfigVersion::V1,
+            template: selection,
+            legacy: None,
+            build: Vec::new(),
+            test: Vec::new(),
+        })
+    }
+
+    fn validate_legacy(
+        template: RawLegacyTemplate,
+        build: Vec<RawStep>,
+        test: Vec<RawStep>,
+    ) -> Result<Config, ConfigError> {
+        require_non_empty("$.template.name", &template.name)?;
+        require_non_empty("$.template.image", &template.image)?;
+        if template.timeout_seconds == 0 {
             return Err(ConfigError::new(
                 "$.template.timeout_seconds",
                 "must be greater than zero",
             ));
         }
-        if self.template.resources.cpu == 0 {
+        if template.resources.cpu == 0 {
             return Err(ConfigError::new(
                 "$.template.resources.cpu",
                 "must be greater than zero",
             ));
         }
-        if self.template.resources.memory_mb == 0 {
+        if template.resources.memory_mb == 0 {
             return Err(ConfigError::new(
                 "$.template.resources.memory_mb",
                 "must be greater than zero",
             ));
         }
-        validate_steps("build", &self.build)?;
-        validate_steps("test", &self.test)?;
+        validate_steps("build", &build)?;
+        validate_steps("test", &test)?;
 
         let mut environment_names = HashSet::new();
-        for (index, name) in self.template.environment.allow.iter().enumerate() {
+        for (index, name) in template.environment.allow.iter().enumerate() {
             validate_environment_name(&format!("$.template.environment.allow[{index}]"), name)?;
             if !environment_names.insert(name.as_str()) {
                 return Err(ConfigError::new(
@@ -278,7 +368,7 @@ impl RawConfig {
         }
 
         let mut secret_environments = HashSet::new();
-        for (index, secret) in self.template.environment.secrets.iter().enumerate() {
+        for (index, secret) in template.environment.secrets.iter().enumerate() {
             validate_environment_name(
                 &format!("$.template.environment.secrets[{index}].environment"),
                 &secret.environment,
@@ -295,13 +385,13 @@ impl RawConfig {
             }
         }
 
-        if self.template.artifacts.directories.is_empty() {
+        if template.artifacts.directories.is_empty() {
             return Err(ConfigError::new(
                 "$.template.artifacts.directories",
                 "must contain at least one directory",
             ));
         }
-        for (index, directory) in self.template.artifacts.directories.iter().enumerate() {
+        for (index, directory) in template.artifacts.directories.iter().enumerate() {
             if !safe_relative_directory(directory) {
                 return Err(ConfigError::new(
                     format!("$.template.artifacts.directories[{index}]"),
@@ -312,19 +402,25 @@ impl RawConfig {
 
         Ok(Config {
             version: ConfigVersion::V1,
-            template: Template {
-                name: self.template.name,
-                platform: self.template.platform,
-                image: self.template.image,
-                timeout_seconds: self.template.timeout_seconds,
+            template: TemplateSelection {
+                id: template.name.clone(),
+                parameters: BTreeMap::from([(
+                    "platform".to_owned(),
+                    template.platform.to_string(),
+                )]),
+            },
+            legacy: Some(LegacyTemplate {
+                name: template.name,
+                platform: template.platform,
+                image: template.image,
+                timeout_seconds: template.timeout_seconds,
                 resources: Resources {
-                    cpu: self.template.resources.cpu,
-                    memory_mb: self.template.resources.memory_mb,
+                    cpu: template.resources.cpu,
+                    memory_mb: template.resources.memory_mb,
                 },
                 environment: Environment {
-                    allow: self.template.environment.allow,
-                    secrets: self
-                        .template
+                    allow: template.environment.allow,
+                    secrets: template
                         .environment
                         .secrets
                         .into_iter()
@@ -335,19 +431,17 @@ impl RawConfig {
                         .collect(),
                 },
                 artifacts: Artifacts {
-                    directories: self.template.artifacts.directories,
+                    directories: template.artifacts.directories,
                 },
-            },
-            build: self
-                .build
+            }),
+            build: build
                 .into_iter()
                 .map(|step| Step {
                     name: step.name,
                     run: step.run,
                 })
                 .collect(),
-            test: self
-                .test
+            test: test
                 .into_iter()
                 .map(|step| Step {
                     name: step.name,
@@ -356,6 +450,22 @@ impl RawConfig {
                 .collect(),
         })
     }
+}
+
+fn parse_template_value<T: for<'de> Deserialize<'de>>(
+    value: serde_yaml::Value,
+) -> Result<T, ConfigError> {
+    serde_path_to_error::deserialize(value.into_deserializer()).map_err(|error| {
+        let suffix = error.path().to_string();
+        let path = if suffix.is_empty() || suffix == "." {
+            "$.template".to_owned()
+        } else if suffix.starts_with('[') {
+            format!("$.template{suffix}")
+        } else {
+            format!("$.template.{suffix}")
+        };
+        ConfigError::new(path, error.into_inner().to_string())
+    })
 }
 
 fn require_non_empty(path: &str, value: &str) -> Result<(), ConfigError> {
@@ -431,17 +541,34 @@ test:
     run: cargo test --locked
 "#;
 
+    const SELECTION: &str = r#"
+version: 1
+template:
+  id: rust-bazel
+  parameters:
+    platform: linux/amd64
+    rust_version: "1.97.0"
+"#;
+
     #[test]
     fn valid_v1_parses_to_the_domain_model() {
         let config = Config::parse_yaml(VALID).unwrap();
         assert_eq!(config.version, ConfigVersion::V1);
-        assert_eq!(config.template.platform, Platform::LinuxAmd64);
-        assert_eq!(config.template.resources.memory_mb, 4096);
+        let legacy = config.legacy.as_ref().unwrap();
+        assert_eq!(legacy.platform, Platform::LinuxAmd64);
+        assert_eq!(legacy.resources.memory_mb, 4096);
         assert_eq!(config.build[0].run, "cargo build --locked");
-        assert_eq!(
-            config.template.environment.secrets[0].secret,
-            "crates-io-token"
-        );
+        assert_eq!(legacy.environment.secrets[0].secret, "crates-io-token");
+    }
+
+    #[test]
+    fn central_template_selection_contains_only_id_and_parameters() {
+        let config = Config::parse_yaml(SELECTION).unwrap();
+        assert_eq!(config.template.id, "rust-bazel");
+        assert_eq!(config.template.platform().unwrap(), Platform::LinuxAmd64);
+        assert!(config.legacy.is_none());
+        assert!(config.build.is_empty());
+        assert!(config.test.is_empty());
     }
 
     #[test]
