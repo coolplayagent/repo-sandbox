@@ -31,6 +31,17 @@ impl MaterializedSnapshot {
         self.temporary.is_some()
     }
 
+    /// Convert a task-owned delete-on-drop snapshot into retained diagnostics.
+    /// Callers use this only after a failed run when `--keep-on-failure` is set.
+    /// Local user repositories are never owned by this guard and are never removed.
+    pub fn retain_on_failure(&mut self) {
+        let Some(temporary) = self.temporary.take() else {
+            return;
+        };
+        let kept = temporary.keep();
+        self.path = kept.join("source");
+    }
+
     /// Recompute the #5 normalized manifest while copying the snapshot.
     ///
     /// This detects same-file-count content, path, and (where representable)
@@ -1439,6 +1450,19 @@ mod tests {
         assert!(path.exists());
         drop(snapshot);
         assert!(!path.exists());
+
+        let mut failed = snapshotter
+            .create(
+                &SourceSpec::LocalDirectory(repo.path().to_owned()),
+                SnapshotOptions::default(),
+            )
+            .unwrap();
+        failed.retain_on_failure();
+        let failed_path = failed.path().to_owned();
+        assert!(!failed.is_automatically_cleaned());
+        drop(failed);
+        assert!(failed_path.exists());
+        fs::remove_dir_all(failed_path.parent().unwrap()).unwrap();
 
         let error = snapshotter.create(
             &SourceSpec::RemoteGit {

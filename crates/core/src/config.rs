@@ -505,11 +505,18 @@ fn validate_environment_name(path: &str, name: &str) -> Result<(), ConfigError> 
 }
 
 fn safe_relative_directory(path: &Path) -> bool {
-    !path.as_os_str().is_empty()
+    let text = path.to_string_lossy();
+    let portable = !text.is_empty()
+        && !text.starts_with(['/', '\\'])
+        && !text.contains(':')
+        && text
+            .split(['/', '\\'])
+            .all(|part| !part.is_empty() && part != "." && part != "..");
+    portable
         && !path.is_absolute()
         && path
             .components()
-            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 #[cfg(test)]
@@ -617,9 +624,13 @@ template:
 
     #[test]
     fn unsafe_artifact_directory_is_rejected() {
-        let error = Config::parse_yaml(&VALID.replace("target/release, reports", "../outside"))
+        for unsafe_path in ["../outside", r"..\outside", r"C:\outside", r"\\host\share"] {
+            let error = Config::parse_yaml(
+                &VALID.replace("target/release, reports", &format!("'{unsafe_path}'")),
+            )
             .unwrap_err();
-        assert_eq!(error.path(), "$.template.artifacts.directories[0]");
+            assert_eq!(error.path(), "$.template.artifacts.directories[0]");
+        }
     }
 
     #[test]

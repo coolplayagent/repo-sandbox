@@ -1,5 +1,6 @@
 //! Infrastructure adapters for repo-sandbox.
 
+pub mod artifacts;
 pub mod buildkit;
 pub mod docker_runner;
 pub mod doctor;
