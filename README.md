@@ -1,8 +1,8 @@
 # repo-sandbox
 
 `repo-sandbox` is a Rust CLI built and tested exclusively through Bazel with
-Bzlmod. The initial skeleton separates the CLI, domain core, and infrastructure
-adapters so future integrations do not leak into the domain layer.
+Bzlmod. The CLI separates domain planning from infrastructure adapters and
+includes a central, versioned environment template catalog.
 
 ## Build and test
 
@@ -21,6 +21,7 @@ Run the read-only prerequisite inspection in a terminal or CI job:
 ```console
 repo-sandbox doctor
 repo-sandbox doctor --json
+repo-sandbox plan --repository .
 ```
 
 Private Git snapshots support SSH agent/key references and HTTPS token/credential
@@ -32,12 +33,16 @@ security contract.
 cross-architecture QEMU/binfmt support, repository filesystem space, and Docker
 Hub registry connectivity. It never installs software or changes host/Docker
 configuration. A failed capability includes suggested operator actions and exits
-with the environment exit code (`3`). The `plan`, `build`, `verify`, and `clean`
-routes remain reserved for follow-up issues.
+with the environment exit code (`3`). `plan` resolves the selected central
+template and displays its stable dependency graph; `build`, `verify`, and
+`clean` remain reserved for follow-up issues.
 
 The versioned repository configuration and finite CLI override contract are
 documented in [`docs/config-v1.md`](docs/config-v1.md). A complete configuration
 is available as [`.repo-sandbox.yaml.example`](.repo-sandbox.yaml.example).
+The central manifest and component graph are documented in
+[`docs/templates.md`](docs/templates.md); business repositories select only a
+template ID and parameters and do not carry a catalog Dockerfile.
 
 Source inputs are materialized into private temporary directories. Local Git
 worktrees include tracked files plus untracked files accepted by Git's ignore

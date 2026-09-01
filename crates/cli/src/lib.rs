@@ -1,10 +1,12 @@
 use clap::{Args, Parser, Subcommand};
 use repo_sandbox_adapters::doctor::{DoctorOptions, DoctorProbe, SystemDoctorProbe, inspect};
-use repo_sandbox_core::config::{CliOverrides, Platform};
+use repo_sandbox_core::config::{CliOverrides, Config, ExecutionRequest, Platform};
 use repo_sandbox_core::doctor::{CapabilityKind, CapabilityStatus, DoctorReport, DoctorStatus};
 use repo_sandbox_core::exit_code::ExitCode;
+use repo_sandbox_core::template::{TemplateCatalog, TemplatePlan};
 use repo_sandbox_core::{AppError, Command, route};
 use std::fmt::Write as _;
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -22,7 +24,7 @@ pub struct Cli {
 enum Commands {
     /// Inspect local prerequisites without modifying the host.
     Doctor(DoctorArgs),
-    /// Produce an execution plan (reserved).
+    /// Resolve the selected central template and display its dependency graph.
     Plan(RuntimeArgs),
     /// Build sandbox artifacts (reserved).
     Build(RuntimeArgs),
@@ -124,10 +126,78 @@ pub fn run_with_probe(cli: Cli, probe: &impl DoctorProbe) -> Result<RunOutput, A
             },
         });
     }
+    if let Commands::Plan(arguments) = command {
+        let source = read_repository_config(arguments.repository.as_deref())?;
+        return plan_from_source(&source, arguments);
+    }
     Ok(RunOutput {
         message: Some(route(Command::from(command))?),
         exit_code: ExitCode::Success,
     })
+}
+
+fn read_repository_config(repository: Option<&str>) -> Result<String, AppError> {
+    let root = match repository {
+        Some(value) if value.contains("://") || value.starts_with("git@") => {
+            return Err(AppError::Configuration(
+                "plan requires a materialized local repository; remote snapshot planning is not implemented"
+                    .to_owned(),
+            ));
+        }
+        Some(value) => PathBuf::from(value),
+        None => std::env::current_dir().map_err(|error| {
+            AppError::Configuration(format!("cannot determine current repository: {error}"))
+        })?,
+    };
+    let path = root.join(".repo-sandbox.yaml");
+    fs::read_to_string(&path)
+        .map_err(|error| AppError::Configuration(format!("{}: {error}", path.display())))
+}
+
+pub fn plan_from_source(source: &str, arguments: RuntimeArgs) -> Result<RunOutput, AppError> {
+    let config =
+        Config::parse_yaml(source).map_err(|error| AppError::Configuration(error.to_string()))?;
+    if config.legacy.is_some() {
+        return Err(AppError::Configuration(
+            "$.template: legacy inline template configuration cannot be planned; migrate to `template.id` and `template.parameters`"
+                .to_owned(),
+        ));
+    }
+    let request = ExecutionRequest::resolve(&config, arguments.into());
+    let catalog = TemplateCatalog::builtin()
+        .map_err(|error| AppError::Configuration(format!("central catalog {error}")))?;
+    let plan = catalog
+        .plan(&config.template, request.platform)
+        .map_err(|error| AppError::Configuration(error.to_string()))?;
+    Ok(RunOutput {
+        message: Some(render_plan(&plan)),
+        exit_code: ExitCode::Success,
+    })
+}
+
+pub fn render_plan(plan: &TemplatePlan) -> String {
+    let mut lines = vec![
+        format!("Template: {}@{}", plan.template_id, plan.template_version),
+        format!("Platform: {}", plan.platform),
+        format!("Base image: {}", plan.base_image),
+        format!("Build context: {}", plan.build_context.display()),
+        "Resolved dependency graph:".to_owned(),
+    ];
+    for (index, stage) in plan.stages.iter().enumerate() {
+        let dependencies = if stage.depends_on.is_empty() {
+            "(root)".to_owned()
+        } else {
+            stage.depends_on.join(", ")
+        };
+        lines.push(format!(
+            "  [{index}] {}@{} <- {} [{}]",
+            stage.id,
+            stage.version,
+            dependencies,
+            stage.build_context.display()
+        ));
+    }
+    lines.join("\n")
 }
 
 pub fn render_json(report: &DoctorReport) -> String {
@@ -292,7 +362,7 @@ mod tests {
         assert_eq!(result.exit_code, ExitCode::Success);
         assert!(result.message.unwrap().contains("doctor: ready"));
 
-        for name in ["plan", "build", "verify", "clean"] {
+        for name in ["build", "verify", "clean"] {
             let cli = Cli::try_parse_from(["repo-sandbox", name]).unwrap();
             assert_eq!(
                 run_with_probe(cli, &ReadyProbe).unwrap(),
@@ -302,6 +372,48 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn plan_displays_the_resolved_dependency_graph() {
+        let source = r#"
+version: 1
+template:
+  id: rust-bazel
+  parameters:
+    platform: linux/amd64
+    rust_version: "1.97.0"
+"#;
+        let output = plan_from_source(source, RuntimeArgs::default()).unwrap();
+        let message = output.message.unwrap();
+        assert!(message.contains("Template: rust-bazel@1.0.0"));
+        assert!(message.contains("Resolved dependency graph:"));
+        assert!(message.contains("[0] base-tools@1.0.0 <- (root)"));
+        assert!(message.contains("[1] bazel@1.0.0 <- base-tools"));
+        assert!(message.contains("[2] rust@1.0.0 <- base-tools"));
+    }
+
+    #[test]
+    fn legacy_inline_config_gets_an_explicit_migration_error() {
+        let error = plan_from_source(
+            r#"
+version: 1
+template:
+  name: rust
+  platform: linux/amd64
+  image: rust:1.97
+  timeout_seconds: 1
+  resources: { cpu: 1, memory_mb: 512 }
+  environment: { allow: [], secrets: [] }
+  artifacts: { directories: [target] }
+build: [{ name: build, run: cargo build }]
+test: [{ name: test, run: cargo test }]
+"#,
+            RuntimeArgs::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("migrate"));
+        assert_eq!(error.exit_code(), ExitCode::Configuration);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+id: rust-bazel
+version: "1.0.0"
+base_image: docker.io/library/rust:${rust_version}-bookworm
+components:
+  - id: base-tools
+  - id: bazel
+    depends_on: [base-tools]
+  - id: rust
+    depends_on: [base-tools]
+target_platforms:
+  - linux/amd64
+  - linux/arm64
+build_context: templates/rust-bazel/context
+parameters:
+  rust_version:
+    default: "1.97.0"
+  bazelisk_version:
+    default: "1.27.0"

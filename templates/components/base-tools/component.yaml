@@ -1,0 +1,6 @@
+id: base-tools
+version: "1.0.0"
+target_platforms:
+  - linux/amd64
+  - linux/arm64
+build_context: templates/components/base-tools/context
