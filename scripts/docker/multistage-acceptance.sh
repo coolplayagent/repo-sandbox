@@ -55,6 +55,8 @@ for architecture in amd64 arm64; do
     "$repo_root/templates/rust-bazel/context" 2>&1 | tee "$warm_log"
   warm_environment_identity=$(docker image inspect "$environment" --format '{{.Id}}')
   test "$cold_environment_identity" = "$warm_environment_identity"
+  printf '%s environment cold/warm identity: %s\n' \
+    "$architecture" "$warm_environment_identity"
   assert_cached_step "$warm_log" '[toolchain-build 2/2] RUN'
   assert_cached_step "$warm_log" '[environment 2/7] RUN'
   assert_cached_step "$warm_log" '[environment 3/7] COPY --from=toolchain-build /usr/local/cargo/'
@@ -84,6 +86,8 @@ for architecture in amd64 arm64; do
   environment_after_source_change=$(docker image inspect "$environment" --format '{{.Id}}')
   changed_task_identity=$(docker image inspect "$task" --format '{{.Id}}')
   test "$environment_before_source_change" = "$environment_after_source_change"
+  printf '%s source-only environment identity: before=%s after=%s\n' \
+    "$architecture" "$environment_before_source_change" "$environment_after_source_change"
   test "$original_task_identity" != "$changed_task_identity"
   changed_labels=$(docker image inspect "$task" --format '{{json .Config.Labels}}')
   grep -Fq "\"io.repo-sandbox.source.digest\":\"$changed_digest\"" <<<"$changed_labels"
@@ -98,6 +102,8 @@ for architecture in amd64 arm64; do
   restored_task_identity=$(docker image inspect "$task" --format '{{.Id}}')
   test "$restored_task_identity" = "$original_task_identity"
   grep -Fq "\"io.repo-sandbox.source.digest\":\"$source_digest\"" <<<"$labels"
+  printf '%s restored task identity=%s source_digest=%s\n' \
+    "$architecture" "$restored_task_identity" "$source_digest"
 
   docker buildx build "${builder_args[@]}" --platform "$platform" --target task \
     --build-arg "SOURCE_DIGEST=$source_digest" --progress plain --load --tag "$baseline" \
@@ -128,6 +134,7 @@ for architecture in amd64 arm64; do
     command -v git >/dev/null
     command -v cc >/dev/null
   '
+  printf '%s final-image history/filesystem security scan: passed\n' "$architecture"
 
   docker image save "$task" -o "$temporary/multi-$architecture.tar"
   docker image save "$baseline" -o "$temporary/single-$architecture.tar"
