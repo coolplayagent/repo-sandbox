@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::PathBuf;
@@ -53,7 +54,8 @@ pub enum CleanupPolicy {
 }
 
 /// Lowercase SHA-256 identity of the normalized path/mode/content manifest.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct SnapshotId(String);
 
 impl SnapshotId {
@@ -84,7 +86,8 @@ impl Display for SnapshotId {
 }
 
 /// The immutable commit selected for a remote input.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct CommitSha(String);
 
 impl CommitSha {
@@ -106,7 +109,8 @@ impl CommitSha {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SnapshotOrigin {
     Local {
         canonical_root: PathBuf,
@@ -118,7 +122,7 @@ pub enum SnapshotOrigin {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SourceSnapshot {
     pub id: SnapshotId,
     pub origin: SnapshotOrigin,

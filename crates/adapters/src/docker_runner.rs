@@ -1,12 +1,13 @@
 //! Local Docker adapter for bounded, one-shot build and test jobs.
 
+use crate::artifacts::{export_declared_artifacts, validate_artifact_path};
 use crate::buildkit::{ProcessInvocation, ProcessOutput};
 use repo_sandbox_core::runner::{
-    ResourceLimit, RunReport, RunSpec, RunStatus, StepPhase, StepResult, StepStatus,
+    CleanupResult, ResourceLimit, RunReport, RunSpec, RunStatus, StepPhase, StepResult, StepStatus,
 };
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -63,6 +64,42 @@ pub trait DockerExecutor {
         invocation: &ProcessInvocation,
         timeout: Duration,
     ) -> io::Result<ProcessOutput>;
+
+    fn execute_streaming(
+        &self,
+        invocation: &ProcessInvocation,
+        timeout: Duration,
+        sink: &dyn LogSink,
+        phase: StepPhase,
+        step: &str,
+    ) -> io::Result<ProcessOutput> {
+        let output = self.execute(invocation, timeout)?;
+        sink.stdout(phase, step, output.stdout.as_bytes());
+        sink.stderr(phase, step, output.stderr.as_bytes());
+        Ok(output)
+    }
+}
+
+/// Receives exactly the bytes captured in each [`StepResult`]. Implementations
+/// must not transform the stream, so live output and the JSON report agree.
+pub trait LogSink: Sync {
+    fn stdout(&self, phase: StepPhase, step: &str, bytes: &[u8]);
+    fn stderr(&self, phase: StepPhase, step: &str, bytes: &[u8]);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConsoleLogSink;
+
+impl LogSink for ConsoleLogSink {
+    fn stdout(&self, _phase: StepPhase, _step: &str, bytes: &[u8]) {
+        let _ = io::stdout().lock().write_all(bytes);
+        let _ = io::stdout().lock().flush();
+    }
+
+    fn stderr(&self, _phase: StepPhase, _step: &str, bytes: &[u8]) {
+        let _ = io::stderr().lock().write_all(bytes);
+        let _ = io::stderr().lock().flush();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -74,6 +111,28 @@ impl DockerExecutor for SystemDockerExecutor {
         invocation: &ProcessInvocation,
         timeout: Duration,
     ) -> io::Result<ProcessOutput> {
+        self.execute_process(invocation, timeout, None)
+    }
+
+    fn execute_streaming(
+        &self,
+        invocation: &ProcessInvocation,
+        timeout: Duration,
+        sink: &dyn LogSink,
+        phase: StepPhase,
+        step: &str,
+    ) -> io::Result<ProcessOutput> {
+        self.execute_process(invocation, timeout, Some((sink, phase, step)))
+    }
+}
+
+impl SystemDockerExecutor {
+    fn execute_process(
+        &self,
+        invocation: &ProcessInvocation,
+        timeout: Duration,
+        live: Option<(&dyn LogSink, StepPhase, &str)>,
+    ) -> io::Result<ProcessOutput> {
         let mut child = Command::new(&invocation.program)
             .args(&invocation.args)
             .current_dir(invocation.current_dir.as_deref().unwrap_or(Path::new(".")))
@@ -82,35 +141,57 @@ impl DockerExecutor for SystemDockerExecutor {
             .spawn()?;
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        let stdout_reader = thread::spawn(move || read_stream(stdout));
-        let stderr_reader = thread::spawn(move || read_stream(stderr));
-        let deadline = Instant::now() + timeout;
-        let (status, interrupted) = loop {
-            if Instant::now() >= deadline {
-                child.kill()?;
-                break (child.wait()?, true);
-            }
-            if let Some(status) = child.try_wait()? {
-                break (status, false);
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        Ok(ProcessOutput {
-            exit_code: status.code(),
-            stdout: join_reader(stdout_reader)?,
-            stderr: join_reader(stderr_reader)?,
-            interrupted,
+        thread::scope(|scope| {
+            let stdout_reader = scope.spawn(|| {
+                read_stream(stdout, |bytes| {
+                    if let Some((sink, phase, step)) = live {
+                        sink.stdout(phase, step, bytes);
+                    }
+                })
+            });
+            let stderr_reader = scope.spawn(|| {
+                read_stream(stderr, |bytes| {
+                    if let Some((sink, phase, step)) = live {
+                        sink.stderr(phase, step, bytes);
+                    }
+                })
+            });
+            let deadline = Instant::now() + timeout;
+            let (status, interrupted) = loop {
+                if Instant::now() >= deadline {
+                    child.kill()?;
+                    break (child.wait()?, true);
+                }
+                if let Some(status) = child.try_wait()? {
+                    break (status, false);
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+            Ok(ProcessOutput {
+                exit_code: status.code(),
+                stdout: join_scoped(stdout_reader)?,
+                stderr: join_scoped(stderr_reader)?,
+                interrupted,
+            })
         })
     }
 }
 
-fn read_stream(mut stream: impl Read) -> io::Result<Vec<u8>> {
+fn read_stream(mut stream: impl Read, mut emit: impl FnMut(&[u8])) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes)?;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = stream.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        emit(&chunk[..count]);
+        bytes.extend_from_slice(&chunk[..count]);
+    }
     Ok(bytes)
 }
 
-fn join_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<String> {
+fn join_scoped(reader: thread::ScopedJoinHandle<'_, io::Result<Vec<u8>>>) -> io::Result<String> {
     let bytes = reader
         .join()
         .map_err(|_| io::Error::other("process output reader panicked"))??;
@@ -272,29 +353,51 @@ fn validate_spec(spec: &RunSpec) -> Result<(), PlanError> {
     Ok(())
 }
 
-pub struct DockerRunner<E, C> {
+pub struct DockerRunner<E, C, S = ConsoleLogSink> {
     executor: E,
     clock: C,
+    sink: S,
 }
 
-impl<E, C> DockerRunner<E, C> {
+impl<E, C> DockerRunner<E, C, ConsoleLogSink> {
     pub const fn new(executor: E, clock: C) -> Self {
-        Self { executor, clock }
+        Self {
+            executor,
+            clock,
+            sink: ConsoleLogSink,
+        }
     }
 }
 
-impl<E: DockerExecutor, C: Clock> DockerRunner<E, C> {
+impl<E, C, S> DockerRunner<E, C, S> {
+    pub const fn new_with_sink(executor: E, clock: C, sink: S) -> Self {
+        Self {
+            executor,
+            clock,
+            sink,
+        }
+    }
+}
+
+impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
     pub fn run(&self, spec: &RunSpec) -> Result<RunReport, PlanError> {
         let run_plan = plan(spec)?;
         let started = self.clock.now();
         let mut report = RunReport {
             task_id: spec.task_id.clone(),
             container_id: None,
+            source_snapshot: spec.source_snapshot.clone(),
+            config: spec.config_summary.clone(),
+            image: spec.image.clone(),
+            image_digest: spec.image_digest.clone(),
             started_at_unix_ms: started.unix_ms,
             ended_at_unix_ms: started.unix_ms,
             duration_ms: 0,
             status: RunStatus::Succeeded,
             steps: Vec::new(),
+            exported_artifacts: Vec::new(),
+            artifact_error: None,
+            cleanup: CleanupResult::NotNeeded,
             cleanup_error: None,
         };
 
@@ -336,10 +439,36 @@ impl<E: DockerExecutor, C: Clock> DockerRunner<E, C> {
             Ok(_) => self.run_steps(spec, &run_plan, started, &container_id, &mut report),
         }
 
-        report.cleanup_error = self
-            .cleanup(&container_id)
-            .err()
-            .map(|error| error.to_string());
+        if let Some(export_root) = &spec.artifact_export_root
+            && !report.steps.is_empty()
+            && !spec.config_summary.artifact_directories.is_empty()
+        {
+            match self.export_artifacts(
+                &container_id,
+                &spec.config_summary.artifact_directories,
+                export_root,
+            ) {
+                Ok(paths) => report.exported_artifacts = paths,
+                Err(error) => {
+                    report.artifact_error = Some(error.clone());
+                    if report.status == RunStatus::Succeeded {
+                        report.status = infrastructure("export declared artifacts", error);
+                    }
+                }
+            }
+        }
+
+        if spec.keep_on_failure && report.status != RunStatus::Succeeded {
+            report.cleanup = CleanupResult::RetainedOnFailure;
+        } else {
+            match self.cleanup(&container_id) {
+                Ok(()) => report.cleanup = CleanupResult::Removed,
+                Err(error) => {
+                    report.cleanup = CleanupResult::Failed;
+                    report.cleanup_error = Some(error.to_string());
+                }
+            }
+        }
         Ok(self.finish(report, started))
     }
 
@@ -377,7 +506,13 @@ impl<E: DockerExecutor, C: Clock> DockerRunner<E, C> {
         let mut first_command_failure = None;
         for step in &run_plan.steps {
             let step_started = self.clock.now();
-            let output = self.execute_remaining(&step.invocation, spec, started.monotonic_ms);
+            let output = self.execute_step_remaining(
+                &step.invocation,
+                spec,
+                started.monotonic_ms,
+                step.phase,
+                &step.name,
+            );
             let step_ended = self.clock.now();
             let (status, exit_code, stdout, stderr) = match output {
                 Err(error) => (
@@ -505,6 +640,33 @@ impl<E: DockerExecutor, C: Clock> DockerRunner<E, C> {
             .execute(invocation, Duration::from_millis(remaining))
     }
 
+    fn execute_step_remaining(
+        &self,
+        invocation: &ProcessInvocation,
+        spec: &RunSpec,
+        started_ms: u64,
+        phase: StepPhase,
+        step: &str,
+    ) -> io::Result<ProcessOutput> {
+        let elapsed = self.clock.now().monotonic_ms.saturating_sub(started_ms);
+        let remaining = spec.timeout_ms.saturating_sub(elapsed);
+        if remaining == 0 {
+            return Ok(ProcessOutput {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: "total job timeout elapsed".to_owned(),
+                interrupted: true,
+            });
+        }
+        self.executor.execute_streaming(
+            invocation,
+            Duration::from_millis(remaining),
+            &self.sink,
+            phase,
+            step,
+        )
+    }
+
     fn cleanup(&self, container_id: &str) -> io::Result<()> {
         let invocation = docker(vec!["container", "rm", "--force", container_id]);
         let output = self.executor.execute(&invocation, CLEANUP_TIMEOUT)?;
@@ -516,6 +678,47 @@ impl<E: DockerExecutor, C: Clock> DockerRunner<E, C> {
                 output.stderr.trim()
             )))
         }
+    }
+
+    fn export_artifacts(
+        &self,
+        container_id: &str,
+        declared: &[std::path::PathBuf],
+        export_root: &Path,
+    ) -> Result<Vec<std::path::PathBuf>, String> {
+        for path in declared {
+            validate_artifact_path(path).map_err(|error| error.to_string())?;
+        }
+        let staging = tempfile::Builder::new()
+            .prefix("repo-sandbox-artifacts-")
+            .tempdir()
+            .map_err(|error| error.to_string())?;
+        for path in declared {
+            let parent = path.parent().unwrap_or_else(|| Path::new(""));
+            std::fs::create_dir_all(staging.path().join(parent))
+                .map_err(|error| error.to_string())?;
+            let container_path = path.to_string_lossy().replace('\\', "/");
+            let destination = staging.path().join(parent);
+            let invocation = docker(vec![
+                "container",
+                "cp",
+                &format!("{container_id}:/workspace/{container_path}"),
+                &destination.to_string_lossy(),
+            ]);
+            let output = self
+                .executor
+                .execute(&invocation, CLEANUP_TIMEOUT)
+                .map_err(|error| error.to_string())?;
+            if output.exit_code != Some(0) {
+                return Err(format!(
+                    "copy declared artifact `{}` from owned container: {}",
+                    path.display(),
+                    output.stderr.trim()
+                ));
+            }
+        }
+        export_declared_artifacts(staging.path(), declared, declared, export_root)
+            .map_err(|error| error.to_string())
     }
 
     fn finish(&self, mut report: RunReport, started: ClockReading) -> RunReport {
@@ -536,12 +739,17 @@ fn infrastructure(operation: impl Into<String>, message: impl Into<String>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use repo_sandbox_core::build::ImageDigest;
     use repo_sandbox_core::build::ImageRef;
     use repo_sandbox_core::config::Platform;
-    use repo_sandbox_core::runner::{RunResources, RunStep};
+    use repo_sandbox_core::runner::{ConfigSummary, RunResources, RunStep, write_report_json};
+    use repo_sandbox_core::snapshot::{SnapshotId, SnapshotOrigin, SourceSnapshot};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::fs;
+    use std::path::PathBuf;
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
     struct FakeClock(Rc<Cell<u64>>);
@@ -619,6 +827,22 @@ mod tests {
         RunSpec {
             task_id: "task-7".to_owned(),
             image: ImageRef::new("repo-sandbox/task@sha256:abc").unwrap(),
+            image_digest: ImageDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            source_snapshot: SourceSnapshot {
+                id: SnapshotId::parse("b".repeat(64)).unwrap(),
+                origin: SnapshotOrigin::Local {
+                    canonical_root: PathBuf::from("/workspace/source"),
+                },
+                file_count: 7,
+                recurse_submodules: false,
+            },
+            config_summary: ConfigSummary {
+                template_id: "rust".to_owned(),
+                platform: Platform::LinuxAmd64,
+                build_steps: vec!["compile".to_owned(), "lint".to_owned()],
+                test_steps: vec!["unit".to_owned()],
+                artifact_directories: vec![PathBuf::from("target/release")],
+            },
             platform: Platform::LinuxAmd64,
             build: vec![
                 RunStep {
@@ -641,6 +865,24 @@ mod tests {
             },
             timeout_ms: 5_000,
             fail_fast,
+            artifact_export_root: None,
+            keep_on_failure: false,
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        stdout: Arc<Mutex<Vec<u8>>>,
+        stderr: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl LogSink for RecordingSink {
+        fn stdout(&self, _phase: StepPhase, _step: &str, bytes: &[u8]) {
+            self.stdout.lock().unwrap().extend_from_slice(bytes);
+        }
+
+        fn stderr(&self, _phase: StepPhase, _step: &str, bytes: &[u8]) {
+            self.stderr.lock().unwrap().extend_from_slice(bytes);
         }
     }
 
@@ -710,6 +952,9 @@ mod tests {
         assert_eq!(report.steps[2].name, "unit");
         assert!(report.steps.iter().all(|step| step.exit_code == Some(0)));
         assert!(report.steps.iter().all(|step| step.duration_ms == 10));
+        assert_eq!(report.source_snapshot, spec(true).source_snapshot);
+        assert_eq!(report.image_digest, spec(true).image_digest);
+        assert_eq!(report.cleanup, CleanupResult::Removed);
         let calls = executor.invocations();
         assert_eq!(
             calls.last().unwrap().args,
@@ -720,6 +965,86 @@ mod tests {
                 .iter()
                 .all(|call| !call.args.iter().any(|arg| arg == "prune"))
         );
+        assert!(calls.iter().all(|call| {
+            call.args.first().is_some_and(|arg| arg == "container")
+                && !call
+                    .args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "image" | "builder" | "buildx" | "system"))
+        }));
+    }
+
+    #[test]
+    fn live_stream_bytes_exactly_match_step_report_and_json_is_valid() {
+        let clock = FakeClock(Rc::new(Cell::new(0)));
+        let executor = FakeExecutor::new(
+            &clock,
+            vec![
+                output(0, "", ""),
+                output(0, "container-id-7", ""),
+                output(0, "", ""),
+                output(0, "build-out\n", "build-warning\n"),
+                output(0, "lint-out\n", ""),
+                output(0, "test-out\n", "test-warning\n"),
+                output(0, "", ""),
+            ],
+        );
+        let sink = RecordingSink::default();
+        let report = DockerRunner::new_with_sink(&executor, clock, sink.clone())
+            .run(&spec(true))
+            .unwrap();
+        let expected_stdout: String = report
+            .steps
+            .iter()
+            .map(|step| step.stdout.as_str())
+            .collect();
+        let expected_stderr: String = report
+            .steps
+            .iter()
+            .map(|step| step.stderr.as_str())
+            .collect();
+        assert_eq!(executor.invocations().len(), 7);
+        assert_eq!(expected_stdout, "build-out\nlint-out\ntest-out\n");
+        assert_eq!(expected_stderr, "build-warning\ntest-warning\n");
+        assert_eq!(&*sink.stdout.lock().unwrap(), expected_stdout.as_bytes());
+        assert_eq!(&*sink.stderr.lock().unwrap(), expected_stderr.as_bytes());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        write_report_json(&report, &path).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(json["status"]["status"], "succeeded");
+        assert_eq!(json["source_snapshot"]["file_count"], 7);
+        assert!(
+            json["image_digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+    }
+
+    #[test]
+    fn failure_report_is_valid_json_and_keep_on_failure_skips_cleanup() {
+        let clock = FakeClock(Rc::new(Cell::new(0)));
+        let executor = FakeExecutor::new(
+            &clock,
+            vec![
+                output(0, "", ""),
+                output(0, "container-id-7", ""),
+                output(0, "", ""),
+                output(2, "partial", "failed"),
+            ],
+        );
+        let mut request = spec(true);
+        request.keep_on_failure = true;
+        let report = DockerRunner::new(&executor, clock).run(&request).unwrap();
+        assert_eq!(report.cleanup, CleanupResult::RetainedOnFailure);
+        assert_eq!(executor.invocations().len(), 4);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("failed.json");
+        write_report_json(&report, &path).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(json["status"]["status"], "command_failed");
+        assert_eq!(json["cleanup"], "retained_on_failure");
     }
 
     #[test]
@@ -871,7 +1196,8 @@ mod tests {
     #[ignore = "requires an accessible Linux Docker daemon and busybox:1.36"]
     fn docker_one_shot_job_smoke() {
         let mut request = spec(true);
-        request.task_id = format!("issue12-smoke-{}", std::process::id());
+        let artifacts = tempfile::tempdir().unwrap();
+        request.task_id = format!("issue13-smoke-{}", std::process::id());
         request.image = ImageRef::new("busybox:1.36").unwrap();
         request.build = vec![RunStep {
             name: "build".to_owned(),
@@ -887,11 +1213,22 @@ mod tests {
             temporary_storage_mb: 32,
         };
         request.timeout_ms = 30_000;
+        request.config_summary.artifact_directories = vec![PathBuf::from("target")];
+        request.artifact_export_root = Some(artifacts.path().to_owned());
         let report = DockerRunner::new(SystemDockerExecutor, SystemClock::default())
             .run(&request)
             .unwrap();
         assert_eq!(report.status, RunStatus::Succeeded, "{report:?}");
         assert_eq!(report.steps.len(), 2);
+        assert_eq!(
+            fs::read_to_string(artifacts.path().join("target/result")).unwrap(),
+            "built\n"
+        );
+        assert_eq!(
+            report.exported_artifacts,
+            vec![artifacts.path().canonicalize().unwrap().join("target")]
+        );
+        assert!(report.artifact_error.is_none());
         assert!(report.cleanup_error.is_none());
     }
 }
