@@ -1,0 +1,3 @@
+# architecture<TAB>host<TAB>user<TAB>port<TAB>known_hosts<TAB>identity
+amd64	euler-amd64.example.test	vm_operator	22	/path/to/known_hosts	/path/to/id_ed25519
+arm64	2001:db8::10	vm_operator	2222	/path/to/known_hosts	/path/to/id_ed25519
