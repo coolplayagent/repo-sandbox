@@ -6,6 +6,6 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
     crate_name = "repo_sandbox_adapters",
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + ["//crates/core:core"],
     visibility = ["//visibility:public"],
 )

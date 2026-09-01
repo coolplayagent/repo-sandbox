@@ -16,8 +16,19 @@ bazelisk run //:repo-sandbox -- --help
 bazelisk run //:repo-sandbox -- --version
 ```
 
-The `doctor`, `plan`, `build`, `verify`, and `clean` routes are intentionally
-reserved; their execution behavior belongs to follow-up issues.
+Run the read-only prerequisite inspection in a terminal or CI job:
+
+```console
+repo-sandbox doctor
+repo-sandbox doctor --json
+```
+
+`doctor` checks the host OS/CPU, Docker daemon, BuildKit, buildx,
+cross-architecture QEMU/binfmt support, repository filesystem space, and Docker
+Hub registry connectivity. It never installs software or changes host/Docker
+configuration. A failed capability includes suggested operator actions and exits
+with the environment exit code (`3`). The `plan`, `build`, `verify`, and `clean`
+routes remain reserved for follow-up issues.
 
 The versioned repository configuration and finite CLI override contract are
 documented in [`docs/config-v1.md`](docs/config-v1.md). A complete configuration

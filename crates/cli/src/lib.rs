@@ -1,6 +1,10 @@
 use clap::{Args, Parser, Subcommand};
+use repo_sandbox_adapters::doctor::{DoctorOptions, DoctorProbe, SystemDoctorProbe, inspect};
 use repo_sandbox_core::config::{CliOverrides, Platform};
+use repo_sandbox_core::doctor::{CapabilityKind, CapabilityStatus, DoctorReport, DoctorStatus};
+use repo_sandbox_core::exit_code::ExitCode;
 use repo_sandbox_core::{AppError, Command, route};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -16,8 +20,8 @@ pub struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 enum Commands {
-    /// Inspect local prerequisites (reserved).
-    Doctor,
+    /// Inspect local prerequisites without modifying the host.
+    Doctor(DoctorArgs),
     /// Produce an execution plan (reserved).
     Plan(RuntimeArgs),
     /// Build sandbox artifacts (reserved).
@@ -26,6 +30,13 @@ enum Commands {
     Verify(RuntimeArgs),
     /// Remove generated sandbox artifacts (reserved).
     Clean,
+}
+
+#[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
+pub struct DoctorArgs {
+    /// Emit the same capability conclusions as structured JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// The complete and intentionally finite v1 CLI override surface.
@@ -67,7 +78,7 @@ impl From<RuntimeArgs> for CliOverrides {
 impl From<Commands> for Command {
     fn from(value: Commands) -> Self {
         match value {
-            Commands::Doctor => Self::Doctor,
+            Commands::Doctor(_) => Self::Doctor,
             Commands::Plan(_) => Self::Plan,
             Commands::Build(_) => Self::Build,
             Commands::Verify(_) => Self::Verify,
@@ -76,14 +87,180 @@ impl From<Commands> for Command {
     }
 }
 
-pub fn run(cli: Cli) -> Result<Option<String>, AppError> {
-    cli.command.map(Command::from).map(route).transpose()
+#[derive(Debug, Eq, PartialEq)]
+pub struct RunOutput {
+    pub message: Option<String>,
+    pub exit_code: ExitCode,
+}
+
+pub fn run(cli: Cli) -> Result<RunOutput, AppError> {
+    run_with_probe(cli, &SystemDoctorProbe)
+}
+
+pub fn run_with_probe(cli: Cli, probe: &impl DoctorProbe) -> Result<RunOutput, AppError> {
+    let Some(command) = cli.command else {
+        return Ok(RunOutput {
+            message: None,
+            exit_code: ExitCode::Success,
+        });
+    };
+    if let Commands::Doctor(arguments) = command {
+        let report = inspect(probe, &DoctorOptions::default());
+        let message = if arguments.json {
+            render_json(&report)
+        } else {
+            render_human(&report)
+        };
+        return Ok(RunOutput {
+            message: Some(message),
+            exit_code: if report.is_ready() {
+                ExitCode::Success
+            } else {
+                ExitCode::Environment
+            },
+        });
+    }
+    Ok(RunOutput {
+        message: Some(route(Command::from(command))?),
+        exit_code: ExitCode::Success,
+    })
+}
+
+pub fn render_json(report: &DoctorReport) -> String {
+    let status = match report.status {
+        DoctorStatus::Ready => "ready",
+        DoctorStatus::NotReady => "not_ready",
+    };
+    let mut output = format!("{{\n  \"status\": \"{status}\",\n  \"capabilities\": [");
+    for (index, capability) in report.capabilities.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str("\n    {\n      \"kind\": ");
+        push_json_string(&mut output, capability_name(capability.kind));
+        output.push_str(",\n      \"status\": ");
+        push_json_string(
+            &mut output,
+            match capability.status {
+                CapabilityStatus::Available => "available",
+                CapabilityStatus::Unavailable => "unavailable",
+            },
+        );
+        output.push_str(",\n      \"summary\": ");
+        push_json_string(&mut output, &capability.summary);
+        output.push_str(",\n      \"remediation\": [");
+        for (action_index, action) in capability.remediation.iter().enumerate() {
+            if action_index != 0 {
+                output.push_str(", ");
+            }
+            push_json_string(&mut output, action);
+        }
+        output.push_str("]\n    }");
+    }
+    output.push_str("\n  ]\n}");
+    output
+}
+
+fn push_json_string(output: &mut String, value: &str) {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            control if control <= '\u{1f}' => {
+                write!(output, "\\u{:04x}", control as u32)
+                    .expect("formatting into a String cannot fail");
+            }
+            printable => output.push(printable),
+        }
+    }
+    output.push('"');
+}
+
+pub fn render_human(report: &DoctorReport) -> String {
+    let mut lines = vec![format!(
+        "repo-sandbox doctor: {}",
+        match report.status {
+            DoctorStatus::Ready => "ready",
+            DoctorStatus::NotReady => "not ready",
+        }
+    )];
+    for capability in &report.capabilities {
+        lines.push(format!(
+            "[{}] {}: {}",
+            match capability.status {
+                CapabilityStatus::Available => "available",
+                CapabilityStatus::Unavailable => "unavailable",
+            },
+            capability_name(capability.kind),
+            capability.summary
+        ));
+        for action in &capability.remediation {
+            lines.push(format!("  Fix: {action}"));
+        }
+    }
+    lines.join("\n")
+}
+
+const fn capability_name(kind: CapabilityKind) -> &'static str {
+    match kind {
+        CapabilityKind::OperatingSystem => "operating_system",
+        CapabilityKind::CpuArchitecture => "cpu_architecture",
+        CapabilityKind::DockerDaemon => "docker_daemon",
+        CapabilityKind::Buildkit => "buildkit",
+        CapabilityKind::Buildx => "buildx",
+        CapabilityKind::QemuBinfmt => "qemu_binfmt",
+        CapabilityKind::DiskSpace => "disk_space",
+        CapabilityKind::RegistryConnectivity => "registry_connectivity",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use repo_sandbox_adapters::doctor::{CommandInvocation, CommandOutput};
+    use std::io;
+    use std::path::Path;
+    use std::time::Duration;
+
+    struct ReadyProbe;
+
+    impl DoctorProbe for ReadyProbe {
+        fn os(&self) -> String {
+            "linux".to_owned()
+        }
+
+        fn architecture(&self) -> String {
+            "x86_64".to_owned()
+        }
+
+        fn execute(&self, invocation: &CommandInvocation) -> io::Result<CommandOutput> {
+            let stdout = if invocation.args == ["buildx", "inspect"] {
+                "Status: running\nPlatforms: linux/amd64, linux/arm64"
+            } else {
+                "available"
+            };
+            Ok(CommandOutput {
+                success: true,
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+            })
+        }
+
+        fn available_space(&self, _path: &Path) -> io::Result<u64> {
+            Ok(20 * 1024 * 1024 * 1024)
+        }
+
+        fn connect_registry(&self, _host: &str, _port: u16, _timeout: Duration) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn cli_definition_is_valid() {
@@ -106,13 +283,58 @@ mod tests {
 
     #[test]
     fn every_reserved_subcommand_parses() {
-        for name in ["doctor", "plan", "build", "verify", "clean"] {
+        let doctor = Cli::try_parse_from(["repo-sandbox", "doctor"]).unwrap();
+        let result = run_with_probe(doctor, &ReadyProbe).unwrap();
+        assert_eq!(result.exit_code, ExitCode::Success);
+        assert!(result.message.unwrap().contains("doctor: ready"));
+
+        for name in ["plan", "build", "verify", "clean"] {
             let cli = Cli::try_parse_from(["repo-sandbox", name]).unwrap();
             assert_eq!(
-                run(cli).unwrap(),
-                Some(format!("{name} is not implemented yet"))
+                run_with_probe(cli, &ReadyProbe).unwrap(),
+                RunOutput {
+                    message: Some(format!("{name} is not implemented yet")),
+                    exit_code: ExitCode::Success,
+                }
             );
         }
+    }
+
+    #[test]
+    fn human_and_json_outputs_are_views_of_the_same_report() {
+        let human_cli = Cli::try_parse_from(["repo-sandbox", "doctor"]).unwrap();
+        let json_cli = Cli::try_parse_from(["repo-sandbox", "doctor", "--json"]).unwrap();
+        let human = run_with_probe(human_cli, &ReadyProbe)
+            .unwrap()
+            .message
+            .unwrap();
+        let json = run_with_probe(json_cli, &ReadyProbe)
+            .unwrap()
+            .message
+            .unwrap();
+        let report = inspect(&ReadyProbe, &DoctorOptions::default());
+        assert_eq!(json, render_json(&report));
+        assert_eq!(human, render_human(&report));
+        for capability in report.capabilities {
+            assert!(human.contains(capability_name(capability.kind)));
+            assert!(human.contains(&capability.summary));
+            assert!(json.contains(capability_name(capability.kind)));
+            assert!(json.contains(&capability.summary));
+        }
+    }
+
+    #[test]
+    fn json_renderer_escapes_untrusted_process_output() {
+        let report = DoctorReport::from_capabilities(vec![
+            repo_sandbox_core::doctor::Capability::unavailable(
+                CapabilityKind::DockerDaemon,
+                "quoted \"message\"\nnext line",
+                ["check C:\\Docker\tconfiguration"],
+            ),
+        ]);
+        let json = render_json(&report);
+        assert!(json.contains("quoted \\\"message\\\"\\nnext line"));
+        assert!(json.contains("C:\\\\Docker\\tconfiguration"));
     }
 
     #[test]

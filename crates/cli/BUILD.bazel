@@ -8,6 +8,7 @@ rust_library(
     crate_name = "repo_sandbox_cli",
     version = "0.1.0",
     deps = [
+        "//crates/adapters:adapters",
         "//crates/core:core",
         "@crates//:clap",
     ],
@@ -22,6 +23,7 @@ rust_binary(
     deps = [
         ":cli",
         "//crates/adapters:adapters",
+        "//crates/core:core",
     ],
     visibility = ["//visibility:public"],
 )

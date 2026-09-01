@@ -9,4 +9,5 @@ name = "repo_sandbox_adapters"
 path = "src/lib.rs"
 
 [dependencies]
+repo-sandbox-core = { path = "../core" }
 tracing-subscriber.workspace = true
