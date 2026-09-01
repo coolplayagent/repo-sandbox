@@ -286,6 +286,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
             Builder::Existing(_) => None,
         };
         if let Some(name) = ephemeral {
+            self.ensure_builder_name_is_available(name)?;
             let create = ProcessInvocation {
                 program: "docker".to_owned(),
                 args: vec![
@@ -298,15 +299,10 @@ impl<E: ProcessExecutor> BuildKit<E> {
                 ],
                 current_dir: None,
             };
-            if let Err(primary) = self.run("create Buildx builder", &create, cancellation) {
-                return match self.remove_builder(name) {
-                    Ok(()) => Err(primary),
-                    Err(cleanup) => Err(BuildError::CleanupAfter {
-                        primary: Box::new(primary),
-                        cleanup: Box::new(cleanup),
-                    }),
-                };
-            }
+            // Ownership starts only after buildx confirms successful creation. A failed
+            // create can be an already-existing builder race, so deleting by name here
+            // could remove a resource owned by another task.
+            self.run("create Buildx builder", &create, cancellation)?;
         }
 
         let primary = self.build_inner(&request, cancellation);
@@ -356,6 +352,42 @@ impl<E: ProcessExecutor> BuildKit<E> {
             current_dir: None,
         };
         self.run("remove owned Buildx builder", &invocation, &NeverCancelled)
+    }
+
+    fn ensure_builder_name_is_available(&self, name: &str) -> Result<(), BuildError> {
+        let invocation = ProcessInvocation {
+            program: "docker".to_owned(),
+            args: vec!["buildx".to_owned(), "inspect".to_owned(), name.to_owned()],
+            current_dir: None,
+        };
+        let output = self
+            .executor
+            .execute(&invocation, &NeverCancelled)
+            .map_err(|source| BuildError::Process {
+                operation: "inspect requested Buildx builder name",
+                source,
+            })?;
+        if output.interrupted {
+            return Err(BuildError::Interrupted {
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+        if output.exit_code == Some(0) {
+            return Err(BuildError::InvalidRequest(format!(
+                "ephemeral builder `{name}` already exists and is not owned by this task"
+            )));
+        }
+        if builder_is_missing(&output.stderr) {
+            Ok(())
+        } else {
+            Err(BuildError::Failed {
+                operation: "inspect requested Buildx builder name",
+                exit_code: output.exit_code,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        }
     }
 
     fn run(
@@ -481,6 +513,13 @@ fn push_pair(args: &mut Vec<String>, flag: &str, value: String) {
     args.push(value);
 }
 
+fn builder_is_missing(stderr: &str) -> bool {
+    let message = stderr.to_ascii_lowercase();
+    message.contains("no builder")
+        || message.contains("not found")
+        || message.contains("does not exist")
+}
+
 fn build_arguments(plan: &TemplatePlan) -> Result<BTreeMap<String, String>, BuildError> {
     let mut arguments = BTreeMap::from([
         ("BASE_IMAGE".to_owned(), plan.base_image.clone()),
@@ -602,6 +641,8 @@ mod tests {
         Success,
         Failure,
         Interrupted,
+        CreateConflict,
+        ExistingName,
     }
 
     struct FakeExecutor {
@@ -629,7 +670,33 @@ mod tests {
             _cancellation: &dyn Cancellation,
         ) -> io::Result<ProcessOutput> {
             self.invocations.lock().unwrap().push(invocation.clone());
-            let is_build = invocation.args.get(1).is_some_and(|value| value == "build");
+            let operation = invocation.args.get(1).map(String::as_str);
+            if operation == Some("inspect") {
+                if matches!(self.behavior, BuildBehavior::ExistingName) {
+                    return Ok(ProcessOutput {
+                        exit_code: Some(0),
+                        stdout: "Name: repo-sandbox-task-7".to_owned(),
+                        stderr: String::new(),
+                        interrupted: false,
+                    });
+                }
+                return Ok(ProcessOutput {
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: "ERROR: no builder found".to_owned(),
+                    interrupted: false,
+                });
+            }
+            if operation == Some("create") && matches!(self.behavior, BuildBehavior::CreateConflict)
+            {
+                return Ok(ProcessOutput {
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: "ERROR: existing instance already exists".to_owned(),
+                    interrupted: false,
+                });
+            }
+            let is_build = operation == Some("build");
             if is_build {
                 match self.behavior {
                     BuildBehavior::Success => {
@@ -659,6 +726,8 @@ mod tests {
                             interrupted: true,
                         });
                     }
+                    BuildBehavior::CreateConflict => unreachable!("create fails before build"),
+                    BuildBehavior::ExistingName => unreachable!("inspect fails before build"),
                 }
             }
             Ok(ProcessOutput {
@@ -851,9 +920,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, BuildError::Interrupted { .. }));
         let invocations = executor.invocations();
-        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations.len(), 4);
         assert_eq!(
-            invocations[2].args,
+            invocations[3].args,
             ["buildx", "rm", "--force", "repo-sandbox-task-7"]
         );
         assert!(
@@ -887,6 +956,95 @@ mod tests {
         assert_eq!(
             value_after(&invocations[0].args, "--builder"),
             "shared-builder"
+        );
+    }
+
+    #[test]
+    fn create_name_race_never_removes_the_unowned_builder() {
+        let executor = FakeExecutor::new(BuildBehavior::CreateConflict);
+        let plan = plan();
+        let error = BuildKit::new(&executor)
+            .build(
+                request(
+                    &plan,
+                    BuildOptions {
+                        builder: Builder::Ephemeral {
+                            name: "repo-sandbox-task-7".to_owned(),
+                        },
+                        ..BuildOptions::default()
+                    },
+                ),
+                &NeverCancelled,
+            )
+            .unwrap_err();
+        assert_eq!(error.exit_code(), Some(1));
+        assert!(error.stderr().unwrap().contains("already exists"));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            invocations[0].args,
+            ["buildx", "inspect", "repo-sandbox-task-7"]
+        );
+        assert_eq!(invocations[1].args[1], "create");
+        assert!(invocations.iter().all(|invocation| {
+            !invocation
+                .args
+                .iter()
+                .any(|argument| matches!(argument.as_str(), "rm" | "prune" | "system"))
+        }));
+    }
+
+    #[test]
+    fn preexisting_ephemeral_name_is_rejected_without_create_or_remove() {
+        let executor = FakeExecutor::new(BuildBehavior::ExistingName);
+        let plan = plan();
+        let error = BuildKit::new(&executor)
+            .build(
+                request(
+                    &plan,
+                    BuildOptions {
+                        builder: Builder::Ephemeral {
+                            name: "repo-sandbox-task-7".to_owned(),
+                        },
+                        ..BuildOptions::default()
+                    },
+                ),
+                &NeverCancelled,
+            )
+            .unwrap_err();
+        assert!(matches!(error, BuildError::InvalidRequest(_)));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0].args,
+            ["buildx", "inspect", "repo-sandbox-task-7"]
+        );
+    }
+
+    #[test]
+    fn successful_create_then_build_failure_removes_owned_builder() {
+        let executor = FakeExecutor::new(BuildBehavior::Failure);
+        let plan = plan();
+        let error = BuildKit::new(&executor)
+            .build(
+                request(
+                    &plan,
+                    BuildOptions {
+                        builder: Builder::Ephemeral {
+                            name: "repo-sandbox-task-8".to_owned(),
+                        },
+                        ..BuildOptions::default()
+                    },
+                ),
+                &NeverCancelled,
+            )
+            .unwrap_err();
+        assert_eq!(error.exit_code(), Some(42));
+        let invocations = executor.invocations();
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(
+            invocations[3].args,
+            ["buildx", "rm", "--force", "repo-sandbox-task-8"]
         );
     }
 

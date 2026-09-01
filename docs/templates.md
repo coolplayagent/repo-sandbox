@@ -44,8 +44,10 @@ edges. The Dockerfile records this digest as an OCI label, so changed template
 inputs invalidate the final image configuration while BuildKit remains free to
 reuse unchanged installation layers.
 
-When an ephemeral builder is requested, the adapter creates it without
-changing the globally selected builder and always attempts
+When an ephemeral builder is requested, the adapter first inspects the name and
+rejects an existing builder as unowned. It then creates the builder without
+changing the globally selected builder and, only after creation succeeds, always attempts
 `docker buildx rm --force <owned-name>` after success, failure, or interruption.
-Existing builders are never removed. The implementation deliberately never
+Create failures never trigger name-based removal, including an `already exists`
+race after inspection. Existing builders are never removed. The implementation deliberately never
 runs `docker system prune` or `docker buildx prune`.
