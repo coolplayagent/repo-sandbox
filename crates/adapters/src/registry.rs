@@ -11,7 +11,6 @@ use repo_sandbox_core::registry::{
     PublishRequest, PublishedImage, PullRequest, PulledImage, RegistryTag,
 };
 use serde_yaml::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
@@ -364,7 +363,16 @@ impl<E: RegistryExecutor> OciRegistry for DockerRegistry<E> {
             .iter()
             .map(|item| item.platform)
             .collect();
-        if inspected.platforms.len() > 1 {
+        if inspected.platforms.is_empty() {
+            if request.expected_platforms.len() != 1 {
+                return Err(RegistryError {
+                    kind: RegistryErrorKind::Manifest,
+                    message:
+                        "a single-platform manifest can satisfy exactly one requested platform"
+                            .into(),
+                });
+            }
+        } else {
             for platform in &request.expected_platforms {
                 if !available.contains(platform) {
                     return Err(RegistryError {
@@ -383,6 +391,23 @@ impl<E: RegistryExecutor> OciRegistry for DockerRegistry<E> {
                 pinned.clone(),
             ]);
             self.run("pull platform", &invocation, None, cancellation)?;
+            let inspect = docker(&[
+                "image".into(),
+                "inspect".into(),
+                "--format".into(),
+                "{{.Os}}/{{.Architecture}}".into(),
+                pinned.clone(),
+            ]);
+            let local = self.run("verify pulled platform", &inspect, None, cancellation)?;
+            if local.stdout.trim() != platform.as_str() {
+                return Err(RegistryError {
+                    kind: RegistryErrorKind::Manifest,
+                    message: format!(
+                        "pulled image platform changed: expected {platform}, got {}",
+                        local.stdout.trim()
+                    ),
+                });
+            }
         }
         // Re-inspection catches mutable-tag races between the first inspection and pulls.
         let after = self.inspect_digest(&request.image, &[], cancellation)?;
@@ -431,6 +456,19 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
         expected: &[PlatformDigest],
         cancellation: &dyn Cancellation,
     ) -> Result<InspectedManifest, RegistryError> {
+        let digest_invocation = docker(&[
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            image.to_string(),
+        ]);
+        let described = self.run(
+            "inspect manifest descriptor",
+            &digest_invocation,
+            None,
+            cancellation,
+        )?;
+        let digest = parse_descriptor_digest(&described.stdout)?;
         let raw_invocation = docker(&[
             "buildx".into(),
             "imagetools".into(),
@@ -439,13 +477,6 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
             image.to_string(),
         ]);
         let raw = self.run("inspect raw manifest", &raw_invocation, None, cancellation)?;
-        // OCI distribution digests the exact manifest bytes returned by the registry.
-        // `imagetools --raw` writes those bytes unchanged, avoiding human output parsing.
-        let digest = ImageDigest::new(format!(
-            "sha256:{:x}",
-            Sha256::digest(raw.stdout.as_bytes())
-        ))
-        .expect("SHA-256 output is a valid OCI digest");
         let platforms = parse_platforms(&raw.stdout)?;
         if !expected.is_empty() {
             verify_platforms(&platforms, expected)?;
@@ -568,6 +599,30 @@ fn ensure_digest(
             kind: RegistryErrorKind::DigestMismatch,
             message: format!("{subject} digest changed: expected {expected}, got {actual}"),
         })
+    }
+}
+
+fn parse_descriptor_digest(output: &str) -> Result<ImageDigest, RegistryError> {
+    // Only the unindented top-level field is the descriptor selected by the name.
+    // Child entries may also contain indented `Digest:` fields.
+    let values: Vec<_> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("Digest:"))
+        .map(str::trim)
+        .collect();
+    match values.as_slice() {
+        [value] => ImageDigest::new(*value).map_err(|message| RegistryError {
+            kind: RegistryErrorKind::Manifest,
+            message: format!("registry reported an invalid descriptor digest: {message}"),
+        }),
+        [] => Err(RegistryError {
+            kind: RegistryErrorKind::Manifest,
+            message: "registry inspection omitted the top-level descriptor digest".into(),
+        }),
+        _ => Err(RegistryError {
+            kind: RegistryErrorKind::Manifest,
+            message: "registry inspection reported multiple top-level descriptor digests".into(),
+        }),
     }
 }
 
@@ -747,8 +802,10 @@ fn redact_url_userinfo(word: &str) -> String {
 mod tests {
     use super::*;
     use repo_sandbox_core::registry::RegistryRepository;
+    use sha2::Digest as _;
     use std::sync::Mutex;
 
+    const ROOT: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const AMD: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const ARM: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
@@ -796,16 +853,23 @@ mod tests {
 
     fn multiarch() -> String {
         format!(
-            r#"{{"schemaVersion":2,"manifests":[{{"digest":"{AMD}","platform":{{"os":"linux","architecture":"amd64"}}}},{{"digest":"{ARM}","platform":{{"os":"linux","architecture":"arm64","variant":"v8"}}}}]}}"#
+            r#"{{"schemaVersion":2,"manifests":[{{"digest":"{AMD}","platform":{{"os":"linux","architecture":"amd64"}}}},{{"digest":"{ARM}","platform":{{"os":"linux","architecture":"arm64","variant":"v8"}}}}]}}
+"#
         )
     }
 
     fn root_digest() -> ImageDigest {
-        ImageDigest::new(format!(
-            "sha256:{:x}",
-            Sha256::digest(multiarch().as_bytes())
-        ))
-        .unwrap()
+        ImageDigest::new(ROOT).unwrap()
+    }
+
+    fn described() -> String {
+        format!(
+            "Name: registry.test/team/image:tag\nMediaType: application/vnd.oci.image.index.v1+json\nDigest: {ROOT}\n\nManifests:\n  Name: child@{AMD}\n  Digest: {AMD}\n"
+        )
+    }
+
+    fn single_manifest() -> String {
+        "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{},\"layers\":[]}\n".into()
     }
 
     fn platform_digests() -> Vec<PlatformDigest> {
@@ -885,7 +949,14 @@ mod tests {
 
     #[test]
     fn publish_creates_content_tag_then_alias_and_verifies_multiarch_digests() {
-        let executor = FakeExecutor::new(vec![ok(""), ok(multiarch()), ok(""), ok(multiarch())]);
+        let executor = FakeExecutor::new(vec![
+            ok(""),
+            ok(described()),
+            ok(multiarch()),
+            ok(""),
+            ok(described()),
+            ok(multiarch()),
+        ]);
         let registry = DockerRegistry::new(executor);
         let request = PublishRequest {
             source: ImageRef::new("registry.test/source/image:build").unwrap(),
@@ -920,7 +991,16 @@ mod tests {
 
     #[test]
     fn pull_fetches_every_platform_by_pinned_digest_and_rechecks_tag() {
-        let executor = FakeExecutor::new(vec![ok(multiarch()), ok(""), ok(""), ok(multiarch())]);
+        let executor = FakeExecutor::new(vec![
+            ok(described()),
+            ok(multiarch()),
+            ok(""),
+            ok("linux/amd64\n"),
+            ok(""),
+            ok("linux/arm64\n"),
+            ok(described()),
+            ok(multiarch()),
+        ]);
         let registry = DockerRegistry::new(executor);
         let request = PullRequest {
             image: ImageRef::new("registry.test/team/image:latest").unwrap(),
@@ -956,6 +1036,62 @@ mod tests {
             verify_platforms(&actual, &changed).unwrap_err().kind(),
             RegistryErrorKind::DigestMismatch
         );
+    }
+
+    #[test]
+    fn descriptor_digest_is_not_inferred_from_raw_stdout_bytes() {
+        let raw_with_cli_newline = multiarch();
+        assert!(raw_with_cli_newline.ends_with('\n'));
+        assert_eq!(
+            parse_descriptor_digest(&described()).unwrap(),
+            root_digest()
+        );
+        assert_ne!(
+            format!(
+                "sha256:{:x}",
+                sha2::Sha256::digest(raw_with_cli_newline.as_bytes())
+            ),
+            ROOT
+        );
+    }
+
+    #[test]
+    fn single_manifest_requires_one_platform_and_verifies_the_pulled_image() {
+        let image = ImageRef::new("registry.test/team/image:single").unwrap();
+        let rejected = DockerRegistry::new(FakeExecutor::new(vec![
+            ok(described()),
+            ok(single_manifest()),
+        ]));
+        let error = rejected
+            .pull_and_verify(
+                &PullRequest {
+                    image: image.clone(),
+                    expected_digest: root_digest(),
+                    expected_platforms: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
+                },
+                &NeverCancelled,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), RegistryErrorKind::Manifest);
+
+        let accepted = DockerRegistry::new(FakeExecutor::new(vec![
+            ok(described()),
+            ok(single_manifest()),
+            ok(""),
+            ok("linux/amd64\n"),
+            ok(described()),
+            ok(single_manifest()),
+        ]));
+        accepted
+            .pull_and_verify(
+                &PullRequest {
+                    image,
+                    expected_digest: root_digest(),
+                    expected_platforms: vec![Platform::LinuxAmd64],
+                },
+                &NeverCancelled,
+            )
+            .unwrap();
     }
 
     /// Configurable end-to-end coverage against an operator-provided disposable repository.

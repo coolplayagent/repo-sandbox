@@ -21,10 +21,12 @@ serializable reports, and repository configuration. Errors are sanitized before 
 authentication, network, command, interruption, digest, or manifest failures.
 
 Publishing uses `docker buildx imagetools create`, which copies a pinned source
-manifest and all of its children. The adapter hashes the exact raw OCI manifest
-bytes returned by the destination and checks the requested child digests.
-Pulling pins the root digest, pulls every requested platform separately, and
-rechecks the original tag afterwards to detect a mutable-tag race.
+manifest and all of its children. The adapter reads the destination descriptor's
+reported `Digest:` and uses raw manifest JSON only to check requested child digests.
+Pulling pins the root digest, pulls every requested platform separately, checks
+each local image's OS/architecture, and then rechecks the original tag to detect
+a mutable-tag race. A raw single-image manifest is accepted for exactly one
+requested platform, which must match the pulled local image.
 
 ## Configurable integration test
 
