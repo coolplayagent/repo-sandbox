@@ -68,3 +68,6 @@ Release reruns compare every already-published asset byte-for-byte and never
 overwrite it. An interrupted, unpublished draft is the only mutable case: after
 revalidating its numeric ID, exact tag, draft state, and remote tag commit, the
 workflow replaces that partial draft without deleting or moving the Git tag.
+When GitHub reruns only failed jobs, publication queries artifacts from the
+current workflow run and selects each platform's latest successful attempt; it
+never borrows an artifact from another run.

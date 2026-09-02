@@ -8,6 +8,7 @@ adapters_build="$root/crates/adapters/BUILD.bazel"
 cli_build="$root/crates/cli/BUILD.bazel"
 
 for required in "$ci" "$release" "$root/scripts/ci/workspace-version.sh" \
+  "$root/scripts/ci/download-release-artifacts.sh" \
   "$root/scripts/ci/validate-release.sh" "$root/scripts/ci/package-cli.sh" \
   "$root/scripts/ci/publish-release.sh" "$root/scripts/ci/verify-release.sh"; do
   [[ -f $required ]] || { echo "missing CI contract: $required" >&2; exit 1; }
@@ -42,6 +43,9 @@ grep -Fq 'version=$(scripts/ci/workspace-version.sh)' "$ci"
 ! grep -Fq "grep -Fx 'repo-sandbox 0.1.0'" "$ci"
 grep -Fq 'bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh' "$ci"
 grep -Fq 'publish-release.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" release "$GITHUB_SHA"' "$release"
+grep -Fq 'actions: read' "$release"
+grep -Fq 'download-release-artifacts.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release' "$release"
+! grep -Fq 'pattern: cli-*-${{ github.run_id }}-${{ github.run_attempt }}' "$release"
 ! grep -Fq 'gh release create' "$release"
 grep -Fq 'refs/tags/${tag}:refs/repo-sandbox/publish-tag' "$root/scripts/ci/publish-release.sh"
 [[ $(grep -c "remote_sha == \"\$expected_sha\"" "$root/scripts/ci/publish-release.sh") -eq 3 ]]
@@ -121,5 +125,6 @@ fi
 "$root/scripts/ci/workspace-version-contract.sh" >/dev/null
 "$root/scripts/ci/release-publish-contract.sh" >/dev/null
 "$root/scripts/ci/glibc-baseline-contract.sh" >/dev/null
+"$root/scripts/ci/download-release-artifacts-contract.sh" >/dev/null
 
 echo 'CI permission, fork, cache, tag, platform, checksum, and fresh-machine contracts passed'
