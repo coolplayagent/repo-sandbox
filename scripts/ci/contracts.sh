@@ -4,6 +4,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 ci="$root/.github/workflows/ci.yml"
 release="$root/.github/workflows/release.yml"
+adapters_build="$root/crates/adapters/BUILD.bazel"
 
 for required in "$ci" "$release" "$root/scripts/ci/validate-release.sh" \
   "$root/scripts/ci/package-cli.sh" "$root/scripts/ci/verify-release.sh"; do
@@ -27,6 +28,12 @@ grep -Fq 'environment: release' "$release"
 grep -Fq 'ubuntu-24.04-arm' "$release"
 grep -Fq 'SHA256SUMS' "$release"
 grep -Fq 'container: ubuntu:24.04' "$release"
+
+# The adapter's include_str! tests must stay hermetic without broad workspace data.
+grep -Fq '"//scripts/docker:multistage-acceptance"' "$adapters_build"
+grep -Fq '"//templates:rust-bazel-dockerfile"' "$adapters_build"
+grep -Fq 'srcs = ["multistage-acceptance.sh"]' "$root/scripts/docker/BUILD.bazel"
+grep -Fq 'srcs = ["rust-bazel/context/Dockerfile"]' "$root/templates/BUILD.bazel"
 
 while IFS= read -r action; do
   [[ $action =~ @([a-f0-9]{40})([[:space:]]|$) ]] || {
