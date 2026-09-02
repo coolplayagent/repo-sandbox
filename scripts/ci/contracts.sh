@@ -50,6 +50,10 @@ grep -Fq "404([[:space:]]|\$)" "$root/scripts/ci/publish-release.sh"
 grep -Fq 'release_is_draft == true' "$root/scripts/ci/publish-release.sh"
 grep -Fq 'release_tag == "$tag"' "$root/scripts/ci/publish-release.sh"
 grep -Fq 'confirmed_metadata == "$metadata"' "$root/scripts/ci/publish-release.sh"
+grep -Fq 'gh api --paginate "repos/${repository}/releases?per_page=100"' \
+  "$root/scripts/ci/publish-release.sh"
+grep -Fq -- "--jq '.[] | [.id, .draft, .tag_name] | @tsv'" "$root/scripts/ci/publish-release.sh"
+! grep -Eq -- '--jq.*\$tag' "$root/scripts/ci/publish-release.sh"
 grep -Fq 'gh api --method DELETE "repos/${repository}/releases/${release_id}"' \
   "$root/scripts/ci/publish-release.sh"
 ! grep -Fq -- '--cleanup-tag' "$root/scripts/ci/publish-release.sh"

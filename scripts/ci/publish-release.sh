@@ -49,47 +49,67 @@ release_status=$?
 set -e
 
 if [[ $release_status -eq 0 ]]; then
-  metadata=$(gh api "repos/${repository}/releases/tags/${tag}" --jq '[.id, .draft, .tag_name] | @tsv')
-  IFS=$'\t' read -r release_id release_is_draft release_tag <<< "$metadata"
-  [[ $release_id =~ ^[0-9]+$ && $release_is_draft =~ ^(true|false)$ && $release_tag == "$tag" ]] || {
-    echo "release API returned invalid identity, draft state, or tag" >&2; exit 1;
+  published=$(gh api "repos/${repository}/releases/tags/${tag}" \
+    --jq '[.id, .draft, .tag_name] | @tsv')
+  IFS=$'\t' read -r release_id release_is_draft release_tag <<< "$published"
+  [[ $release_id =~ ^[0-9]+$ && $release_is_draft == false && $release_tag == "$tag" ]] || {
+    echo "published release endpoint returned invalid identity, state, or tag" >&2; exit 1;
   }
-
-  if [[ $release_is_draft == true ]]; then
-    # A partial draft is unpublished and mutable. Delete only that numeric release
-    # object (never the tag), then recreate it from the exact current asset set.
-    git fetch --force --no-tags origin "refs/tags/${tag}:refs/repo-sandbox/publish-tag"
-    remote_sha=$(git rev-parse --verify 'refs/repo-sandbox/publish-tag^{commit}')
-    [[ $remote_sha == "$expected_sha" ]] || {
-      echo "remote tag moved before partial-draft recovery" >&2; exit 1;
+  existing=$(mktemp -d)
+  trap 'rm -rf -- "$existing"' EXIT
+  gh release download "$tag" --repo "$repository" --dir "$existing"
+  assert_asset_set "$existing"
+  while IFS= read -r asset; do
+    cmp --silent "$release_dir/$asset" "$existing/$asset" || {
+      echo "existing release asset differs from this deterministic build: $asset" >&2
+      exit 1
     }
-    confirmed_metadata=$(gh api "repos/${repository}/releases/tags/${tag}" \
-      --jq '[.id, .draft, .tag_name] | @tsv')
-    [[ $confirmed_metadata == "$metadata" ]] || {
-      echo "draft identity or state changed before recovery" >&2; exit 1;
-    }
-    gh api --method DELETE "repos/${repository}/releases/${release_id}"
-    release_status=1
-    release_response='HTTP/2.0 404 Not Found'
-  else
-    existing=$(mktemp -d)
-    trap 'rm -rf -- "$existing"' EXIT
-    gh release download "$tag" --repo "$repository" --dir "$existing"
-    assert_asset_set "$existing"
-    while IFS= read -r asset; do
-      cmp --silent "$release_dir/$asset" "$existing/$asset" || {
-        echo "existing release asset differs from this deterministic build: $asset" >&2
-        exit 1
-      }
-    done <<< "$expected_assets"
-    echo "existing published release assets exactly match this run; publication is already complete"
-    exit 0
-  fi
+  done <<< "$expected_assets"
+  echo "existing published release assets exactly match this run; publication is already complete"
+  exit 0
 fi
 
 if ! grep -Eq '^HTTP/[^ ]+ 404([[:space:]]|$)' <<< "$release_response"; then
   printf '%s\n' "$release_response" >&2
   exit "$release_status"
+fi
+
+# The tag endpoint intentionally excludes drafts. Only after its explicit 404,
+# enumerate every release visible to the authenticated write token and compare
+# tag_name in Bash, never by interpolating the tag into a jq program.
+release_list=$(gh api --paginate "repos/${repository}/releases?per_page=100" \
+  --jq '.[] | [.id, .draft, .tag_name] | @tsv')
+draft_matches=()
+while IFS=$'\t' read -r candidate_id candidate_is_draft candidate_tag; do
+  [[ -z $candidate_id && -z $candidate_is_draft && -z $candidate_tag ]] && continue
+  if [[ $candidate_tag == "$tag" ]]; then
+    [[ $candidate_id =~ ^[0-9]+$ && $candidate_is_draft =~ ^(true|false)$ ]] || {
+      echo "release list returned invalid matching metadata" >&2; exit 1;
+    }
+    draft_matches+=("${candidate_id}"$'\t'"${candidate_is_draft}"$'\t'"${candidate_tag}")
+  fi
+done <<< "$release_list"
+
+[[ ${#draft_matches[@]} -le 1 ]] || {
+  echo "multiple release objects match the canonical tag" >&2; exit 1;
+}
+if [[ ${#draft_matches[@]} -eq 1 ]]; then
+  metadata=${draft_matches[0]}
+  IFS=$'\t' read -r release_id release_is_draft release_tag <<< "$metadata"
+  [[ $release_is_draft == true && $release_tag == "$tag" ]] || {
+    echo "tag endpoint was absent but release list match is not the expected draft" >&2; exit 1;
+  }
+  git fetch --force --no-tags origin "refs/tags/${tag}:refs/repo-sandbox/publish-tag"
+  remote_sha=$(git rev-parse --verify 'refs/repo-sandbox/publish-tag^{commit}')
+  [[ $remote_sha == "$expected_sha" ]] || {
+    echo "remote tag moved before partial-draft recovery" >&2; exit 1;
+  }
+  confirmed_metadata=$(gh api "repos/${repository}/releases/${release_id}" \
+    --jq '[.id, .draft, .tag_name] | @tsv')
+  [[ $confirmed_metadata == "$metadata" ]] || {
+    echo "draft identity or state changed before recovery" >&2; exit 1;
+  }
+  gh api --method DELETE "repos/${repository}/releases/${release_id}"
 fi
 
 # Close the approval/API window: re-fetch and peel the remote tag immediately
