@@ -9,7 +9,8 @@ cli_build="$root/crates/cli/BUILD.bazel"
 
 for required in "$ci" "$release" "$root/scripts/ci/workspace-version.sh" \
   "$root/scripts/ci/download-release-artifacts.sh" \
-  "$root/scripts/ci/validate-release.sh" "$root/scripts/ci/package-cli.sh" \
+  "$root/scripts/ci/validate-release.sh" "$root/scripts/ci/validate-release-inputs.sh" \
+  "$root/scripts/ci/package-cli.sh" \
   "$root/scripts/ci/publish-release.sh" "$root/scripts/ci/verify-release.sh"; do
   [[ -f $required ]] || { echo "missing CI contract: $required" >&2; exit 1; }
 done
@@ -45,6 +46,20 @@ grep -Fq 'bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acc
 grep -Fq 'publish-release.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" release "$GITHUB_SHA"' "$release"
 grep -Fq 'actions: read' "$release"
 grep -Fq 'download-release-artifacts.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release' "$release"
+[[ $(grep -c 'validate-release-inputs.sh "$GITHUB_REF_NAME"' "$release") -eq 2 ]]
+! grep -Fq 'git merge-base --is-ancestor "$GITHUB_SHA" origin/main' "$release"
+grep -Fq 'git -C "$root" -c "safe.directory=$root"' \
+  "$root/scripts/ci/validate-release-inputs.sh"
+if grep -Rq --exclude=contracts.sh 'safe.directory=\*' "$root/.github" "$root/scripts/ci"; then
+  echo 'wildcard safe.directory exception is forbidden' >&2
+  exit 1
+fi
+if grep -REq --exclude=contracts.sh \
+  'git[[:space:]]+config[[:space:]]+--global.*safe\.directory' \
+  "$root/.github" "$root/scripts/ci"; then
+  echo 'persistent global safe.directory configuration is forbidden' >&2
+  exit 1
+fi
 ! grep -Fq 'pattern: cli-*-${{ github.run_id }}-${{ github.run_attempt }}' "$release"
 ! grep -Fq 'gh release create' "$release"
 grep -Fq 'refs/tags/${tag}:refs/repo-sandbox/publish-tag' "$root/scripts/ci/publish-release.sh"
@@ -126,5 +141,6 @@ fi
 "$root/scripts/ci/release-publish-contract.sh" >/dev/null
 "$root/scripts/ci/glibc-baseline-contract.sh" >/dev/null
 "$root/scripts/ci/download-release-artifacts-contract.sh" >/dev/null
+"$root/scripts/ci/release-inputs-contract.sh" >/dev/null
 
 echo 'CI permission, fork, cache, tag, platform, checksum, and fresh-machine contracts passed'
