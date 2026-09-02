@@ -19,6 +19,7 @@ workspace=$(cd "$GITHUB_WORKSPACE" && pwd -P)
 
 # A job container can see the checkout as owned by the host runner's uid. Keep
 # the ownership exception command-scoped and limited to this exact checkout;
-# never persist it or trust every directory with safe.directory=*.
-git -c "safe.directory=$root" merge-base --is-ancestor "$GITHUB_SHA" origin/main
+# never persist it or trust every directory via a wildcard exception.
+git -C "$root" -c "safe.directory=$root" \
+  merge-base --is-ancestor "$GITHUB_SHA" origin/main
 "$root/scripts/ci/validate-release.sh" "$tag"

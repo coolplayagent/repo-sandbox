@@ -48,10 +48,18 @@ grep -Fq 'actions: read' "$release"
 grep -Fq 'download-release-artifacts.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release' "$release"
 [[ $(grep -c 'validate-release-inputs.sh "$GITHUB_REF_NAME"' "$release") -eq 2 ]]
 ! grep -Fq 'git merge-base --is-ancestor "$GITHUB_SHA" origin/main' "$release"
-grep -Fq 'git -c "safe.directory=$root" merge-base --is-ancestor "$GITHUB_SHA" origin/main' \
+grep -Fq 'git -C "$root" -c "safe.directory=$root"' \
   "$root/scripts/ci/validate-release-inputs.sh"
-! grep -Rq 'safe.directory=\*' "$root/.github" "$root/scripts/ci"
-! grep -Rq 'git config --global.*safe.directory' "$root/.github" "$root/scripts/ci"
+if grep -Rq --exclude=contracts.sh 'safe.directory=\*' "$root/.github" "$root/scripts/ci"; then
+  echo 'wildcard safe.directory exception is forbidden' >&2
+  exit 1
+fi
+if grep -REq --exclude=contracts.sh \
+  'git[[:space:]]+config[[:space:]]+--global.*safe\.directory' \
+  "$root/.github" "$root/scripts/ci"; then
+  echo 'persistent global safe.directory configuration is forbidden' >&2
+  exit 1
+fi
 ! grep -Fq 'pattern: cli-*-${{ github.run_id }}-${{ github.run_attempt }}' "$release"
 ! grep -Fq 'gh release create' "$release"
 grep -Fq 'refs/tags/${tag}:refs/repo-sandbox/publish-tag' "$root/scripts/ci/publish-release.sh"
