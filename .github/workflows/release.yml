@@ -39,9 +39,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Validate immutable release inputs
-        run: |
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-          scripts/ci/validate-release.sh "$GITHUB_REF_NAME"
+        run: scripts/ci/validate-release-inputs.sh "$GITHUB_REF_NAME"
       - name: Install checksum-pinned Bazelisk
         run: scripts/ci/install-bazelisk.sh "$RUNNER_TEMP/bin"
       - name: Restore release Bazel cache namespace
@@ -89,9 +87,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Validate immutable release inputs
-        run: |
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-          scripts/ci/validate-release.sh "$GITHUB_REF_NAME"
+        run: scripts/ci/validate-release-inputs.sh "$GITHUB_REF_NAME"
       - name: Download latest successful platform artifacts from this run
         env:
           GH_TOKEN: ${{ github.token }}
