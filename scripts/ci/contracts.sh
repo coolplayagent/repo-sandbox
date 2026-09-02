@@ -5,6 +5,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 ci="$root/.github/workflows/ci.yml"
 release="$root/.github/workflows/release.yml"
 adapters_build="$root/crates/adapters/BUILD.bazel"
+cli_build="$root/crates/cli/BUILD.bazel"
 
 for required in "$ci" "$release" "$root/scripts/ci/validate-release.sh" \
   "$root/scripts/ci/package-cli.sh" "$root/scripts/ci/verify-release.sh"; do
@@ -34,6 +35,10 @@ grep -Fq '"//scripts/docker:multistage-acceptance"' "$adapters_build"
 grep -Fq '"//templates:rust-bazel-dockerfile"' "$adapters_build"
 grep -Fq 'srcs = ["multistage-acceptance.sh"]' "$root/scripts/docker/BUILD.bazel"
 grep -Fq 'srcs = ["rust-bazel/context/Dockerfile"]' "$root/templates/BUILD.bazel"
+
+# Both the CLI library and binary directly import clap; keep exactly those direct deps.
+[[ $(grep -c '"@crates//:clap"' "$cli_build") -eq 2 ]]
+! grep -Fq 'all_crate_deps' "$cli_build"
 
 while IFS= read -r action; do
   [[ $action =~ @([a-f0-9]{40})([[:space:]]|$) ]] || {
