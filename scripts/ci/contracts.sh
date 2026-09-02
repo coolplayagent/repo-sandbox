@@ -92,7 +92,9 @@ grep -Fq 'srcs = ["multistage-acceptance.sh"]' "$root/scripts/docker/BUILD.bazel
 grep -Fq 'srcs = ["rust-bazel/context/Dockerfile"]' "$root/templates/BUILD.bazel"
 grep -A5 -F 'name = "e2e_matrix_test"' "$adapters_build" | grep -Fq 'srcs = ["e2e/e2e_matrix.rs"]'
 grep -Fq 'bazelisk test --action_env=PATH //...' "$ci"
-grep -Fq 'run: scripts/ci/release-bazel.sh' "$release"
+grep -Fq -- '- name: Release Bazel target selection' "$ci"
+[[ $(grep -Fhc 'run: scripts/ci/release-bazel.sh' "$ci" "$release" | \
+  awk '{ total += $1 } END { print total }') -eq 2 ]]
 grep -Fq "bazelisk query 'kind(\".*_test rule\", //...)' --output=label" \
   "$root/scripts/ci/release-bazel.sh"
 grep -Fq '[[ ${#test_targets[@]} -gt 0 ]]' "$root/scripts/ci/release-bazel.sh"

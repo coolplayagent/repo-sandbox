@@ -44,6 +44,8 @@ jobs:
         run: bazelisk build --action_env=PATH //...
       - name: Bazel unit tests
         run: bazelisk test --action_env=PATH //...
+      - name: Release Bazel target selection
+        run: scripts/ci/release-bazel.sh
       - name: Rust formatting and lint contracts
         run: |
           cargo fmt --all -- --check
