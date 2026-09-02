@@ -31,7 +31,12 @@ jobs:
     timeout-minutes: 35
     steps:
       - name: Install Rocky Linux 8 build prerequisites
-        run: dnf install --assumeyes binutils ca-certificates curl findutils gcc git gzip python3 tar zstd
+        run: |
+          dnf install --assumeyes binutils ca-certificates curl findutils gcc gcc-c++ git gzip python3 tar zstd
+          libstdcxx=$(gcc -print-file-name=libstdc++.so)
+          test "$libstdcxx" != libstdc++.so
+          test -f "$libstdcxx"
+          rpm -qf "$libstdcxx" | grep -Eq '^gcc-c[+][+]-'
       - name: Checkout the tagged commit without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -33,6 +33,11 @@ grep -Fq 'ubuntu-24.04-arm' "$release"
 grep -Fq 'SHA256SUMS' "$release"
 rocky_image='rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6'
 [[ $(grep -c "container: $rocky_image" "$release") -eq 2 ]]
+rocky_prerequisites='dnf install --assumeyes binutils ca-certificates curl findutils gcc gcc-c++ git gzip python3 tar zstd'
+[[ $(grep -Fc "$rocky_prerequisites" "$release") -eq 1 ]]
+grep -Fq 'libstdcxx=$(gcc -print-file-name=libstdc++.so)' "$release"
+grep -Fq 'test "$libstdcxx" != libstdc++.so' "$release"
+grep -Fq "rpm -qf \"\$libstdcxx\" | grep -Eq '^gcc-c[+][+]-'" "$release"
 ! grep -Fq 'cargo build' "$release"
 grep -Fq 'binary=$(bazelisk cquery --config=release //:repo-sandbox --output=files' "$release"
 grep -Fq 'verify-glibc-baseline.sh" "$binary" 2.28' "$root/scripts/ci/package-cli.sh"
