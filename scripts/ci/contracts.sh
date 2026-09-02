@@ -11,7 +11,8 @@ for required in "$ci" "$release" "$root/scripts/ci/workspace-version.sh" \
   "$root/scripts/ci/download-release-artifacts.sh" \
   "$root/scripts/ci/validate-release.sh" "$root/scripts/ci/validate-release-inputs.sh" \
   "$root/scripts/ci/package-cli.sh" \
-  "$root/scripts/ci/publish-release.sh" "$root/scripts/ci/verify-release.sh"; do
+  "$root/scripts/ci/publish-release.sh" "$root/scripts/ci/verify-release.sh" \
+  "$root/scripts/ci/verify-rocky-cxx.sh" "$root/scripts/ci/release-bazel.sh"; do
   [[ -f $required ]] || { echo "missing CI contract: $required" >&2; exit 1; }
 done
 
@@ -35,9 +36,11 @@ rocky_image='rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808
 [[ $(grep -c "container: $rocky_image" "$release") -eq 2 ]]
 rocky_prerequisites='dnf install --assumeyes binutils ca-certificates curl findutils gcc gcc-c++ git gzip python3 tar zstd'
 [[ $(grep -Fc "$rocky_prerequisites" "$release") -eq 1 ]]
-grep -Fq 'libstdcxx=$(gcc -print-file-name=libstdc++.so)' "$release"
-grep -Fq 'test "$libstdcxx" != libstdc++.so' "$release"
-grep -Fq "rpm -qf \"\$libstdcxx\" | grep -Eq '^gcc-c[+][+]-'" "$release"
+grep -Fq 'run: scripts/ci/verify-rocky-cxx.sh' "$release"
+grep -Fq 'rpm -q gcc-c++' "$root/scripts/ci/verify-rocky-cxx.sh"
+grep -Fq '[[ $libstdcxx != libstdc++.so && -f $libstdcxx ]]' \
+  "$root/scripts/ci/verify-rocky-cxx.sh"
+grep -Fq '^(gcc-c\+\+|libstdc\+\+-devel)-' "$root/scripts/ci/verify-rocky-cxx.sh"
 ! grep -Fq 'cargo build' "$release"
 grep -Fq 'binary=$(bazelisk cquery --config=release //:repo-sandbox --output=files' "$release"
 grep -Fq 'verify-glibc-baseline.sh" "$binary" 2.28' "$root/scripts/ci/package-cli.sh"
@@ -89,6 +92,20 @@ grep -Fq 'srcs = ["multistage-acceptance.sh"]' "$root/scripts/docker/BUILD.bazel
 grep -Fq 'srcs = ["rust-bazel/context/Dockerfile"]' "$root/templates/BUILD.bazel"
 grep -A5 -F 'name = "e2e_matrix_test"' "$adapters_build" | grep -Fq 'srcs = ["e2e/e2e_matrix.rs"]'
 grep -Fq 'bazelisk test --action_env=PATH //...' "$ci"
+grep -Fq -- '- name: Release Bazel target selection' "$ci"
+[[ $(grep -Fhc 'run: scripts/ci/release-bazel.sh' "$ci" "$release" | \
+  awk '{ total += $1 } END { print total }') -eq 2 ]]
+grep -Fq "bazelisk query 'kind(\".*_test rule\", //...)' --output=label" \
+  "$root/scripts/ci/release-bazel.sh"
+grep -Fq '[[ ${#test_targets[@]} -gt 0 ]]' "$root/scripts/ci/release-bazel.sh"
+grep -Fq 'bazelisk test --action_env=PATH "${test_targets[@]}"' \
+  "$root/scripts/ci/release-bazel.sh"
+! grep -Fq 'bazelisk test --action_env=PATH //...' "$release" "$root/scripts/ci/release-bazel.sh"
+if grep -Eq '(^|[[:space:]])(cargo|rustc)([[:space:]]|$)' \
+  "$release" "$root/scripts/ci/release-bazel.sh"; then
+  echo 'release build must not install or invoke host Cargo/Rust' >&2
+  exit 1
+fi
 
 # Both the CLI library and binary directly import clap; keep exactly those direct deps.
 [[ $(grep -c '"@crates//:clap"' "$cli_build") -eq 2 ]]
@@ -147,5 +164,7 @@ fi
 "$root/scripts/ci/glibc-baseline-contract.sh" >/dev/null
 "$root/scripts/ci/download-release-artifacts-contract.sh" >/dev/null
 "$root/scripts/ci/release-inputs-contract.sh" >/dev/null
+"$root/scripts/ci/rocky-cxx-contract.sh" >/dev/null
+"$root/scripts/ci/release-bazel-contract.sh" >/dev/null
 
 echo 'CI permission, fork, cache, tag, platform, checksum, and fresh-machine contracts passed'
