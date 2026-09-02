@@ -1,0 +1,147 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BAZEL_CACHE_NAMESPACE: bazel-release-v1
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    container: rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6
+    timeout-minutes: 35
+    steps:
+      - name: Install Rocky Linux 8 build prerequisites
+        run: dnf install --assumeyes binutils ca-certificates curl findutils gcc git gzip python3 tar zstd
+      - name: Checkout the tagged commit without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable release inputs
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          scripts/ci/validate-release.sh "$GITHUB_REF_NAME"
+      - name: Install checksum-pinned Bazelisk
+        run: scripts/ci/install-bazelisk.sh "$RUNNER_TEMP/bin"
+      - name: Restore release Bazel cache namespace
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/bazelisk
+          key: ${{ env.BAZEL_CACHE_NAMESPACE }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.bazelversion', 'MODULE.bazel', 'MODULE.bazel.lock', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ env.BAZEL_CACHE_NAMESPACE }}-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build and test with Bazel
+        run: |
+          bazelisk build --action_env=PATH --config=release //:repo-sandbox
+          bazelisk test --action_env=PATH //...
+      - name: Package versioned CLI and checksum
+        env:
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          binary=$(bazelisk cquery --config=release //:repo-sandbox --output=files | tail -n 1)
+          scripts/ci/package-cli.sh "$GITHUB_REF_NAME" "$RELEASE_PLATFORM" "$binary" release
+      - name: Upload immutable run artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: Publish protected tag release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout release contracts without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable release inputs
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          scripts/ci/validate-release.sh "$GITHUB_REF_NAME"
+      - name: Download latest successful platform artifacts from this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/download-release-artifacts.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release
+      - name: Verify artifact set and checksums
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          for platform in linux-amd64 linux-arm64; do
+            archive="repo-sandbox-${version}-${platform}.tar.gz"
+            checksum="${archive}.sha256"
+            test -f "release/$archive"
+            test -f "release/$checksum"
+            (cd release && sha256sum --check --strict "$checksum")
+          done
+          test "$(find release -maxdepth 1 -type f | wc -l)" -eq 4
+          (cd release && sha256sum repo-sandbox-*.tar.gz > SHA256SUMS)
+      - name: Publish or verify immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/publish-release.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" release "$GITHUB_SHA"
+
+  fresh-machine:
+    name: Fresh machine ${{ matrix.platform }}
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    container: rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Install only fresh-machine download prerequisites
+        run: dnf install --assumeyes binutils ca-certificates curl gzip tar
+      - name: Download public release, verify SHA-256, and run version
+        env:
+          RELEASE_BASE_URL: https://github.com/${{ github.repository }}/releases/download
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output /tmp/verify-release.sh \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-release.sh"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output /tmp/verify-glibc-baseline.sh \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-glibc-baseline.sh"
+          chmod +x /tmp/verify-release.sh /tmp/verify-glibc-baseline.sh
+          /tmp/verify-release.sh "$GITHUB_REF_NAME" "$RELEASE_PLATFORM" "$RELEASE_BASE_URL"

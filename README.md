@@ -84,3 +84,9 @@ The descriptor-driven end-to-end matrix dogfoods the Rust+Bazel repository
 through real snapshot, BuildKit, registry, Docker runner, WSL and VM boundaries.
 Required local Docker scenarios and explicitly skipped opt-in targets are
 documented in [`docs/e2e-matrix.md`](docs/e2e-matrix.md).
+
+Pull requests are gated by Bazel quality checks and the required Docker runner
+matrix. Canonical version tags publish checksum-verifiable native amd64 and
+arm64 CLI archives, then exercise the public downloads on clean machines. The
+permission, cache, artifact, and operator contracts are documented in
+[`docs/releasing.md`](docs/releasing.md).

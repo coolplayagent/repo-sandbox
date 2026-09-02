@@ -1,3 +1,5 @@
 common --enable_bzlmod
 build --incompatible_strict_action_env
+build:release --compilation_mode=opt
+build:release --strip=always
 test --test_output=errors

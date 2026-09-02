@@ -24,6 +24,7 @@ rust_binary(
         ":cli",
         "//crates/adapters:adapters",
         "//crates/core:core",
+        "@crates//:clap",
     ],
     visibility = ["//visibility:public"],
 )

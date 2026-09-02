@@ -5,6 +5,10 @@ rust_library(
     name = "adapters",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
+    compile_data = [
+        "//scripts/docker:multistage-acceptance",
+        "//templates:rust-bazel-dockerfile",
+    ],
     crate_name = "repo_sandbox_adapters",
     deps = all_crate_deps(normal = True) + ["//crates/core:core"],
     visibility = ["//visibility:public"],
@@ -17,6 +21,13 @@ rust_test(
 
 rust_binary(
     name = "e2e_matrix",
+    srcs = ["e2e/e2e_matrix.rs"],
+    crate_root = "e2e/e2e_matrix.rs",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "e2e_matrix_test",
     srcs = ["e2e/e2e_matrix.rs"],
     crate_root = "e2e/e2e_matrix.rs",
     deps = all_crate_deps(normal = True),

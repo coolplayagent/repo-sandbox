@@ -3,3 +3,9 @@ filegroup(
     srcs = glob(["**"]),
     visibility = ["//visibility:public"],
 )
+
+filegroup(
+    name = "rust-bazel-dockerfile",
+    srcs = ["rust-bazel/context/Dockerfile"],
+    visibility = ["//visibility:public"],
+)

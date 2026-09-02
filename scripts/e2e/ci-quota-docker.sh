@@ -6,12 +6,8 @@ runner_temp=${2:-}
 run_id=${3:-}
 run_attempt=${4:-}
 
-if [[ $EUID -ne 0 ]]; then
-  echo "ci-quota-docker must run as root" >&2
-  exit 64
-fi
 if [[ -z $runner_temp || -z $run_id || -z $run_attempt ]]; then
-  echo "usage: ci-quota-docker.sh start|stop RUNNER_TEMP RUN_ID RUN_ATTEMPT" >&2
+  echo "usage: ci-quota-docker.sh start|stop|builder-name RUNNER_TEMP RUN_ID RUN_ATTEMPT" >&2
   exit 64
 fi
 if [[ ! $run_id =~ ^[0-9]+$ || ! $run_attempt =~ ^[0-9]+$ ]]; then
@@ -28,6 +24,10 @@ bridge="rsq$(printf '%x' "$((run_id % 1048575))")"
 bridge=${bridge:0:15}
 subnet_octet=$((run_id % 180 + 40))
 
+builder_name() {
+  printf 'buildkit-e2e-v1-%s-%s\n' "$run_id" "$run_attempt"
+}
+
 validate_task_root() {
   case "$task_root" in
     "$runner_temp"/repo-sandbox-quota-docker-*) ;;
@@ -35,6 +35,16 @@ validate_task_root() {
   esac
   [[ $task_root != "$runner_temp" ]]
 }
+
+if [[ $action == builder-name ]]; then
+  validate_task_root
+  builder_name
+  exit 0
+fi
+if [[ $EUID -ne 0 ]]; then
+  echo "ci-quota-docker must run as root" >&2
+  exit 64
+fi
 
 owned_daemon_pid() {
   local pid
@@ -112,7 +122,8 @@ stop() {
   validate_task_root
   [[ -d $task_root ]] || return 0
   local docker_host="unix://$socket"
-  local builder="repo-sandbox-ci-$run_id-$run_attempt"
+  local builder
+  builder=$(builder_name)
   if [[ -S $socket ]]; then
     DOCKER_HOST="$docker_host" docker buildx inspect "$builder" >/dev/null 2>&1 \
       && DOCKER_HOST="$docker_host" docker buildx rm "$builder" >/dev/null
