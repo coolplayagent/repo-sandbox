@@ -14,7 +14,7 @@ mapfile -t test_targets <"$temporary"
 }
 
 for target in "${test_targets[@]}"; do
-  [[ $target =~ ^//[A-Za-z0-9_./+-]+:[A-Za-z0-9_./+-]+$ ]] || {
+  [[ $target =~ ^//[A-Za-z0-9_./+-]*:[A-Za-z0-9_./+-]+$ ]] || {
     echo "Bazel query returned a non-canonical test label: $target" >&2
     exit 1
   }
