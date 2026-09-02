@@ -31,18 +31,15 @@ jobs:
     timeout-minutes: 35
     steps:
       - name: Install Rocky Linux 8 build prerequisites
-        run: |
-          dnf install --assumeyes binutils ca-certificates curl findutils gcc gcc-c++ git gzip python3 tar zstd
-          libstdcxx=$(gcc -print-file-name=libstdc++.so)
-          test "$libstdcxx" != libstdc++.so
-          test -f "$libstdcxx"
-          rpm -qf "$libstdcxx" | grep -Eq '^gcc-c[+][+]-'
+        run: dnf install --assumeyes binutils ca-certificates curl findutils gcc gcc-c++ git gzip python3 tar zstd
       - name: Checkout the tagged commit without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Validate Rocky Linux C++ linker prerequisite
+        run: scripts/ci/verify-rocky-cxx.sh
       - name: Validate immutable release inputs
         run: scripts/ci/validate-release-inputs.sh "$GITHUB_REF_NAME"
       - name: Install checksum-pinned Bazelisk
@@ -57,9 +54,7 @@ jobs:
           restore-keys: |
             ${{ env.BAZEL_CACHE_NAMESPACE }}-${{ runner.os }}-${{ runner.arch }}-
       - name: Build and test with Bazel
-        run: |
-          bazelisk build --action_env=PATH --config=release //:repo-sandbox
-          bazelisk test --action_env=PATH //...
+        run: scripts/ci/release-bazel.sh
       - name: Package versioned CLI and checksum
         env:
           RELEASE_PLATFORM: ${{ matrix.platform }}
