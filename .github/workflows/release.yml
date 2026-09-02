@@ -27,8 +27,11 @@ jobs:
           - runner: ubuntu-24.04-arm
             platform: linux-arm64
     runs-on: ${{ matrix.runner }}
+    container: rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6
     timeout-minutes: 35
     steps:
+      - name: Install Rocky Linux 8 build prerequisites
+        run: dnf install --assumeyes binutils ca-certificates curl findutils gcc git gzip python3 tar zstd
       - name: Checkout the tagged commit without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -123,13 +126,13 @@ jobs:
           - runner: ubuntu-24.04-arm
             platform: linux-arm64
     runs-on: ${{ matrix.runner }}
-    container: ubuntu:24.04
+    container: rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
       - name: Install only fresh-machine download prerequisites
-        run: apt-get update && apt-get install --yes ca-certificates curl
+        run: dnf install --assumeyes binutils ca-certificates curl gzip tar
       - name: Download public release, verify SHA-256, and run version
         env:
           RELEASE_BASE_URL: https://github.com/${{ github.repository }}/releases/download
@@ -138,5 +141,8 @@ jobs:
           curl --fail --location --proto '=https' --tlsv1.2 \
             --output /tmp/verify-release.sh \
             "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-release.sh"
-          chmod +x /tmp/verify-release.sh
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output /tmp/verify-glibc-baseline.sh \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-glibc-baseline.sh"
+          chmod +x /tmp/verify-release.sh /tmp/verify-glibc-baseline.sh
           /tmp/verify-release.sh "$GITHUB_REF_NAME" "$RELEASE_PLATFORM" "$RELEASE_BASE_URL"

@@ -17,6 +17,7 @@ version=${tag#v}
 archive="repo-sandbox-${version}-${platform}.tar.gz"
 checksum="${archive}.sha256"
 temporary=$(mktemp -d)
+script_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cleanup() { rm -rf -- "$temporary"; }
 trap cleanup EXIT
 for asset in "$archive" "$checksum"; do
@@ -34,6 +35,7 @@ checksum_line=$(cat "$temporary/$checksum")
   echo 'archive must contain exactly the repo-sandbox executable' >&2; exit 1;
 }
 tar -xzf "$temporary/$archive" -C "$temporary" -- repo-sandbox
+"$script_directory/verify-glibc-baseline.sh" "$temporary/repo-sandbox" 2.28
 [[ $("$temporary/repo-sandbox" --version) == "repo-sandbox $version" ]] || {
   echo 'downloaded CLI version does not match release tag' >&2; exit 1;
 }

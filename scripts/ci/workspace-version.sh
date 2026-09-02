@@ -12,11 +12,18 @@ fi
 import pathlib
 import re
 import sys
-import tomllib
 
 root = pathlib.Path(sys.argv[1])
-with (root / "Cargo.toml").open("rb") as source:
-    version = tomllib.load(source)["workspace"]["package"]["version"]
+cargo = (root / "Cargo.toml").read_text(encoding="utf-8")
+workspace_package = re.search(
+    r'^\[workspace\.package\]\s*$\n(.*?)(?=^\[|\Z)', cargo, re.MULTILINE | re.DOTALL
+)
+declared_workspace_versions = [] if not workspace_package else re.findall(
+    r'^\s*version\s*=\s*"([^"]+)"\s*$', workspace_package.group(1), re.MULTILINE
+)
+if len(declared_workspace_versions) != 1:
+    raise SystemExit("Cargo.toml must declare exactly one workspace package version")
+version = declared_workspace_versions[0]
 
 canonical = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 if not isinstance(version, str) or not re.fullmatch(canonical, version):

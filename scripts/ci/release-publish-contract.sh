@@ -40,7 +40,31 @@ cat > "$temporary/bin/gh" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ ${1:-} == api ]]; then
-  if [[ $MOCK_RELEASE_STATE == existing ]]; then
+  if [[ " $* " == *' --method DELETE '* ]]; then
+    : > "$MOCK_DELETE_MARKER"
+    exit 0
+  fi
+  if [[ " $* " == *' --jq '* ]]; then
+    metadata_count=0
+    [[ ! -f $MOCK_METADATA_COUNT ]] || metadata_count=$(cat "$MOCK_METADATA_COUNT")
+    metadata_count=$((metadata_count + 1))
+    printf '%s\n' "$metadata_count" > "$MOCK_METADATA_COUNT"
+    if [[ $MOCK_RELEASE_STATE == draft || $MOCK_RELEASE_STATE == wrong-tag || \
+      $MOCK_RELEASE_STATE == draft-flips ]]; then
+      if [[ $MOCK_RELEASE_STATE == wrong-tag ]]; then
+        printf '123\ttrue\tv9.9.9\n'
+      elif [[ $MOCK_RELEASE_STATE == draft-flips && $metadata_count -gt 1 ]]; then
+        printf '123\tfalse\tv%s\n' "$MOCK_WORKSPACE_VERSION"
+      else
+        printf '123\ttrue\tv%s\n' "$MOCK_WORKSPACE_VERSION"
+      fi
+    else
+      printf '123\tfalse\tv%s\n' "$MOCK_WORKSPACE_VERSION"
+    fi
+    exit 0
+  fi
+  if [[ $MOCK_RELEASE_STATE == existing || $MOCK_RELEASE_STATE == draft || \
+    $MOCK_RELEASE_STATE == wrong-tag || $MOCK_RELEASE_STATE == draft-flips ]]; then
     printf 'HTTP/2.0 200 OK\n\n{}\n'
     exit 0
   fi
@@ -69,7 +93,8 @@ chmod +x "$temporary/bin/git" "$temporary/bin/gh"
 sha=0123456789abcdef0123456789abcdef01234567
 export PATH="$temporary/bin:$PATH" MOCK_REMOTE_SHA=$sha
 export MOCK_EXISTING_DIR="$temporary/existing" MOCK_CREATE_MARKER="$temporary/created"
-export MOCK_GIT_COUNT="$temporary/git-count"
+export MOCK_DELETE_MARKER="$temporary/deleted" MOCK_GIT_COUNT="$temporary/git-count"
+export MOCK_METADATA_COUNT="$temporary/metadata-count" MOCK_WORKSPACE_VERSION=$version
 
 # A moved tag is rejected before any GitHub release API or write is attempted.
 export MOCK_REMOTE_SHA=1123456789abcdef0123456789abcdef01234567 MOCK_RELEASE_STATE=absent
@@ -90,6 +115,32 @@ fi
 [[ ! -e $MOCK_CREATE_MARKER ]]
 unset MOCK_SECOND_REMOTE_SHA
 
+# An interrupted partial draft is mutable. Delete only its numeric release object,
+# retain the verified tag, and recreate from this run's complete asset set.
+export MOCK_RELEASE_STATE=draft
+rm -f "$MOCK_GIT_COUNT" "$MOCK_METADATA_COUNT" "$MOCK_CREATE_MARKER" "$MOCK_DELETE_MARKER"
+"$root/scripts/ci/publish-release.sh" "v$version" owner/repository "$temporary/current" "$sha" >/dev/null
+[[ -f $MOCK_DELETE_MARKER && -f $MOCK_CREATE_MARKER ]]
+rm -f "$MOCK_CREATE_MARKER" "$MOCK_DELETE_MARKER"
+
+# Even a draft response cannot authorize deletion unless its tag_name is exact.
+export MOCK_RELEASE_STATE=wrong-tag
+rm -f "$MOCK_GIT_COUNT"
+if "$root/scripts/ci/publish-release.sh" "v$version" owner/repository "$temporary/current" "$sha" \
+  >/dev/null 2>&1; then
+  echo "draft with mismatched tag_name was accepted" >&2; exit 1
+fi
+[[ ! -e $MOCK_CREATE_MARKER && ! -e $MOCK_DELETE_MARKER ]]
+
+# A draft that becomes published/changes during recovery is never deleted.
+export MOCK_RELEASE_STATE=draft-flips
+rm -f "$MOCK_GIT_COUNT" "$MOCK_METADATA_COUNT"
+if "$root/scripts/ci/publish-release.sh" "v$version" owner/repository "$temporary/current" "$sha" \
+  >/dev/null 2>&1; then
+  echo "draft state change before delete was accepted" >&2; exit 1
+fi
+[[ ! -e $MOCK_CREATE_MARKER && ! -e $MOCK_DELETE_MARKER ]]
+
 # An API/auth/network failure is not treated as proof that a release is absent.
 export MOCK_RELEASE_STATE=error
 rm -f "$MOCK_GIT_COUNT"
@@ -98,6 +149,7 @@ if "$root/scripts/ci/publish-release.sh" "v$version" owner/repository "$temporar
   echo "release API failure was treated as absence" >&2; exit 1
 fi
 [[ ! -e $MOCK_CREATE_MARKER ]]
+[[ ! -e $MOCK_DELETE_MARKER ]]
 
 # An existing release must be byte-for-byte identical; it is never overwritten.
 export MOCK_REMOTE_SHA=$sha MOCK_RELEASE_STATE=existing
@@ -108,6 +160,7 @@ if "$root/scripts/ci/publish-release.sh" "v$version" owner/repository "$temporar
   echo "different existing release was accepted" >&2; exit 1
 fi
 [[ ! -e $MOCK_CREATE_MARKER ]]
+[[ ! -e $MOCK_DELETE_MARKER ]]
 
 cp "$temporary/current/SHA256SUMS" "$temporary/existing/SHA256SUMS"
 rm -f "$MOCK_GIT_COUNT"

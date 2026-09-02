@@ -29,16 +29,30 @@ grep -Fq 'contents: write' "$release"
 grep -Fq 'environment: release' "$release"
 grep -Fq 'ubuntu-24.04-arm' "$release"
 grep -Fq 'SHA256SUMS' "$release"
-grep -Fq 'container: ubuntu:24.04' "$release"
+rocky_image='rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6'
+[[ $(grep -c "container: $rocky_image" "$release") -eq 2 ]]
+! grep -Fq 'cargo build' "$release"
+grep -Fq 'binary=$(bazelisk cquery --config=release //:repo-sandbox --output=files' "$release"
+grep -Fq 'verify-glibc-baseline.sh" "$binary" 2.28' "$root/scripts/ci/package-cli.sh"
+grep -Fq 'verify-glibc-baseline.sh" "$temporary/repo-sandbox" 2.28' \
+  "$root/scripts/ci/verify-release.sh"
+grep -Fq 'raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-glibc-baseline.sh' \
+  "$release"
 grep -Fq 'version=$(scripts/ci/workspace-version.sh)' "$ci"
 ! grep -Fq "grep -Fx 'repo-sandbox 0.1.0'" "$ci"
 grep -Fq 'bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh' "$ci"
 grep -Fq 'publish-release.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" release "$GITHUB_SHA"' "$release"
 ! grep -Fq 'gh release create' "$release"
 grep -Fq 'refs/tags/${tag}:refs/repo-sandbox/publish-tag' "$root/scripts/ci/publish-release.sh"
-[[ $(grep -c "remote_sha == \"\$expected_sha\"" "$root/scripts/ci/publish-release.sh") -eq 2 ]]
+[[ $(grep -c "remote_sha == \"\$expected_sha\"" "$root/scripts/ci/publish-release.sh") -eq 3 ]]
 grep -Fq 'cmp --silent' "$root/scripts/ci/publish-release.sh"
 grep -Fq "404([[:space:]]|\$)" "$root/scripts/ci/publish-release.sh"
+grep -Fq 'release_is_draft == true' "$root/scripts/ci/publish-release.sh"
+grep -Fq 'release_tag == "$tag"' "$root/scripts/ci/publish-release.sh"
+grep -Fq 'confirmed_metadata == "$metadata"' "$root/scripts/ci/publish-release.sh"
+grep -Fq 'gh api --method DELETE "repos/${repository}/releases/${release_id}"' \
+  "$root/scripts/ci/publish-release.sh"
+! grep -Fq -- '--cleanup-tag' "$root/scripts/ci/publish-release.sh"
 
 # The adapter's include_str! tests must stay hermetic without broad workspace data.
 grep -Fq '"//scripts/docker:multistage-acceptance"' "$adapters_build"
@@ -102,5 +116,6 @@ fi
 
 "$root/scripts/ci/workspace-version-contract.sh" >/dev/null
 "$root/scripts/ci/release-publish-contract.sh" >/dev/null
+"$root/scripts/ci/glibc-baseline-contract.sh" >/dev/null
 
 echo 'CI permission, fork, cache, tag, platform, checksum, and fresh-machine contracts passed'

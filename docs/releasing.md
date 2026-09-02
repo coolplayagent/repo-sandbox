@@ -30,17 +30,22 @@ cache entries cannot become release inputs.
 The tag workflow validates that the tagged commit is already on `origin/main`,
 the tag is canonical, and all version declarations match before it builds
 anything. Native GitHub runners build `linux-amd64` and
-`linux-arm64` with Bazel, run the Bazel tests, execute each binary, create a
+`linux-arm64` with Bazel inside a digest-pinned Rocky Linux 8.10 container,
+run the Bazel tests, enforce a maximum GLIBC 2.28 symbol requirement, execute
+each binary, create a
 deterministic archive, and attach both per-asset checksums and `SHA256SUMS` to a
 GitHub Release with generated notes. Only the `Publish protected tag release`
 job receives `contents: write`; build and fresh-machine jobs remain read-only.
 All third-party Actions are pinned to full commits and checkout never persists
 the workflow token.
 
-After publication, native amd64 and arm64 jobs start from clean `ubuntu:24.04`
-containers. They use no release token: each downloads the public archive and
+The generic Linux archives support GLIBC 2.28 or newer. This baseline is both
+built and tested on Rocky Linux 8 rather than inferred from a newer hosted
+runner. After publication, native amd64 and arm64 jobs start from the same clean,
+digest-pinned Rocky Linux 8.10 container. They use no release token: each downloads the public archive and
 checksum, validates the checksum filename before invoking `sha256sum`, rejects
-unexpected archive members, and executes `repo-sandbox --version`. The workflow
+unexpected archive members, independently rechecks the GLIBC symbol ceiling,
+and executes `repo-sandbox --version`. The workflow
 is not successful until both public-download checks pass.
 
 ## Consumer verification
@@ -59,3 +64,7 @@ finite allowlists. Build artifacts are immutable, run-scoped Actions artifacts
 and are accepted by the publish job only when the exact two-platform file set
 and both checksums validate. The final public checks provide an independent
 download boundary; GitHub Releases remains the only artifact service.
+Release reruns compare every already-published asset byte-for-byte and never
+overwrite it. An interrupted, unpublished draft is the only mutable case: after
+revalidating its numeric ID, exact tag, draft state, and remote tag commit, the
+workflow replaces that partial draft without deleting or moving the Git tag.

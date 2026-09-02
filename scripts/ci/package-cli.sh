@@ -19,6 +19,7 @@ esac
   exit 1
 }
 [[ -f "$binary" && -x "$binary" ]] || { echo "CLI binary is not executable: $binary" >&2; exit 1; }
+"$root/scripts/ci/verify-glibc-baseline.sh" "$binary" 2.28
 
 version=${tag#v}
 [[ $("$binary" --version) == "repo-sandbox $version" ]] || {

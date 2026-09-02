@@ -49,18 +49,42 @@ release_status=$?
 set -e
 
 if [[ $release_status -eq 0 ]]; then
-  existing=$(mktemp -d)
-  trap 'rm -rf -- "$existing"' EXIT
-  gh release download "$tag" --repo "$repository" --dir "$existing"
-  assert_asset_set "$existing"
-  while IFS= read -r asset; do
-    cmp --silent "$release_dir/$asset" "$existing/$asset" || {
-      echo "existing release asset differs from this deterministic build: $asset" >&2
-      exit 1
+  metadata=$(gh api "repos/${repository}/releases/tags/${tag}" --jq '[.id, .draft, .tag_name] | @tsv')
+  IFS=$'\t' read -r release_id release_is_draft release_tag <<< "$metadata"
+  [[ $release_id =~ ^[0-9]+$ && $release_is_draft =~ ^(true|false)$ && $release_tag == "$tag" ]] || {
+    echo "release API returned invalid identity, draft state, or tag" >&2; exit 1;
+  }
+
+  if [[ $release_is_draft == true ]]; then
+    # A partial draft is unpublished and mutable. Delete only that numeric release
+    # object (never the tag), then recreate it from the exact current asset set.
+    git fetch --force --no-tags origin "refs/tags/${tag}:refs/repo-sandbox/publish-tag"
+    remote_sha=$(git rev-parse --verify 'refs/repo-sandbox/publish-tag^{commit}')
+    [[ $remote_sha == "$expected_sha" ]] || {
+      echo "remote tag moved before partial-draft recovery" >&2; exit 1;
     }
-  done <<< "$expected_assets"
-  echo "existing release assets exactly match this run; publication is already complete"
-  exit 0
+    confirmed_metadata=$(gh api "repos/${repository}/releases/tags/${tag}" \
+      --jq '[.id, .draft, .tag_name] | @tsv')
+    [[ $confirmed_metadata == "$metadata" ]] || {
+      echo "draft identity or state changed before recovery" >&2; exit 1;
+    }
+    gh api --method DELETE "repos/${repository}/releases/${release_id}"
+    release_status=1
+    release_response='HTTP/2.0 404 Not Found'
+  else
+    existing=$(mktemp -d)
+    trap 'rm -rf -- "$existing"' EXIT
+    gh release download "$tag" --repo "$repository" --dir "$existing"
+    assert_asset_set "$existing"
+    while IFS= read -r asset; do
+      cmp --silent "$release_dir/$asset" "$existing/$asset" || {
+        echo "existing release asset differs from this deterministic build: $asset" >&2
+        exit 1
+      }
+    done <<< "$expected_assets"
+    echo "existing published release assets exactly match this run; publication is already complete"
+    exit 0
+  fi
 fi
 
 if ! grep -Eq '^HTTP/[^ ]+ 404([[:space:]]|$)' <<< "$release_response"; then
