@@ -69,11 +69,17 @@ if EXPECTED_ROOT=$root EXPECTED_SHA=$non_ancestor EXPECTED_STATUS=1 PATH="$tempo
   exit 1
 fi
 
-fixture_parent=$("$real_git" -C "$fixture" rev-parse HEAD^)
-"$real_git" -C "$fixture" update-ref refs/remotes/origin/main "$fixture_parent"
+fixture_tree=$("$real_git" -C "$fixture" rev-parse 'HEAD^{tree}')
+unrelated_main=$(printf '%s\n' 'unrelated main fixture' | \
+  GIT_AUTHOR_NAME=contract GIT_AUTHOR_EMAIL=contract@example.invalid \
+  GIT_AUTHOR_DATE=2000-01-01T00:00:00Z \
+  GIT_COMMITTER_NAME=contract GIT_COMMITTER_EMAIL=contract@example.invalid \
+  GIT_COMMITTER_DATE=2000-01-01T00:00:00Z \
+  "$real_git" -C "$fixture" commit-tree "$fixture_tree")
+"$real_git" -C "$fixture" update-ref refs/remotes/origin/main "$unrelated_main"
 if GITHUB_WORKSPACE=$fixture GITHUB_SHA=$fixture_head \
   "$fixture/scripts/ci/validate-release-inputs.sh" "v$version" >/dev/null 2>&1; then
-  echo "real Git ancestry gate accepted $fixture_head against its parent" >&2
+  echo "real Git ancestry gate accepted $fixture_head against an unrelated root" >&2
   exit 1
 fi
 
