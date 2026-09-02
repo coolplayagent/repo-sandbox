@@ -1,0 +1,5 @@
+filegroup(
+    name = "multistage-acceptance",
+    srcs = ["multistage-acceptance.sh"],
+    visibility = ["//visibility:public"],
+)
