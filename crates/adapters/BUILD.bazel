@@ -25,3 +25,10 @@ rust_binary(
     crate_root = "e2e/e2e_matrix.rs",
     deps = all_crate_deps(normal = True),
 )
+
+rust_test(
+    name = "e2e_matrix_test",
+    srcs = ["e2e/e2e_matrix.rs"],
+    crate_root = "e2e/e2e_matrix.rs",
+    deps = all_crate_deps(normal = True),
+)

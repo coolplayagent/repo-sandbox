@@ -106,15 +106,10 @@ jobs:
           done
           test "$(find release -maxdepth 1 -type f | wc -l)" -eq 4
           (cd release && sha256sum repo-sandbox-*.tar.gz > SHA256SUMS)
-      - name: Publish GitHub Release with generated notes
+      - name: Publish or verify immutable GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" release/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --generate-notes \
-            --notes 'Download the archive for your platform and verify it against SHA256SUMS before execution.'
+        run: scripts/ci/publish-release.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" release "$GITHUB_SHA"
 
   fresh-machine:
     name: Fresh machine ${{ matrix.platform }}

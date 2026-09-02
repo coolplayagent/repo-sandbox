@@ -7,8 +7,9 @@ release="$root/.github/workflows/release.yml"
 adapters_build="$root/crates/adapters/BUILD.bazel"
 cli_build="$root/crates/cli/BUILD.bazel"
 
-for required in "$ci" "$release" "$root/scripts/ci/validate-release.sh" \
-  "$root/scripts/ci/package-cli.sh" "$root/scripts/ci/verify-release.sh"; do
+for required in "$ci" "$release" "$root/scripts/ci/workspace-version.sh" \
+  "$root/scripts/ci/validate-release.sh" "$root/scripts/ci/package-cli.sh" \
+  "$root/scripts/ci/publish-release.sh" "$root/scripts/ci/verify-release.sh"; do
   [[ -f $required ]] || { echo "missing CI contract: $required" >&2; exit 1; }
 done
 
@@ -29,12 +30,23 @@ grep -Fq 'environment: release' "$release"
 grep -Fq 'ubuntu-24.04-arm' "$release"
 grep -Fq 'SHA256SUMS' "$release"
 grep -Fq 'container: ubuntu:24.04' "$release"
+grep -Fq 'version=$(scripts/ci/workspace-version.sh)' "$ci"
+! grep -Fq "grep -Fx 'repo-sandbox 0.1.0'" "$ci"
+grep -Fq 'bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh' "$ci"
+grep -Fq 'publish-release.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" release "$GITHUB_SHA"' "$release"
+! grep -Fq 'gh release create' "$release"
+grep -Fq 'refs/tags/${tag}:refs/repo-sandbox/publish-tag' "$root/scripts/ci/publish-release.sh"
+[[ $(grep -c "remote_sha == \"\$expected_sha\"" "$root/scripts/ci/publish-release.sh") -eq 2 ]]
+grep -Fq 'cmp --silent' "$root/scripts/ci/publish-release.sh"
+grep -Fq "404([[:space:]]|\$)" "$root/scripts/ci/publish-release.sh"
 
 # The adapter's include_str! tests must stay hermetic without broad workspace data.
 grep -Fq '"//scripts/docker:multistage-acceptance"' "$adapters_build"
 grep -Fq '"//templates:rust-bazel-dockerfile"' "$adapters_build"
 grep -Fq 'srcs = ["multistage-acceptance.sh"]' "$root/scripts/docker/BUILD.bazel"
 grep -Fq 'srcs = ["rust-bazel/context/Dockerfile"]' "$root/templates/BUILD.bazel"
+grep -A5 -F 'name = "e2e_matrix_test"' "$adapters_build" | grep -Fq 'srcs = ["e2e/e2e_matrix.rs"]'
+grep -Fq 'bazelisk test --action_env=PATH //...' "$ci"
 
 # Both the CLI library and binary directly import clap; keep exactly those direct deps.
 [[ $(grep -c '"@crates//:clap"' "$cli_build") -eq 2 ]]
@@ -72,18 +84,23 @@ while IFS= read -r action; do
   }
 done < <(grep -RhE '^\s*uses:' "$root/.github/workflows")
 
-"$root/scripts/ci/validate-release.sh" v0.1.0 >/dev/null
-for malicious in 'v0.1.0;id' 'v0.1.0/../../escape' 'v0.1.0-rc.1' 'V0.1.0' 'v00.1.0'; do
+workspace_version=$("$root/scripts/ci/workspace-version.sh")
+"$root/scripts/ci/validate-release.sh" "v$workspace_version" >/dev/null
+for malicious in "v${workspace_version};id" "v${workspace_version}/../../escape" \
+  "v${workspace_version}-rc.1" "V$workspace_version" 'v00.1.0'; do
   if "$root/scripts/ci/validate-release.sh" "$malicious" >/dev/null 2>&1; then
     echo "unsafe release tag accepted: $malicious" >&2
     exit 1
   fi
 done
 
-if "$root/scripts/ci/package-cli.sh" v0.1.0 'linux-amd64/../../escape' /does/not/exist /tmp/out \
+if "$root/scripts/ci/package-cli.sh" "v$workspace_version" 'linux-amd64/../../escape' /does/not/exist /tmp/out \
   >/dev/null 2>&1; then
   echo 'unsafe release platform accepted' >&2
   exit 1
 fi
+
+"$root/scripts/ci/workspace-version-contract.sh" >/dev/null
+"$root/scripts/ci/release-publish-contract.sh" >/dev/null
 
 echo 'CI permission, fork, cache, tag, platform, checksum, and fresh-machine contracts passed'

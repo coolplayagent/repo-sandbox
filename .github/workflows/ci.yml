@@ -48,12 +48,14 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features -- -D warnings
+          bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh
       - name: Configuration sample and executable integration
         run: |
           binary=$(bazelisk cquery //:repo-sandbox --output=files | tail -n 1)
           test -x "$binary"
           install -m 0755 "$binary" "$RUNNER_TEMP/repo-sandbox"
-          "$RUNNER_TEMP/repo-sandbox" --version | grep -Fx 'repo-sandbox 0.1.0'
+          version=$(scripts/ci/workspace-version.sh)
+          "$RUNNER_TEMP/repo-sandbox" --version | grep -Fx "repo-sandbox $version"
           sample=$(mktemp -d)
           cp .repo-sandbox.yaml.example "$sample/.repo-sandbox.yaml"
           "$RUNNER_TEMP/repo-sandbox" plan --repository "$sample" | grep -F 'Template: rust-bazel@1.0.0'
