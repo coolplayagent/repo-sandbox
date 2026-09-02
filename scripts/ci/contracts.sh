@@ -40,6 +40,31 @@ grep -Fq 'srcs = ["rust-bazel/context/Dockerfile"]' "$root/templates/BUILD.bazel
 [[ $(grep -c '"@crates//:clap"' "$cli_build") -eq 2 ]]
 ! grep -Fq 'all_crate_deps' "$cli_build"
 
+# Keep every required scenario budget stable: this change deliberately grants only
+# the dual-architecture dogfood scenario more time on hosted QEMU runners.
+scenario_timeouts=$(awk '
+  /- id: / { id=$3 }
+  /timeout_seconds:/ { print id "=" $2 }
+' "$root/tests/e2e/scenarios.yaml")
+expected_scenario_timeouts=$(printf '%s\n' \
+  'public-git-snapshot=60' \
+  'private-https-snapshot=120' \
+  'private-ssh-snapshot=120' \
+  'private-https-invalid-auth=120' \
+  'docker-adapters=600' \
+  'docker-failures=180' \
+  'docker-architecture-mismatch=120' \
+  'rust-bazel-dogfood=3300' \
+  'registry-publish-pull=600' \
+  'euleros-wsl-dogfood=1800' \
+  'euleros-hce-vm-matrix=3600')
+[[ "$scenario_timeouts" == "$expected_scenario_timeouts" ]]
+
+dogfood_timeout=3300
+docker_job_minutes=$(awk '/^  docker-required:/{found=1} found && /timeout-minutes:/{print $2; exit}' \
+  "$ci")
+[[ $((docker_job_minutes * 60)) -ge $((dogfood_timeout + 600)) ]]
+
 while IFS= read -r action; do
   [[ $action =~ @([a-f0-9]{40})([[:space:]]|$) ]] || {
     echo "GitHub Action is not pinned to a full commit: $action" >&2

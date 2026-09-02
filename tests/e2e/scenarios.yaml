@@ -109,7 +109,7 @@ scenarios:
     tier: required
     targets: [docker]
     covers: [rust, bazel, cold_cache, warm_cache, source_change, amd64, arm64, multistage, secrets]
-    timeout_seconds: 2700
+    timeout_seconds: 3300
     command:
       program: repo-bash
       args: ["${ROOT}/scripts/e2e/docker-scenario.sh", dogfood, "${RESULT_DIR}"]
