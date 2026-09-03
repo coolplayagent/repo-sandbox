@@ -152,7 +152,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: scripts/ci/download-release-artifacts.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release
       - name: Verify exact artifact set and generate aggregate checksums
-        run: python3 tools/release/assemble_release.py --tag "${{ needs.prepare.outputs.tag }}" --directory release
+        run: |
+          python3 tools/release/assemble_release.py --tag "${{ needs.prepare.outputs.tag }}" --directory release
+          test -f release/SHA256SUMS
       - name: Publish or verify immutable GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
