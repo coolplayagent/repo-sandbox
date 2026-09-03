@@ -75,6 +75,14 @@ The `plan`, `build`, and `verify` routes accept only these runtime options:
 | `--keep-on-failure` | retain a failed sandbox |
 | `--recurse-submodules` | recursively materialize Git submodules in the source snapshot |
 
+Remote credentials are always explicit external references. HTTPS accepts
+`--git-https-token-env NAME` with an optional `--git-https-username USER`, or
+the mutually exclusive `--git-credential-helper`. SSH accepts
+`--git-ssh-private-key PATH` or `--git-ssh-agent`, plus an optional strict
+`--git-ssh-known-hosts PATH`. Secret values and key bytes never enter the plan,
+process arguments, report, or journal; only the selected reference names/paths
+enter the plan digest.
+
 When `--platform` is absent, the configured platform parameter is used. Multiple
 platforms require `--push` or `--oci-layout`; publication/export happens only
 after the primary platform passes the central runner. No CLI option can replace
@@ -98,3 +106,12 @@ limits, timeout, allowlisted environment names, external Secret names, artifact
 directories, and optional parameterized Registry repository/aliases. Unknown
 fields fail. The complete resolved DAG, profile, parameters and finite CLI
 overrides form the execution/task identity digest.
+
+The built-in `rust-bazel-acceptance-*` profiles are fixed diagnostic fixtures
+for required CLI verification of timeout, memory, temporary storage,
+architecture, Secret injection, and artifact export. They are never selected
+by default and execution requires the explicit process-local opt-in
+`REPO_SANDBOX_ENABLE_ACCEPTANCE_PROFILES=1`. Repositories can select only the
+published profile ID and platform; they cannot replace its commands or safety
+limits. These profiles run through the same unprivileged Docker runner and must
+not be used as application build profiles.

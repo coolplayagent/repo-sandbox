@@ -111,13 +111,25 @@ fi
 [[ $(grep -c '"@crates//:clap"' "$cli_build") -eq 2 ]]
 ! grep -Fq 'all_crate_deps' "$cli_build"
 
-# Keep every required scenario budget stable: this change deliberately grants only
-# the dual-architecture dogfood scenario more time on hosted QEMU runners.
+# Keep every scenario budget explicit. The required Docker job is sequential, so
+# its outer timeout must cover the sum of every required Docker scenario plus teardown.
 scenario_timeouts=$(awk '
   /- id: / { id=$3 }
   /timeout_seconds:/ { print id "=" $2 }
 ' "$root/tests/e2e/scenarios.yaml")
 expected_scenario_timeouts=$(printf '%s\n' \
+  'cli-build-success=900' \
+  'cli-verify-success=600' \
+  'cli-build-failure=600' \
+  'cli-test-failure=600' \
+  'cli-clean-owned-only=600' \
+  'cli-interrupt-cleanup=600' \
+  'cli-multi-platform-oci=1800' \
+  'cli-registry-publish=1200' \
+  'cli-public-file-remote=600' \
+  'cli-private-https-remote=1800' \
+  'cli-private-ssh-remote=1800' \
+  'cli-profile-contracts=1200' \
   'public-git-snapshot=60' \
   'private-https-snapshot=120' \
   'private-ssh-snapshot=120' \
@@ -131,10 +143,16 @@ expected_scenario_timeouts=$(printf '%s\n' \
   'euleros-hce-vm-matrix=3600')
 [[ "$scenario_timeouts" == "$expected_scenario_timeouts" ]]
 
-dogfood_timeout=3300
 docker_job_minutes=$(awk '/^  docker-required:/{found=1} found && /timeout-minutes:/{print $2; exit}' \
   "$ci")
-[[ $((docker_job_minutes * 60)) -ge $((dogfood_timeout + 600)) ]]
+required_docker_budget=$(awk '
+  /- id: / { id=$3; tier=""; docker=0 }
+  /tier: required/ { tier="required" }
+  /targets: \[[^]]*docker/ { docker=1 }
+  /timeout_seconds:/ { if (tier == "required" && docker) total += $2 }
+  END { print total }
+' "$root/tests/e2e/scenarios.yaml")
+[[ $((docker_job_minutes * 60)) -ge $((required_docker_budget + 600)) ]]
 
 while IFS= read -r action; do
   [[ $action =~ @([a-f0-9]{40})([[:space:]]|$) ]] || {

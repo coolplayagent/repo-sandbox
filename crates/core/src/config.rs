@@ -128,6 +128,17 @@ pub struct CliOverrides {
     pub report: Option<PathBuf>,
     pub keep_on_failure: bool,
     pub recurse_submodules: bool,
+    pub remote_auth: RemoteAuthentication,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RemoteAuthentication {
+    pub https_username: Option<String>,
+    pub https_token_environment: Option<String>,
+    pub https_credential_helper: bool,
+    pub ssh_private_key: Option<PathBuf>,
+    pub ssh_known_hosts: Option<PathBuf>,
+    pub ssh_agent: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -141,6 +152,7 @@ pub struct ExecutionRequest {
     pub report: Option<PathBuf>,
     pub keep_on_failure: bool,
     pub recurse_submodules: bool,
+    pub remote_auth: RemoteAuthentication,
 }
 
 impl ExecutionRequest {
@@ -168,6 +180,7 @@ impl ExecutionRequest {
             report: cli.report,
             keep_on_failure: cli.keep_on_failure,
             recurse_submodules: cli.recurse_submodules,
+            remote_auth: cli.remote_auth,
         }
     }
 }

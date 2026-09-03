@@ -7,13 +7,16 @@ use repo_sandbox_core::application::{
     BuildUseCase, CleanRequest, CleanUseCase, ExecutionPlan, VerifyUseCase, WorkflowFailureReport,
     WorkflowFailureStatus, write_failure_report,
 };
-use repo_sandbox_core::config::{CliOverrides, Config, ExecutionRequest, Platform};
+use repo_sandbox_core::config::{
+    CliOverrides, Config, ExecutionRequest, Platform, RemoteAuthentication,
+};
 use repo_sandbox_core::doctor::{CapabilityKind, CapabilityStatus, DoctorReport, DoctorStatus};
 use repo_sandbox_core::exit_code::ExitCode;
 use repo_sandbox_core::snapshot::{CleanupPolicy, SnapshotOptions, SnapshotOrigin, SourceSpec};
 use repo_sandbox_core::template::{TemplateCatalog, TemplatePlan};
 use std::fmt::Write as _;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, Write as IoWrite};
 use std::path::PathBuf;
 
@@ -76,6 +79,24 @@ pub struct RuntimeArgs {
     /// Recursively materialize Git submodules in the source snapshot.
     #[arg(long)]
     pub recurse_submodules: bool,
+    /// Name of an environment variable containing an HTTPS token.
+    #[arg(long = "git-https-token-env", value_name = "NAME")]
+    pub git_https_token_env: Option<String>,
+    /// HTTPS username paired with --git-https-token-env.
+    #[arg(long = "git-https-username", value_name = "USER")]
+    pub git_https_username: Option<String>,
+    /// Use the operator-configured Git HTTPS credential helper.
+    #[arg(long = "git-credential-helper")]
+    pub git_credential_helper: bool,
+    /// Path to an external SSH private key; key bytes never enter the plan.
+    #[arg(long = "git-ssh-private-key", value_name = "PATH")]
+    pub git_ssh_private_key: Option<PathBuf>,
+    /// Path to the strict SSH known_hosts file.
+    #[arg(long = "git-ssh-known-hosts", value_name = "PATH")]
+    pub git_ssh_known_hosts: Option<PathBuf>,
+    /// Use the external SSH agent instead of a private-key file.
+    #[arg(long = "git-ssh-agent")]
+    pub git_ssh_agent: bool,
 }
 
 #[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
@@ -112,6 +133,14 @@ impl From<RuntimeArgs> for CliOverrides {
             report: value.report,
             keep_on_failure: value.keep_on_failure,
             recurse_submodules: value.recurse_submodules,
+            remote_auth: RemoteAuthentication {
+                https_username: value.git_https_username,
+                https_token_environment: value.git_https_token_env,
+                https_credential_helper: value.git_credential_helper,
+                ssh_private_key: value.git_ssh_private_key,
+                ssh_known_hosts: value.git_ssh_known_hosts,
+                ssh_agent: value.git_ssh_agent,
+            },
         }
     }
 }
@@ -150,8 +179,11 @@ pub fn run_with_probe(cli: Cli, probe: &impl DoctorProbe) -> Result<RunOutput, A
         });
     }
     if let Commands::Plan(arguments) = command {
-        let source = read_repository_config(arguments.repository.as_deref())?;
-        return plan_from_source(&source, arguments);
+        let execution = prepare_execution(arguments)?;
+        return Ok(RunOutput {
+            message: Some(render_plan(&execution.template)),
+            exit_code: ExitCode::Success,
+        });
     }
     let workflow = SystemWorkflow;
     match command {
@@ -248,7 +280,94 @@ fn run_runtime(
     verify: bool,
     workflow: &SystemWorkflow,
 ) -> Result<RunOutput, AppError> {
-    let mut arguments = arguments;
+    let requested_report = arguments.report.clone();
+    let _report_reservation = requested_report
+        .as_deref()
+        .map(CliReportReservation::create)
+        .transpose()?;
+    let prepared = prepare_execution(arguments);
+    let execution = match prepared {
+        Ok(execution) => execution,
+        Err(error) => {
+            if let Some(path) = requested_report.as_deref()
+                && !path.exists()
+            {
+                write_cli_failure_report(path, "unavailable", preparation_phase(&error), &error)?;
+            }
+            return Err(error);
+        }
+    };
+    let result = if verify {
+        VerifyUseCase::new(workflow).execute(&execution)
+    } else {
+        BuildUseCase::new(workflow).execute(&execution)
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(path) = &execution.request.report
+                && !path.exists()
+            {
+                write_cli_failure_report(path, &execution.digest, "orchestration", &error)?;
+            }
+            return Err(error);
+        }
+    };
+    Ok(RunOutput {
+        message: Some(render_workflow(&result)),
+        exit_code: ExitCode::Success,
+    })
+}
+
+struct CliReportReservation {
+    path: PathBuf,
+}
+
+impl CliReportReservation {
+    fn create(report: &std::path::Path) -> Result<Self, AppError> {
+        let parent = report.parent().unwrap_or_else(|| std::path::Path::new("."));
+        fs::create_dir_all(parent)
+            .map_err(|error| AppError::Environment(format!("create report directory: {error}")))?;
+        if report.exists() {
+            return Err(AppError::Configuration(format!(
+                "report already exists: {}",
+                report.display()
+            )));
+        }
+        let name = report
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("report.json");
+        let path = parent.join(format!(".{name}.repo-sandbox-cli-reservation"));
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                AppError::Configuration(format!(
+                    "cannot reserve report {}: {error}",
+                    report.display()
+                ))
+            })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for CliReportReservation {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn prepare_execution(mut arguments: RuntimeArgs) -> Result<ExecutionPlan, AppError> {
+    let remote_auth = RemoteAuthentication {
+        https_username: arguments.git_https_username.clone(),
+        https_token_environment: arguments.git_https_token_env.clone(),
+        https_credential_helper: arguments.git_credential_helper,
+        ssh_private_key: arguments.git_ssh_private_key.clone(),
+        ssh_known_hosts: arguments.git_ssh_known_hosts.clone(),
+        ssh_agent: arguments.git_ssh_agent,
+    };
     let source = if let Some(repository) = arguments
         .repository
         .as_deref()
@@ -256,7 +375,10 @@ fn run_runtime(
     {
         let materialized = GitSnapshotter::default()
             .with_authentication(
-                repo_sandbox_adapters::workflow::environment_git_authentication(repository),
+                repo_sandbox_adapters::workflow::external_git_authentication(
+                    repository,
+                    &remote_auth,
+                )?,
             )
             .create(
                 &SourceSpec::RemoteGit {
@@ -278,57 +400,51 @@ fn run_runtime(
     } else {
         read_repository_config(arguments.repository.as_deref())?
     };
-    let execution = execution_plan_from_source(&source, arguments)?;
-    let result = if verify {
-        VerifyUseCase::new(workflow).execute(&execution)
-    } else {
-        BuildUseCase::new(workflow).execute(&execution)
+    execution_plan_from_source(&source, arguments)
+}
+
+fn preparation_phase(error: &AppError) -> &'static str {
+    match error {
+        AppError::Configuration(_) => "configuration",
+        _ => "snapshot",
+    }
+}
+
+fn write_cli_failure_report(
+    path: &std::path::Path,
+    plan_digest: &str,
+    phase: &'static str,
+    error: &AppError,
+) -> Result<(), AppError> {
+    let report = WorkflowFailureReport {
+        schema_version: 1,
+        task_id: "unassigned".into(),
+        plan_digest: plan_digest.into(),
+        phase: phase.into(),
+        exit_code: error.exit_code().as_i32(),
+        message: error.to_string(),
+        cleanup: repo_sandbox_core::runner::CleanupResult::NotNeeded,
+        published: None,
+        container_id: None,
+        source_snapshot: None,
+        config: None,
+        image: None,
+        image_digest: None,
+        started_at_unix_ms: 0,
+        ended_at_unix_ms: 0,
+        duration_ms: 0,
+        status: WorkflowFailureStatus {
+            status: "infrastructure_failed",
+            operation: phase.into(),
+            message: error.to_string(),
+        },
+        steps: Vec::new(),
+        exported_artifacts: Vec::new(),
+        artifact_error: None,
+        cleanup_error: None,
     };
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            if let Some(path) = &execution.request.report
-                && !path.exists()
-            {
-                let report = WorkflowFailureReport {
-                    schema_version: 1,
-                    task_id: "unassigned".into(),
-                    plan_digest: execution.digest.clone(),
-                    phase: "orchestration".into(),
-                    exit_code: error.exit_code().as_i32(),
-                    message: error.to_string(),
-                    cleanup: repo_sandbox_core::runner::CleanupResult::NotNeeded,
-                    published: None,
-                    container_id: None,
-                    source_snapshot: None,
-                    config: None,
-                    image: None,
-                    image_digest: None,
-                    started_at_unix_ms: 0,
-                    ended_at_unix_ms: 0,
-                    duration_ms: 0,
-                    status: WorkflowFailureStatus {
-                        status: "infrastructure_failed",
-                        operation: "orchestration".into(),
-                        message: error.to_string(),
-                    },
-                    steps: Vec::new(),
-                    exported_artifacts: Vec::new(),
-                    artifact_error: None,
-                    cleanup_error: None,
-                };
-                write_failure_report(&report, path).map_err(|write| {
-                    AppError::Environment(format!(
-                        "write failure report: {write}; primary: {error}"
-                    ))
-                })?;
-            }
-            return Err(error);
-        }
-    };
-    Ok(RunOutput {
-        message: Some(render_workflow(&result)),
-        exit_code: ExitCode::Success,
+    write_failure_report(&report, path).map_err(|write| {
+        AppError::Environment(format!("write failure report: {write}; primary: {error}"))
     })
 }
 
@@ -342,6 +458,14 @@ fn execution_plan_from_source(
         return Err(AppError::Configuration(
             "legacy inline execution is unsupported; select a central template profile".into(),
         ));
+    }
+    if config.template.id.starts_with("rust-bazel-acceptance-")
+        && std::env::var("REPO_SANDBOX_ENABLE_ACCEPTANCE_PROFILES").as_deref() != Ok("1")
+    {
+        return Err(AppError::Configuration(format!(
+            "central diagnostic profile `{}` requires REPO_SANDBOX_ENABLE_ACCEPTANCE_PROFILES=1",
+            config.template.id
+        )));
     }
     let request = ExecutionRequest::resolve(&config, arguments.into());
     let template = TemplateCatalog::builtin()
@@ -667,6 +791,63 @@ test: [{ name: test, run: cargo test }]
     }
 
     #[test]
+    fn configuration_failure_writes_the_requested_common_report_schema() {
+        let temporary = std::env::temp_dir().join(format!(
+            "repo-sandbox-cli-report-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&temporary).unwrap();
+        fs::write(
+            temporary.join(".repo-sandbox.yaml"),
+            "version: 1\ntemplate: definitely-not-valid\n",
+        )
+        .unwrap();
+        let report = temporary.join("failure.json");
+        let cli = Cli::try_parse_from([
+            "repo-sandbox",
+            "build",
+            "--repository",
+            temporary.to_str().unwrap(),
+            "--report-path",
+            report.to_str().unwrap(),
+        ])
+        .unwrap();
+        let error = run(cli).unwrap_err();
+        assert_eq!(error.exit_code(), ExitCode::Configuration);
+        let json = fs::read_to_string(&report).unwrap();
+        for field in [
+            "schema_version",
+            "task_id",
+            "plan_digest",
+            "phase",
+            "exit_code",
+            "message",
+            "cleanup",
+            "published",
+            "container_id",
+            "source_snapshot",
+            "config",
+            "image",
+            "image_digest",
+            "status",
+            "steps",
+            "exported_artifacts",
+        ] {
+            assert!(
+                json.contains(&format!("\"{field}\"")),
+                "missing field {field}"
+            );
+        }
+        assert!(json.contains("\"phase\": \"configuration\""));
+        assert!(json.contains("\"exit_code\": 2"));
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn human_and_json_outputs_are_views_of_the_same_report() {
         let human_cli = Cli::try_parse_from(["repo-sandbox", "doctor"]).unwrap();
         let json_cli = Cli::try_parse_from(["repo-sandbox", "doctor", "--json"]).unwrap();
@@ -723,6 +904,10 @@ test: [{ name: test, run: cargo test }]
             "out/report.json",
             "--keep-on-failure",
             "--recurse-submodules",
+            "--git-https-username",
+            "robot",
+            "--git-https-token-env",
+            "REPOSITORY_TOKEN",
         ])
         .unwrap();
         let Commands::Plan(args) = cli.command.unwrap() else {
@@ -744,6 +929,14 @@ test: [{ name: test, run: cargo test }]
         assert_eq!(overrides.report, Some(PathBuf::from("out/report.json")));
         assert!(overrides.keep_on_failure);
         assert!(overrides.recurse_submodules);
+        assert_eq!(
+            overrides.remote_auth.https_username.as_deref(),
+            Some("robot")
+        );
+        assert_eq!(
+            overrides.remote_auth.https_token_environment.as_deref(),
+            Some("REPOSITORY_TOKEN")
+        );
     }
 
     #[test]

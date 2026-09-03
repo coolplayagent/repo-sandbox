@@ -18,7 +18,7 @@ use repo_sandbox_core::application::{
     WorkflowResult, write_failure_report,
 };
 use repo_sandbox_core::build::{BuiltImage, ImageRef};
-use repo_sandbox_core::config::Platform;
+use repo_sandbox_core::config::{Platform, RemoteAuthentication};
 use repo_sandbox_core::registry::{PublishRequest, RegistryRepository, RegistryTag};
 use repo_sandbox_core::runner::{
     ConfigSummary, RunResources, RunSpec, RunStatus, SecretMount, StepPhase, write_report_json,
@@ -46,15 +46,16 @@ impl WorkflowPort for SystemWorkflow {
     ) -> Result<WorkflowResult, AppError> {
         let repository = repository_path(plan)?;
         let cancellation = ProcessCancellation;
-        let state = repository.join(".repo-sandbox");
         let task_id = task_id();
-        let repository_id = repository_id(&repository)?;
+        let repository_id = repository_id_for_plan(plan, &repository)?;
+        let state = state_root(plan, &repository, &repository_id);
         let report_path = plan
             .request
             .report
             .clone()
             .unwrap_or_else(|| state.join("reports").join(format!("{task_id}.json")));
         let _report_reservation = ReportReservation::create(&report_path)?;
+        let mut completed_report = None;
         let result = (|| {
             validate_outputs(plan)?;
             let _oci_reservation = plan
@@ -92,7 +93,10 @@ impl WorkflowPort for SystemWorkflow {
                 _ => SourceSpec::LocalDirectory(repository.clone()),
             };
             let mut materialized = GitSnapshotter::default()
-                .with_authentication(environment_git_authentication(source_repository(&source)))
+                .with_authentication(external_git_authentication(
+                    source_repository(&source),
+                    &plan.request.remote_auth,
+                )?)
                 .create(
                     &source,
                     SnapshotOptions {
@@ -284,25 +288,30 @@ impl WorkflowPort for SystemWorkflow {
                 .map_err(|error| AppError::Configuration(error.to_string()))?;
 
             let failed = report.status != RunStatus::Succeeded;
+            let mut bookkeeping_errors = Vec::new();
             if report.cleanup == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure {
                 materialized.retain_on_failure();
                 if !materialized.is_automatically_cleaned()
                     && is_remote(plan.request.repository.as_deref().unwrap_or(""))
                 {
-                    fs::write(materialized.path().join(OWNER_MARKER), &task_id)
-                        .map_err(environment("mark retained source"))?;
-                    journal.append(&[CleanCandidate {
+                    if let Err(error) = fs::write(materialized.path().join(OWNER_MARKER), &task_id)
+                        .map_err(environment("mark retained source"))
+                    {
+                        bookkeeping_errors.push(error.to_string());
+                    } else if let Err(error) = journal.append(&[CleanCandidate {
                         task_id: task_id.clone(),
                         repository_id: repository_id.clone(),
                         kind: ResourceKind::Source,
                         identifier: materialized.path().display().to_string(),
                         owner: task_id.clone(),
                         state: ResourceState::Retained,
-                    }])?;
+                    }]) {
+                        bookkeeping_errors.push(error.to_string());
+                    }
                 }
             }
-            if let Some(container) = &report.container_id {
-                journal.append(&[CleanCandidate {
+            if let Some(container) = &report.container_id
+                && let Err(error) = journal.append(&[CleanCandidate {
                     task_id: task_id.clone(),
                     repository_id: repository_id.clone(),
                     kind: ResourceKind::Container,
@@ -315,8 +324,14 @@ impl WorkflowPort for SystemWorkflow {
                     } else {
                         ResourceState::Cleaned
                     },
-                }])?;
+                }])
+            {
+                bookkeeping_errors.push(error.to_string());
             }
+            apply_bookkeeping_errors(&mut report, bookkeeping_errors);
+
+            annotate_report(&mut report);
+            completed_report = Some(report.clone());
 
             if !failed && let Some(output) = &plan.request.oci_layout {
                 export_verified_oci(
@@ -377,6 +392,7 @@ impl WorkflowPort for SystemWorkflow {
             };
             report.published = published.clone();
             annotate_report(&mut report);
+            completed_report = Some(report.clone());
 
             write_report_json(&report, &report_path).map_err(environment("write atomic report"))?;
             let result = WorkflowResult {
@@ -420,6 +436,24 @@ impl WorkflowPort for SystemWorkflow {
         if let Err(error) = &result
             && !report_path.exists()
         {
+            if let Some(mut report) = completed_report {
+                if matches!(report.status, RunStatus::Succeeded) {
+                    let phase = failure_phase(error);
+                    report.phase = phase.into();
+                    report.exit_code = error.exit_code().as_i32();
+                    report.message = error.to_string();
+                    report.status = RunStatus::InfrastructureFailed {
+                        operation: phase.into(),
+                        message: error.to_string(),
+                    };
+                }
+                write_report_json(&report, &report_path).map_err(|write| {
+                    AppError::Environment(format!(
+                        "write failure report: {write}; primary: {error}"
+                    ))
+                })?;
+                return result;
+            }
             let failure = WorkflowFailureReport {
                 schema_version: 1,
                 task_id: task_id.clone(),
@@ -461,63 +495,107 @@ impl CleanPort for SystemWorkflow {
             .repository
             .canonicalize()
             .map_err(environment("resolve repository"))?;
-        let expected_repository = repository_id(&repository)?;
-        let manifests = repository.join(".repo-sandbox").join("tasks");
-        let mut plan = CleanPlan::default();
-        if !manifests.exists() {
-            return Ok(plan);
+        let local_repository_id = repository_id(&repository)?;
+        let state = repository.join(".repo-sandbox");
+        let local_manifests = state.join("tasks");
+        let mut stores = vec![(local_manifests.clone(), local_repository_id.clone())];
+        if request.all {
+            let remotes = state.join("remotes");
+            if remotes.is_dir() {
+                let mut entries = fs::read_dir(&remotes)
+                    .map_err(environment("read remote state stores"))?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(environment("read remote state store entry"))?;
+                entries.sort();
+                for remote in entries {
+                    let Some(name) = remote.file_name().and_then(|value| value.to_str()) else {
+                        continue;
+                    };
+                    if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        continue;
+                    }
+                    stores.push((remote.join("tasks"), format!("sha256:{name}")));
+                }
+            }
         }
-        plan.manifest_root = Some(manifests.clone());
+        let mut plan = CleanPlan::default();
         let mut latest = std::collections::BTreeMap::new();
-        let mut entries = fs::read_dir(manifests)
-            .map_err(environment("read task manifests"))?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(environment("read task manifest entry"))?;
-        entries.sort();
-        for path in entries {
-            if path.extension().and_then(|v| v.to_str()) != Some("json") {
+        for (manifests, expected_repository) in stores {
+            if !manifests.is_dir() {
                 continue;
             }
-            let candidates: Vec<CleanCandidate> = serde_json::from_slice(
-                &fs::read(&path).map_err(environment("read task manifest"))?,
-            )
-            .map_err(|error| AppError::Environment(format!("parse {}: {error}", path.display())))?;
-            for candidate in candidates {
-                latest.insert(
-                    (
-                        format!("{:?}", candidate.kind),
-                        candidate.identifier.clone(),
-                    ),
-                    candidate,
-                );
+            if plan.manifest_root.is_none() {
+                plan.manifest_root = Some(manifests.clone());
+            }
+            plan.journal_roots
+                .insert(expected_repository.clone(), manifests.clone());
+            let mut entries = fs::read_dir(&manifests)
+                .map_err(environment("read task manifests"))?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(environment("read task manifest entry"))?;
+            entries.sort();
+            for path in entries {
+                if path.extension().and_then(|v| v.to_str()) != Some("json") {
+                    continue;
+                }
+                let candidates: Vec<CleanCandidate> = serde_json::from_slice(
+                    &fs::read(&path).map_err(environment("read task manifest"))?,
+                )
+                .map_err(|error| {
+                    AppError::Environment(format!("parse {}: {error}", path.display()))
+                })?;
+                for candidate in candidates {
+                    if candidate.repository_id != expected_repository {
+                        plan.refused.push(format!(
+                            "{}: repository owner mismatch for trusted store",
+                            candidate.identifier
+                        ));
+                        continue;
+                    }
+                    latest.insert(
+                        (
+                            candidate.repository_id.clone(),
+                            format!("{:?}", candidate.kind),
+                            candidate.identifier.clone(),
+                        ),
+                        candidate,
+                    );
+                }
             }
         }
         for (_, candidate) in latest {
             if candidate.state == ResourceState::Cleaned {
                 continue;
             }
-            if candidate.repository_id != expected_repository {
-                plan.refused.push(format!(
-                    "{}: repository owner mismatch",
-                    candidate.identifier
-                ));
+            let Some(manifest_root) = plan.journal_roots.get(&candidate.repository_id) else {
+                plan.refused
+                    .push(format!("{}: untrusted journal store", candidate.identifier));
                 continue;
-            }
+            };
+            let owned_state = manifest_root.parent().expect("tasks has parent");
             if candidate.kind == ResourceKind::Cache
-                && Path::new(&candidate.identifier)
-                    != repository.join(".repo-sandbox").join("cache")
+                && Path::new(&candidate.identifier) != owned_state.join("cache")
             {
                 plan.refused
                     .push(format!("{}: cache boundary mismatch", candidate.identifier));
                 continue;
             }
-            if candidate.kind == ResourceKind::Image && !request.include_images {
+            if candidate.kind == ResourceKind::Source && !trusted_source_path(&candidate.identifier)
+            {
+                plan.refused.push(format!(
+                    "{}: source boundary mismatch",
+                    candidate.identifier
+                ));
+                continue;
+            }
+            if candidate.kind == ResourceKind::Image && !(request.all || request.include_images) {
                 plan.refused
                     .push(format!("{}: images not requested", candidate.identifier));
                 continue;
             }
-            if candidate.kind == ResourceKind::Cache && !request.include_cache {
+            if candidate.kind == ResourceKind::Cache && !(request.all || request.include_cache) {
                 plan.refused
                     .push(format!("{}: cache not requested", candidate.identifier));
                 continue;
@@ -544,8 +622,17 @@ impl CleanPort for SystemWorkflow {
             match remove_candidate(candidate) {
                 Ok(true) => {
                     result.succeeded.push(candidate.clone());
-                    if let Some(root) = &plan.manifest_root {
-                        append_cleanup_state(root, candidate)?;
+                    let root = plan
+                        .journal_roots
+                        .get(&candidate.repository_id)
+                        .or(plan.manifest_root.as_ref());
+                    if let Some(root) = root
+                        && let Err(error) = append_cleanup_state(root, candidate)
+                    {
+                        result.failed.push(format!(
+                            "{}: removed but failed to record cleanup state: {error}",
+                            candidate.identifier
+                        ));
                     }
                 }
                 Ok(false) => result.skipped.push(format!(
@@ -642,6 +729,23 @@ fn annotate_report(report: &mut repo_sandbox_core::runner::RunReport) {
     report.phase = phase.into();
     report.exit_code = exit_code;
     report.message = message;
+}
+
+fn apply_bookkeeping_errors(
+    report: &mut repo_sandbox_core::runner::RunReport,
+    errors: Vec<String>,
+) {
+    if errors.is_empty() {
+        return;
+    }
+    let detail = errors.join("; ");
+    report.cleanup_error = Some(match report.cleanup_error.take() {
+        Some(existing) => format!("{existing}; journal: {detail}"),
+        None => format!("journal: {detail}"),
+    });
+    if matches!(report.status, RunStatus::Succeeded) {
+        report.cleanup = repo_sandbox_core::runner::CleanupResult::Failed;
+    }
 }
 
 fn failure_phase(error: &AppError) -> &'static str {
@@ -1018,28 +1122,83 @@ fn source_repository(source: &SourceSpec) -> &str {
 
 /// Map opt-in fixture credentials to external references. Values are never
 /// copied into configuration, argv, logs, or reports.
-pub fn environment_git_authentication(repository: &str) -> GitAuthentication {
+pub fn external_git_authentication(
+    repository: &str,
+    auth: &RemoteAuthentication,
+) -> Result<GitAuthentication, AppError> {
+    let https_modes = usize::from(auth.https_token_environment.is_some())
+        + usize::from(auth.https_credential_helper);
+    if https_modes > 1 || (auth.ssh_private_key.is_some() && auth.ssh_agent) {
+        return Err(AppError::Configuration(
+            "remote authentication methods are mutually exclusive per transport".into(),
+        ));
+    }
+    if let Some(name) = &auth.https_token_environment {
+        let valid = !name.is_empty()
+            && name.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+            });
+        if !valid {
+            return Err(AppError::Configuration(
+                "--git-https-token-env must name a POSIX environment variable".into(),
+            ));
+        }
+    }
+    if auth
+        .https_username
+        .as_deref()
+        .is_some_and(|value| value.is_empty() || value.contains(['\r', '\n']))
+    {
+        return Err(AppError::Configuration(
+            "--git-https-username must be non-empty and single-line".into(),
+        ));
+    }
     if repository.starts_with("git@") || repository.starts_with("ssh://") {
-        let known_hosts = std::env::var_os("REPO_SANDBOX_E2E_SSH_KNOWN_HOSTS").map(PathBuf::from);
-        return std::env::var_os("REPO_SANDBOX_E2E_SSH_KEY")
-            .map(PathBuf::from)
-            .map(|private_key| GitAuthentication::SshKey {
-                private_key,
-                known_hosts: known_hosts.clone(),
-            })
-            .unwrap_or(GitAuthentication::SshAgent { known_hosts });
+        if https_modes > 0 || auth.https_username.is_some() {
+            return Err(AppError::Configuration(
+                "HTTPS authentication options cannot be used with an SSH remote".into(),
+            ));
+        }
+        if let Some(private_key) = &auth.ssh_private_key {
+            return Ok(GitAuthentication::SshKey {
+                private_key: private_key.clone(),
+                known_hosts: auth.ssh_known_hosts.clone(),
+            });
+        }
+        if auth.ssh_agent {
+            return Ok(GitAuthentication::SshAgent {
+                known_hosts: auth.ssh_known_hosts.clone(),
+            });
+        }
+        return Ok(GitAuthentication::None);
     }
     if repository.starts_with("https://") {
-        if std::env::var_os("REPO_SANDBOX_E2E_HTTPS_TOKEN").is_some() {
-            return GitAuthentication::HttpsToken {
-                username: std::env::var("REPO_SANDBOX_E2E_HTTPS_USER")
-                    .unwrap_or_else(|_| "git".into()),
-                token: ExternalSecret::Environment("REPO_SANDBOX_E2E_HTTPS_TOKEN".into()),
-            };
+        if auth.ssh_private_key.is_some() || auth.ssh_known_hosts.is_some() || auth.ssh_agent {
+            return Err(AppError::Configuration(
+                "SSH authentication options cannot be used with an HTTPS remote".into(),
+            ));
         }
-        return GitAuthentication::HttpsCredentialHelper;
+        if let Some(environment) = &auth.https_token_environment {
+            return Ok(GitAuthentication::HttpsToken {
+                username: auth.https_username.clone().unwrap_or_else(|| "git".into()),
+                token: ExternalSecret::Environment(environment.clone()),
+            });
+        }
+        if auth.https_credential_helper {
+            return Ok(GitAuthentication::HttpsCredentialHelper);
+        }
     }
-    GitAuthentication::None
+    if https_modes > 0
+        || auth.https_username.is_some()
+        || auth.ssh_private_key.is_some()
+        || auth.ssh_known_hosts.is_some()
+        || auth.ssh_agent
+    {
+        return Err(AppError::Configuration(
+            "remote authentication options require a matching HTTPS or SSH remote".into(),
+        ));
+    }
+    Ok(GitAuthentication::None)
 }
 fn short_digest(value: &str) -> &str {
     value
@@ -1066,6 +1225,91 @@ fn repository_id(repository: &Path) -> Result<String, AppError> {
     let mut h = Sha256::new();
     h.update(repository.to_string_lossy().as_bytes());
     Ok(format!("sha256:{:x}", h.finalize()))
+}
+
+fn repository_id_for_plan(plan: &ExecutionPlan, local_root: &Path) -> Result<String, AppError> {
+    match plan
+        .request
+        .repository
+        .as_deref()
+        .filter(|value| is_remote(value))
+    {
+        Some(remote) => {
+            let normalized = normalize_remote_identity(remote)?;
+            let mut hasher = Sha256::new();
+            hasher.update(b"repo-sandbox-remote-v1\0");
+            hasher.update(normalized.as_bytes());
+            Ok(format!("sha256:{:x}", hasher.finalize()))
+        }
+        None => repository_id(local_root),
+    }
+}
+
+fn normalize_remote_identity(remote: &str) -> Result<String, AppError> {
+    let value = remote.trim().trim_end_matches('/');
+    if value.is_empty() {
+        return Err(AppError::Configuration("remote repository is empty".into()));
+    }
+    if let Some((scheme, remainder)) = value.split_once("://") {
+        if scheme.eq_ignore_ascii_case("file") {
+            let path = remainder
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(remainder)
+                .replace('\\', "/");
+            if path.is_empty() {
+                return Err(AppError::Configuration(
+                    "file remote repository must include a path".into(),
+                ));
+            }
+            return Ok(format!("file://{}", path.trim_end_matches('/')));
+        }
+        let authority_path = remainder.split(['?', '#']).next().unwrap_or(remainder);
+        let (authority, path) = authority_path
+            .split_once('/')
+            .unwrap_or((authority_path, ""));
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        if host.is_empty() || path.is_empty() {
+            return Err(AppError::Configuration(
+                "remote repository URL must include a host and path".into(),
+            ));
+        }
+        return Ok(format!(
+            "{}://{}/{}",
+            scheme.to_ascii_lowercase(),
+            host.to_ascii_lowercase(),
+            path.trim_end_matches('/')
+        ));
+    }
+    if let Some((user_host, path)) = value.split_once(':')
+        && let Some((_, host)) = user_host.rsplit_once('@')
+        && !host.is_empty()
+        && !path.is_empty()
+    {
+        return Ok(format!(
+            "ssh://{}/{}",
+            host.to_ascii_lowercase(),
+            path.trim_start_matches('/').trim_end_matches('/')
+        ));
+    }
+    Err(AppError::Configuration(format!(
+        "unsupported remote repository `{remote}`"
+    )))
+}
+
+fn state_root(plan: &ExecutionPlan, local_root: &Path, repository_id: &str) -> PathBuf {
+    let state = local_root.join(".repo-sandbox");
+    if plan.request.repository.as_deref().is_some_and(is_remote) {
+        state.join("remotes").join(
+            repository_id
+                .strip_prefix("sha256:")
+                .unwrap_or(repository_id),
+        )
+    } else {
+        state
+    }
 }
 fn environment(operation: &'static str) -> impl FnOnce(std::io::Error) -> AppError {
     move |error| AppError::Environment(format!("{operation}: {error}"))
@@ -1354,6 +1598,15 @@ fn remove_candidate(candidate: &CleanCandidate) -> Result<bool, String> {
     }
 }
 
+fn trusted_source_path(identifier: &str) -> bool {
+    let path = Path::new(identifier);
+    let has_owned_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.starts_with("repo-sandbox-source-"));
+    has_owned_name && path.starts_with(std::env::temp_dir())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1436,5 +1689,120 @@ mod tests {
             None,
             "connection refused"
         )));
+    }
+
+    #[test]
+    fn remote_identity_is_credential_free_and_repository_specific() {
+        let first =
+            normalize_remote_identity("https://token@example.test/org/one.git?secret=x").unwrap();
+        let same = normalize_remote_identity("https://other@example.test/org/one.git/").unwrap();
+        let second = normalize_remote_identity("https://example.test/org/two.git").unwrap();
+        assert_eq!(first, same);
+        assert_eq!(first, "https://example.test/org/one.git");
+        assert_ne!(first, second);
+        assert!(!first.contains("token"));
+        assert!(!first.contains("secret"));
+    }
+
+    #[test]
+    fn remote_authentication_uses_only_explicit_external_references() {
+        let auth = RemoteAuthentication {
+            https_username: Some("robot".into()),
+            https_token_environment: Some("EXTERNAL_TOKEN".into()),
+            ..RemoteAuthentication::default()
+        };
+        assert_eq!(
+            external_git_authentication("https://example.test/repo.git", &auth).unwrap(),
+            GitAuthentication::HttpsToken {
+                username: "robot".into(),
+                token: ExternalSecret::Environment("EXTERNAL_TOKEN".into()),
+            }
+        );
+        let conflicting = RemoteAuthentication {
+            https_token_environment: Some("TOKEN".into()),
+            https_credential_helper: true,
+            ..RemoteAuthentication::default()
+        };
+        assert!(
+            external_git_authentication("https://example.test/repo.git", &conflicting).is_err()
+        );
+    }
+
+    #[test]
+    fn clean_all_enumerates_local_and_trusted_remote_stores() {
+        let repository = tempfile::tempdir().unwrap();
+        let canonical = repository.path().canonicalize().unwrap();
+        let local_id = repository_id(&canonical).unwrap();
+        let remote_id = format!("sha256:{}", "b".repeat(64));
+        let state = canonical.join(".repo-sandbox");
+        let local_tasks = state.join("tasks");
+        let remote_state = state.join("remotes").join("b".repeat(64));
+        let remote_tasks = remote_state.join("tasks");
+        fs::create_dir_all(&local_tasks).unwrap();
+        fs::create_dir_all(&remote_tasks).unwrap();
+        let candidate = |repository_id: String, identifier: PathBuf| CleanCandidate {
+            task_id: "task".into(),
+            repository_id: repository_id.clone(),
+            kind: ResourceKind::Cache,
+            identifier: identifier.display().to_string(),
+            owner: repository_id,
+            state: ResourceState::Registered,
+        };
+        fs::write(
+            local_tasks.join("local.json"),
+            serde_json::to_vec(&[candidate(local_id, state.join("cache"))]).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            remote_tasks.join("remote.json"),
+            serde_json::to_vec(&[candidate(remote_id, remote_state.join("cache"))]).unwrap(),
+        )
+        .unwrap();
+        let plan = SystemWorkflow
+            .plan(&CleanRequest {
+                repository: canonical,
+                all: true,
+                include_images: false,
+                include_cache: false,
+                dry_run: true,
+            })
+            .unwrap();
+        assert_eq!(plan.candidates.len(), 2);
+        assert_eq!(plan.journal_roots.len(), 2);
+        assert!(plan.refused.is_empty());
+    }
+
+    #[test]
+    fn clean_continues_after_cleanup_state_recording_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository_id = format!("sha256:{}", "c".repeat(64));
+        let make = |name: &str| {
+            let path = temporary.path().join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join(OWNER_MARKER), &repository_id).unwrap();
+            CleanCandidate {
+                task_id: name.into(),
+                repository_id: repository_id.clone(),
+                kind: ResourceKind::Cache,
+                identifier: path.display().to_string(),
+                owner: repository_id.clone(),
+                state: ResourceState::Registered,
+            }
+        };
+        let first = make("first");
+        let second = make("second");
+        let not_a_directory = temporary.path().join("journal-file");
+        fs::write(&not_a_directory, "not a directory").unwrap();
+        let plan = CleanPlan {
+            candidates: vec![first.clone(), second.clone()],
+            refused: Vec::new(),
+            manifest_root: None,
+            journal_roots: std::collections::BTreeMap::from([(repository_id, not_a_directory)]),
+        };
+        let result = CleanPort::execute(&SystemWorkflow, &plan, false).unwrap();
+        assert_eq!(result.succeeded.len(), 2);
+        assert_eq!(result.failed.len(), 2);
+        assert!(!Path::new(&first.identifier).exists());
+        assert!(!Path::new(&second.identifier).exists());
     }
 }

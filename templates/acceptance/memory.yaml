@@ -1,0 +1,17 @@
+id: rust-bazel-acceptance-memory
+version: "1.0.0"
+base_image: docker.io/library/rust:1.97.0-bookworm
+components: [{ id: base-tools }, { id: bazel, depends_on: [base-tools] }, { id: rust, depends_on: [base-tools] }]
+target_platforms: [linux/amd64, linux/arm64]
+build_context: templates/rust-bazel/context
+execution:
+  version: 1
+  build: [{ name: acceptance-build, command: "true" }]
+  test:
+    - name: acceptance-memory
+      command: >-
+        printf '#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\nint main(void){size_t n=268435456;char*p=malloc(n);if(!p)return 2;memset(p,1,n);sleep(2);return p[0]==1?0:3;}\n' >/tmp/oom.c && cc /tmp/oom.c -o /tmp/oom && /tmp/oom
+  resources: { cpu: 1, memory_mb: 64, temporary_storage_mb: 64 }
+  timeout_seconds: 120
+  fail_fast: true
+

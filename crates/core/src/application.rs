@@ -9,6 +9,7 @@ use crate::snapshot::SourceSnapshot;
 use crate::template::TemplatePlan;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -77,6 +78,54 @@ impl ExecutionPlan {
                 "submodules"
             } else {
                 "no-submodules"
+            },
+        );
+        hash(
+            &mut hasher,
+            request.remote_auth.https_username.as_deref().unwrap_or(""),
+        );
+        hash(
+            &mut hasher,
+            request
+                .remote_auth
+                .https_token_environment
+                .as_deref()
+                .unwrap_or(""),
+        );
+        hash(
+            &mut hasher,
+            if request.remote_auth.https_credential_helper {
+                "https-helper"
+            } else {
+                "no-https-helper"
+            },
+        );
+        hash(
+            &mut hasher,
+            request
+                .remote_auth
+                .ssh_private_key
+                .as_ref()
+                .map(|path| path.to_string_lossy())
+                .as_deref()
+                .unwrap_or(""),
+        );
+        hash(
+            &mut hasher,
+            request
+                .remote_auth
+                .ssh_known_hosts
+                .as_ref()
+                .map(|path| path.to_string_lossy())
+                .as_deref()
+                .unwrap_or(""),
+        );
+        hash(
+            &mut hasher,
+            if request.remote_auth.ssh_agent {
+                "ssh-agent"
+            } else {
+                "no-ssh-agent"
             },
         );
         Self {
@@ -231,6 +280,8 @@ pub struct CleanPlan {
     pub refused: Vec<String>,
     #[serde(skip)]
     pub manifest_root: Option<PathBuf>,
+    #[serde(skip)]
+    pub journal_roots: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]

@@ -200,7 +200,14 @@ impl TemplateCatalog {
 
     pub fn builtin() -> Result<Self, PlanError> {
         Self::from_yaml_sources(
-            &[include_str!("../../../templates/rust-bazel/template.yaml")],
+            &[
+                include_str!("../../../templates/rust-bazel/template.yaml"),
+                include_str!("../../../templates/acceptance/timeout.yaml"),
+                include_str!("../../../templates/acceptance/memory.yaml"),
+                include_str!("../../../templates/acceptance/temporary-storage.yaml"),
+                include_str!("../../../templates/acceptance/architecture.yaml"),
+                include_str!("../../../templates/acceptance/secret-artifact.yaml"),
+            ],
             &[
                 include_str!("../../../templates/components/base-tools/component.yaml"),
                 include_str!("../../../templates/components/bazel/component.yaml"),

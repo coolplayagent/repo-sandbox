@@ -446,17 +446,21 @@ EOF
       remote_url=$REPO_SANDBOX_E2E_HTTPS_URL
       remote_ref=$REPO_SANDBOX_E2E_HTTPS_REF
       credential_marker=$REPO_SANDBOX_E2E_HTTPS_TOKEN
+      auth_args=(--git-https-username "$REPO_SANDBOX_E2E_HTTPS_USER" \
+        --git-https-token-env REPO_SANDBOX_E2E_HTTPS_TOKEN)
     else
       remote_url=$REPO_SANDBOX_E2E_SSH_URL
       remote_ref=$REPO_SANDBOX_E2E_SSH_REF
       credential_marker=$(awk '!/^---/ && NF { print; exit }' \
         "$REPO_SANDBOX_E2E_SSH_KEY")
+      auth_args=(--git-ssh-private-key "$REPO_SANDBOX_E2E_SSH_KEY" \
+        --git-ssh-known-hosts "$REPO_SANDBOX_E2E_SSH_KNOWN_HOSTS")
     fi
     [[ -n $credential_marker ]]
     (
       cd "$remote_state"
       "$cli" verify --repository "$remote_url" --git-ref "$remote_ref" \
-        --report-path "$report"
+        --report-path "$report" "${auth_args[@]}"
     )
     assert_report_common "$report" removed
     grep -Fq '"kind": "remote_git"' "$report"
@@ -468,10 +472,33 @@ EOF
     printf 'passed\n' >"$result_directory/$scenario.passed"
     ;;
   cli-profile-contracts)
-    profile_root=$REPO_SANDBOX_E2E_PROFILE_FIXTURE_ROOT
-    profile_secret=$REPO_SANDBOX_E2E_PROFILE_SECRET
+    profile_root=$(mktemp -d)
+    profile_secret="repo-sandbox-profile-secret-$RANDOM-$RANDOM"
+    cleanup_profile_fixtures() { rm -rf -- "$profile_root"; }
+    trap cleanup_profile_fixtures EXIT
+    export REPO_SANDBOX_ENABLE_ACCEPTANCE_PROFILES=1
     cargo build -p repo-sandbox-cli
     cli="$root/target/debug/repo-sandbox"
+    for profile in timeout memory temporary-storage architecture secret-artifact; do
+      repository="$profile_root/$profile"
+      mkdir -p "$repository"
+      cat >"$repository/.repo-sandbox.yaml" <<EOF
+version: 1
+template:
+  id: rust-bazel-acceptance-$profile
+  parameters:
+    platform: linux/amd64
+EOF
+      printf 'module(name = "repo_sandbox_profile_%s")\n' "${profile//-/_}" >"$repository/MODULE.bazel"
+      printf 'exports_files(["fixture.txt"])\n' >"$repository/BUILD.bazel"
+      printf 'fixture\n' >"$repository/fixture.txt"
+      printf '.repo-sandbox/\n' >"$repository/.gitignore"
+      git -C "$repository" init -q
+      git -C "$repository" config user.email e2e@example.invalid
+      git -C "$repository" config user.name repo-sandbox-e2e
+      git -C "$repository" add .
+      git -C "$repository" commit -qm fixture
+    done
     for profile in timeout memory temporary-storage architecture; do
       repository="$profile_root/$profile"
       report="$result_directory/profile-$profile.json"
@@ -498,7 +525,7 @@ EOF
       assert_report_common "$report" removed
       grep -Fq "\"status\": \"$expected_status\"" "$report"
       assert_report_phase "$report" "$expected_phase" "$expected_exit"
-      assert_step "$report" test bazel-test "$expected_step_status"
+      assert_step "$report" test "acceptance-$profile" "$expected_step_status"
       if [[ $profile == memory ]]; then
         grep -Fq '"limit": "memory"' "$report"
       elif [[ $profile == temporary-storage ]]; then

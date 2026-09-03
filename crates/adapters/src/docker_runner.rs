@@ -11,6 +11,7 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -100,6 +101,121 @@ pub struct StreamedProcessOutput {
 pub trait LogSink: Sync {
     fn stdout(&self, phase: StepPhase, step: &str, bytes: &[u8]);
     fn stderr(&self, phase: StepPhase, step: &str, bytes: &[u8]);
+}
+
+struct RedactingLogSink<'a> {
+    inner: &'a dyn LogSink,
+    secrets: Vec<Vec<u8>>,
+    stdout: Mutex<RedactingStream>,
+    stderr: Mutex<RedactingStream>,
+}
+
+#[derive(Default)]
+struct RedactingStream {
+    pending: Vec<u8>,
+}
+
+impl<'a> RedactingLogSink<'a> {
+    fn new(inner: &'a dyn LogSink, secrets: Vec<Vec<u8>>) -> Self {
+        Self {
+            inner,
+            secrets,
+            stdout: Mutex::new(RedactingStream::default()),
+            stderr: Mutex::new(RedactingStream::default()),
+        }
+    }
+
+    fn finish(&self, phase: StepPhase, step: &str) {
+        self.flush_stream(&self.stdout, true, phase, step);
+        self.flush_stream(&self.stderr, false, phase, step);
+    }
+
+    fn flush_stream(
+        &self,
+        stream: &Mutex<RedactingStream>,
+        stdout: bool,
+        phase: StepPhase,
+        step: &str,
+    ) {
+        if let Ok(mut stream) = stream.lock() {
+            let bytes = take_redacted(&mut stream.pending, &self.secrets, true);
+            if stdout {
+                self.inner.stdout(phase, step, &bytes);
+            } else {
+                self.inner.stderr(phase, step, &bytes);
+            }
+        }
+    }
+
+    fn emit(
+        &self,
+        stream: &Mutex<RedactingStream>,
+        stdout: bool,
+        phase: StepPhase,
+        step: &str,
+        bytes: &[u8],
+    ) {
+        let Ok(mut stream) = stream.lock() else {
+            return;
+        };
+        stream.pending.extend_from_slice(bytes);
+        let safe = take_redacted(&mut stream.pending, &self.secrets, false);
+        drop(stream);
+        if safe.is_empty() {
+            return;
+        }
+        if stdout {
+            self.inner.stdout(phase, step, &safe);
+        } else {
+            self.inner.stderr(phase, step, &safe);
+        }
+    }
+}
+
+impl LogSink for RedactingLogSink<'_> {
+    fn stdout(&self, phase: StepPhase, step: &str, bytes: &[u8]) {
+        self.emit(&self.stdout, true, phase, step, bytes);
+    }
+
+    fn stderr(&self, phase: StepPhase, step: &str, bytes: &[u8]) {
+        self.emit(&self.stderr, false, phase, step, bytes);
+    }
+}
+
+fn redact_bytes(bytes: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
+    let mut pending = bytes.to_vec();
+    take_redacted(&mut pending, secrets, true)
+}
+
+fn take_redacted(pending: &mut Vec<u8>, secrets: &[Vec<u8>], finish: bool) -> Vec<u8> {
+    let retain = if finish {
+        0
+    } else {
+        secrets
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(1)
+            .saturating_sub(1)
+    };
+    let limit = pending.len().saturating_sub(retain);
+    let mut redacted = Vec::with_capacity(pending.len());
+    let mut index = 0;
+    while index < limit {
+        if let Some(secret) = secrets
+            .iter()
+            .filter(|secret| !secret.is_empty())
+            .find(|secret| pending[index..].starts_with(secret))
+        {
+            redacted.extend_from_slice(b"[REDACTED]");
+            index += secret.len();
+        } else {
+            redacted.push(pending[index]);
+            index += 1;
+        }
+    }
+    pending.drain(..index);
+    redacted
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -805,37 +921,36 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
                 stderr_bytes: Vec::new(),
             });
         }
-        if spec.secret_mounts.is_empty() {
-            self.executor.execute_streaming(
+        let secrets = spec
+            .secret_mounts
+            .iter()
+            .filter_map(|secret| std::fs::read(&secret.source).ok())
+            .filter(|secret| !secret.is_empty())
+            .collect::<Vec<_>>();
+        if secrets.is_empty() {
+            return self.executor.execute_streaming(
                 invocation,
                 Duration::from_millis(remaining),
                 &self.sink,
                 phase,
                 step,
-            )
-        } else {
-            let mut output = self
-                .executor
-                .execute(invocation, Duration::from_millis(remaining))?;
-            for secret in &spec.secret_mounts {
-                if let Ok(bytes) = std::fs::read(&secret.source)
-                    && !bytes.is_empty()
-                {
-                    let value = String::from_utf8_lossy(&bytes);
-                    output.stdout = output.stdout.replace(value.as_ref(), "[REDACTED]");
-                    output.stderr = output.stderr.replace(value.as_ref(), "[REDACTED]");
-                }
-            }
-            let stdout_bytes = output.stdout.as_bytes().to_vec();
-            let stderr_bytes = output.stderr.as_bytes().to_vec();
-            self.sink.stdout(phase, step, &stdout_bytes);
-            self.sink.stderr(phase, step, &stderr_bytes);
-            Ok(StreamedProcessOutput {
-                output,
-                stdout_bytes,
-                stderr_bytes,
-            })
+            );
         }
+        let sink = RedactingLogSink::new(&self.sink, secrets.clone());
+        let streamed = self.executor.execute_streaming(
+            invocation,
+            Duration::from_millis(remaining),
+            &sink,
+            phase,
+            step,
+        );
+        sink.finish(phase, step);
+        let mut streamed = streamed?;
+        streamed.stdout_bytes = redact_bytes(&streamed.stdout_bytes, &secrets);
+        streamed.stderr_bytes = redact_bytes(&streamed.stderr_bytes, &secrets);
+        streamed.output.stdout = String::from_utf8_lossy(&streamed.stdout_bytes).into_owned();
+        streamed.output.stderr = String::from_utf8_lossy(&streamed.stderr_bytes).into_owned();
+        Ok(streamed)
     }
 
     fn cleanup(&self, container_id: &str) -> io::Result<()> {
@@ -1129,6 +1244,16 @@ mod tests {
             !String::from_utf8_lossy(&sink.stdout.lock().unwrap()).contains("token-super-secret")
         );
         assert!(json.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn live_secret_redaction_handles_values_split_across_chunks() {
+        let sink = RecordingSink::default();
+        let redacting = RedactingLogSink::new(&sink, vec![b"split-secret".to_vec()]);
+        redacting.stdout(StepPhase::Test, "secret", b"prefix split-");
+        redacting.stdout(StepPhase::Test, "secret", b"secret suffix\n");
+        redacting.finish(StepPhase::Test, "secret");
+        assert_eq!(&*sink.stdout.lock().unwrap(), b"prefix [REDACTED] suffix\n");
     }
 
     #[derive(Clone, Default)]
