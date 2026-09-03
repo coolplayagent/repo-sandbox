@@ -5,6 +5,7 @@ use crate::buildkit::{
     BuildKit, BuildOptions, BuildRequest, CacheConfig, ImageOutput, NeverCancelled,
     ProcessExecutor, ProcessInvocation, Progress, SystemProcessExecutor,
 };
+use crate::cancellation::ProcessCancellation;
 use crate::docker_runner::{DockerRunner, SystemClock, SystemDockerExecutor};
 use crate::doctor::{DoctorProbe, SystemDoctorProbe};
 use crate::registry::{DockerRegistry, OciRegistry, SystemRegistryExecutor};
@@ -13,7 +14,7 @@ use crate::task_image::{TaskImageBuilder, TaskImageOptions, TaskImageRequest};
 use repo_sandbox_core::AppError;
 use repo_sandbox_core::application::{
     CleanCandidate, CleanPlan, CleanPort, CleanRequest, CleanResult, ExecutionPlan, ResourceKind,
-    WorkflowMode, WorkflowPort, WorkflowResult,
+    ResourceState, WorkflowMode, WorkflowPort, WorkflowResult,
 };
 use repo_sandbox_core::build::ImageRef;
 use repo_sandbox_core::registry::{PublishRequest, RegistryRepository, RegistryTag};
@@ -42,6 +43,7 @@ impl WorkflowPort for SystemWorkflow {
         plan: &ExecutionPlan,
     ) -> Result<WorkflowResult, AppError> {
         let repository = repository_path(plan)?;
+        let cancellation = ProcessCancellation;
         let state = repository.join(".repo-sandbox");
         let task_id = task_id();
         let repository_id = repository_id(&repository)?;
@@ -69,6 +71,7 @@ impl WorkflowPort for SystemWorkflow {
             kind: ResourceKind::Cache,
             identifier: cache.display().to_string(),
             owner: repository_id.clone(),
+            state: ResourceState::Registered,
         }])?;
 
         let source = match (&plan.request.repository, &plan.request.git_ref) {
@@ -122,7 +125,7 @@ impl WorkflowPort for SystemWorkflow {
                         ..BuildOptions::default()
                     },
                 ),
-                &NeverCancelled,
+                &cancellation,
             )
             .map_err(|error| AppError::Environment(error.to_string()))?;
         if cache_export.exists() {
@@ -152,7 +155,7 @@ impl WorkflowPort for SystemWorkflow {
                         ..TaskImageOptions::default()
                     },
                 },
-                &NeverCancelled,
+                &cancellation,
             )
             .map_err(|error| AppError::Environment(error.to_string()))?;
         journal.append(&[CleanCandidate {
@@ -161,6 +164,7 @@ impl WorkflowPort for SystemWorkflow {
             kind: ResourceKind::Image,
             identifier: task_image.image.digest.to_string(),
             owner: task_image.identity.oci_value(),
+            state: ResourceState::Registered,
         }])?;
 
         let execution = &plan.template.execution;
@@ -259,6 +263,7 @@ impl WorkflowPort for SystemWorkflow {
                         kind: ResourceKind::Container,
                         identifier: container.to_owned(),
                         owner: task_id.clone(),
+                        state: ResourceState::Registered,
                     }])
                     .map_err(|error| error.to_string())
             })
@@ -267,7 +272,7 @@ impl WorkflowPort for SystemWorkflow {
         let failed = report.status != RunStatus::Succeeded;
         if report.cleanup == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure {
             materialized.retain_on_failure();
-            if materialized.is_automatically_cleaned() == false
+            if !materialized.is_automatically_cleaned()
                 && is_remote(plan.request.repository.as_deref().unwrap_or(""))
             {
                 fs::write(materialized.path().join(OWNER_MARKER), &task_id)
@@ -278,8 +283,25 @@ impl WorkflowPort for SystemWorkflow {
                     kind: ResourceKind::Source,
                     identifier: materialized.path().display().to_string(),
                     owner: task_id.clone(),
+                    state: ResourceState::Retained,
                 }])?;
             }
+        }
+        if let Some(container) = &report.container_id {
+            journal.append(&[CleanCandidate {
+                task_id: task_id.clone(),
+                repository_id: repository_id.clone(),
+                kind: ResourceKind::Container,
+                identifier: container.clone(),
+                owner: task_id.clone(),
+                state: if report.cleanup
+                    == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure
+                {
+                    ResourceState::Retained
+                } else {
+                    ResourceState::Cleaned
+                },
+            }])?;
         }
 
         let published = if plan.request.push && !failed {
@@ -306,7 +328,7 @@ impl WorkflowPort for SystemWorkflow {
                             platform_digests: task_image.image.platform_digests.clone(),
                             aliases,
                         },
-                        &NeverCancelled,
+                        &cancellation,
                     )
                     .map_err(|error| AppError::Environment(error.to_string()))?,
             )
@@ -342,6 +364,7 @@ impl WorkflowPort for SystemWorkflow {
                 report_path.display()
             ))),
             RunStatus::TimedOut
+            | RunStatus::Cancelled { .. }
             | RunStatus::ResourceExceeded { .. }
             | RunStatus::InfrastructureFailed { .. } => Err(AppError::Environment(format!(
                 "task {task_id} failed; report {}",
@@ -367,10 +390,15 @@ impl CleanPort for SystemWorkflow {
         if !manifests.exists() {
             return Ok(plan);
         }
-        for entry in fs::read_dir(manifests).map_err(environment("read task manifests"))? {
-            let path = entry
-                .map_err(environment("read task manifest entry"))?
-                .path();
+        plan.manifest_root = Some(manifests.clone());
+        let mut latest = std::collections::BTreeMap::new();
+        let mut entries = fs::read_dir(manifests)
+            .map_err(environment("read task manifests"))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(environment("read task manifest entry"))?;
+        entries.sort();
+        for path in entries {
             if path.extension().and_then(|v| v.to_str()) != Some("json") {
                 continue;
             }
@@ -379,33 +407,45 @@ impl CleanPort for SystemWorkflow {
             )
             .map_err(|error| AppError::Environment(format!("parse {}: {error}", path.display())))?;
             for candidate in candidates {
-                if candidate.repository_id != expected_repository {
-                    plan.refused.push(format!(
-                        "{}: repository owner mismatch",
-                        candidate.identifier
-                    ));
-                    continue;
-                }
-                if candidate.kind == ResourceKind::Cache
-                    && PathBuf::from(&candidate.identifier)
-                        != repository.join(".repo-sandbox").join("cache")
-                {
-                    plan.refused
-                        .push(format!("{}: cache boundary mismatch", candidate.identifier));
-                    continue;
-                }
-                if candidate.kind == ResourceKind::Image && !request.include_images {
-                    plan.refused
-                        .push(format!("{}: images not requested", candidate.identifier));
-                    continue;
-                }
-                if candidate.kind == ResourceKind::Cache && !request.include_cache {
-                    plan.refused
-                        .push(format!("{}: cache not requested", candidate.identifier));
-                    continue;
-                }
-                plan.candidates.push(candidate);
+                latest.insert(
+                    (
+                        format!("{:?}", candidate.kind),
+                        candidate.identifier.clone(),
+                    ),
+                    candidate,
+                );
             }
+        }
+        for (_, candidate) in latest {
+            if candidate.state == ResourceState::Cleaned {
+                continue;
+            }
+            if candidate.repository_id != expected_repository {
+                plan.refused.push(format!(
+                    "{}: repository owner mismatch",
+                    candidate.identifier
+                ));
+                continue;
+            }
+            if candidate.kind == ResourceKind::Cache
+                && Path::new(&candidate.identifier)
+                    != repository.join(".repo-sandbox").join("cache")
+            {
+                plan.refused
+                    .push(format!("{}: cache boundary mismatch", candidate.identifier));
+                continue;
+            }
+            if candidate.kind == ResourceKind::Image && !request.include_images {
+                plan.refused
+                    .push(format!("{}: images not requested", candidate.identifier));
+                continue;
+            }
+            if candidate.kind == ResourceKind::Cache && !request.include_cache {
+                plan.refused
+                    .push(format!("{}: cache not requested", candidate.identifier));
+                continue;
+            }
+            plan.candidates.push(candidate);
         }
         Ok(plan)
     }
@@ -425,7 +465,12 @@ impl CleanPort for SystemWorkflow {
                 continue;
             }
             match remove_candidate(candidate) {
-                Ok(true) => result.succeeded.push(candidate.clone()),
+                Ok(true) => {
+                    result.succeeded.push(candidate.clone());
+                    if let Some(root) = &plan.manifest_root {
+                        append_cleanup_state(root, candidate)?;
+                    }
+                }
                 Ok(false) => result.skipped.push(format!(
                     "{}: absent or still referenced",
                     candidate.identifier
@@ -623,6 +668,35 @@ struct ManifestJournal {
     root: PathBuf,
     task_id: String,
     sequence: AtomicU64,
+}
+
+static CLEAN_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+fn append_cleanup_state(root: &Path, candidate: &CleanCandidate) -> Result<(), AppError> {
+    let mut completed = candidate.clone();
+    completed.state = ResourceState::Cleaned;
+    let sequence = CLEAN_EVENT_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let final_path = root.join(format!(
+        "zz-cleanup-{timestamp:020}-{}-{sequence:06}.json",
+        std::process::id()
+    ));
+    let temporary = final_path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(environment("create cleanup state event"))?;
+    file.write_all(
+        &serde_json::to_vec_pretty(&[completed])
+            .map_err(|error| AppError::Environment(error.to_string()))?,
+    )
+    .map_err(environment("write cleanup state event"))?;
+    file.sync_all()
+        .map_err(environment("sync cleanup state event"))?;
+    fs::rename(temporary, final_path).map_err(environment("publish cleanup state event"))
 }
 
 impl ManifestJournal {

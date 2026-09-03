@@ -2,6 +2,7 @@
 
 use crate::artifacts::{export_declared_artifacts, validate_artifact_path};
 use crate::buildkit::{ProcessInvocation, ProcessOutput};
+use crate::cancellation::is_cancelled;
 use repo_sandbox_core::runner::{
     CleanupResult, ResourceLimit, RunReport, RunSpec, RunStatus, StepPhase, StepResult, StepStatus,
 };
@@ -172,7 +173,7 @@ impl SystemDockerExecutor {
             });
             let deadline = Instant::now() + timeout;
             let (status, interrupted) = loop {
-                if Instant::now() >= deadline {
+                if Instant::now() >= deadline || is_cancelled() {
                     child.kill()?;
                     break (child.wait()?, true);
                 }
@@ -215,6 +216,17 @@ fn join_scoped(reader: thread::ScopedJoinHandle<'_, io::Result<Vec<u8>>>) -> io:
     reader
         .join()
         .map_err(|_| io::Error::other("process output reader panicked"))?
+}
+
+fn interrupted_run_status(phase: Option<StepPhase>, step: Option<&str>) -> RunStatus {
+    if is_cancelled() {
+        RunStatus::Cancelled {
+            phase,
+            step: step.map(str::to_owned),
+        }
+    } else {
+        RunStatus::TimedOut
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -485,7 +497,7 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
         }
         let create = match self.execute_remaining(&run_plan.create, spec, started.monotonic_ms) {
             Ok(output) if output.interrupted => {
-                report.status = RunStatus::TimedOut;
+                report.status = interrupted_run_status(None, None);
                 return Ok(self.finish(report, started));
             }
             Ok(output) if output.exit_code == Some(0) => output,
@@ -518,7 +530,7 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
         }
 
         match self.execute_remaining(&run_plan.start, spec, started.monotonic_ms) {
-            Ok(output) if output.interrupted => report.status = RunStatus::TimedOut,
+            Ok(output) if output.interrupted => report.status = interrupted_run_status(None, None),
             Ok(output) if output.exit_code != Some(0) => {
                 report.status = infrastructure("start owned container", output.stderr)
             }
@@ -568,7 +580,7 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
         started_ms: u64,
     ) -> Result<(), RunStatus> {
         match self.execute_remaining(&run_plan.ownership_check, spec, started_ms) {
-            Ok(output) if output.interrupted => Err(RunStatus::TimedOut),
+            Ok(output) if output.interrupted => Err(interrupted_run_status(None, None)),
             Ok(output) if output.exit_code != Some(0) => {
                 Err(infrastructure("check task ownership label", output.stderr))
             }
@@ -613,7 +625,11 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
                     Vec::new(),
                 ),
                 Ok(streamed) if streamed.output.interrupted => (
-                    StepStatus::TimedOut,
+                    if is_cancelled() {
+                        StepStatus::Cancelled
+                    } else {
+                        StepStatus::TimedOut
+                    },
                     streamed.output.exit_code,
                     streamed.output.stdout,
                     streamed.output.stderr,
@@ -677,6 +693,10 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
                 }
                 StepStatus::TimedOut => {
                     report.status = RunStatus::TimedOut;
+                    return;
+                }
+                StepStatus::Cancelled => {
+                    report.status = interrupted_run_status(Some(step.phase), Some(&step.name));
                     return;
                 }
                 StepStatus::ResourceExceeded { limit } => {
@@ -779,12 +799,12 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
                 .executor
                 .execute(invocation, Duration::from_millis(remaining))?;
             for secret in &spec.secret_mounts {
-                if let Ok(bytes) = std::fs::read(&secret.source) {
-                    if !bytes.is_empty() {
-                        let value = String::from_utf8_lossy(&bytes);
-                        output.stdout = output.stdout.replace(value.as_ref(), "[REDACTED]");
-                        output.stderr = output.stderr.replace(value.as_ref(), "[REDACTED]");
-                    }
+                if let Ok(bytes) = std::fs::read(&secret.source)
+                    && !bytes.is_empty()
+                {
+                    let value = String::from_utf8_lossy(&bytes);
+                    output.stdout = output.stdout.replace(value.as_ref(), "[REDACTED]");
+                    output.stderr = output.stderr.replace(value.as_ref(), "[REDACTED]");
                 }
             }
             let stdout_bytes = output.stdout.as_bytes().to_vec();

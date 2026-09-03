@@ -4,7 +4,8 @@ use repo_sandbox_adapters::snapshot::GitSnapshotter;
 use repo_sandbox_adapters::workflow::SystemWorkflow;
 use repo_sandbox_core::AppError;
 use repo_sandbox_core::application::{
-    BuildUseCase, CleanRequest, CleanUseCase, ExecutionPlan, VerifyUseCase,
+    BuildUseCase, CleanRequest, CleanUseCase, ExecutionPlan, VerifyUseCase, WorkflowFailureReport,
+    write_failure_report,
 };
 use repo_sandbox_core::config::{CliOverrides, Config, ExecutionRequest, Platform};
 use repo_sandbox_core::doctor::{CapabilityKind, CapabilityStatus, DoctorReport, DoctorStatus};
@@ -277,7 +278,29 @@ fn run_runtime(
         VerifyUseCase::new(workflow).execute(&execution)
     } else {
         BuildUseCase::new(workflow).execute(&execution)
-    }?;
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(path) = &execution.request.report
+                && !path.exists()
+            {
+                let report = WorkflowFailureReport {
+                    schema_version: 1,
+                    plan_digest: execution.digest.clone(),
+                    phase: "orchestration".into(),
+                    exit_code: error.exit_code().as_i32(),
+                    message: error.to_string(),
+                };
+                write_failure_report(&report, path).map_err(|write| {
+                    AppError::Environment(format!(
+                        "write failure report: {write}; primary: {error}"
+                    ))
+                })?;
+            }
+            return Err(error);
+        }
+    };
     Ok(RunOutput {
         message: Some(render_workflow(&result)),
         exit_code: ExitCode::Success,

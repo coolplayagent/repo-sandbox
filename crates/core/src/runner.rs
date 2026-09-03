@@ -103,6 +103,7 @@ pub enum StepStatus {
     Succeeded,
     CommandFailed,
     TimedOut,
+    Cancelled,
     ResourceExceeded { limit: ResourceLimit },
     InfrastructureFailed,
 }
@@ -134,6 +135,12 @@ pub enum RunStatus {
         exit_code: Option<i32>,
     },
     TimedOut,
+    Cancelled {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<StepPhase>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        step: Option<String>,
+    },
     ResourceExceeded {
         phase: StepPhase,
         step: String,

@@ -7,7 +7,11 @@ use crate::runner::RunReport;
 use crate::template::TemplatePlan;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkflowMode {
@@ -82,6 +86,40 @@ pub struct WorkflowResult {
     pub published: Option<PublishedImage>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkflowFailureReport {
+    pub schema_version: u8,
+    pub plan_digest: String,
+    pub phase: String,
+    pub exit_code: i32,
+    pub message: String,
+}
+
+static FAILURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub fn write_failure_report(report: &WorkflowFailureReport, path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("report.json");
+    let temporary = parent.join(format!(
+        ".{name}.failure.{}.{}.tmp",
+        std::process::id(),
+        FAILURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec_pretty(report).map_err(std::io::Error::other)?)?;
+    file.sync_all()?;
+    let result = fs::hard_link(&temporary, path);
+    let _ = fs::remove_file(temporary);
+    result
+}
+
 pub trait WorkflowPort {
     fn execute(&self, mode: WorkflowMode, plan: &ExecutionPlan)
     -> Result<WorkflowResult, AppError>;
@@ -130,6 +168,15 @@ pub enum ResourceKind {
     Cache,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceState {
+    #[default]
+    Registered,
+    Retained,
+    Cleaned,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct CleanCandidate {
     pub task_id: String,
@@ -137,12 +184,16 @@ pub struct CleanCandidate {
     pub kind: ResourceKind,
     pub identifier: String,
     pub owner: String,
+    #[serde(default)]
+    pub state: ResourceState,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct CleanPlan {
     pub candidates: Vec<CleanCandidate>,
     pub refused: Vec<String>,
+    #[serde(skip)]
+    pub manifest_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
