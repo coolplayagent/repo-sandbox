@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -39,7 +39,7 @@ jobs:
       - name: Checkout tagged commit without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ steps.requested.outputs.tag }}
+          ref: refs/tags/${{ steps.requested.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
       - name: Validate tag, versions, and main ancestry
@@ -149,14 +149,14 @@ jobs:
         run: scripts/ci/download-release-artifacts.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release
       - name: Verify exact artifact set and generate aggregate checksums
         run: python3 tools/release/assemble_release.py --tag "${{ needs.prepare.outputs.tag }}" --directory release
-      - name: Attest release archives
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
-        with:
-          subject-checksums: release/SHA256SUMS
       - name: Publish or verify immutable GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/ci/publish-release.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" release "${{ needs.prepare.outputs.commit }}"
+      - name: Attest accepted release archives
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-checksums: release/SHA256SUMS
 
   fresh-machine:
     name: Fresh machine ${{ matrix.platform }}

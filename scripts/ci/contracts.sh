@@ -53,10 +53,15 @@ grep -Fq 'version=$(scripts/ci/workspace-version.sh)' "$ci"
 ! grep -Fq "grep -Fx 'repo-sandbox 0.1.0'" "$ci"
 grep -Fq 'bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh' "$ci"
 grep -Fq 'publish-release.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" release "${{ needs.prepare.outputs.commit }}"' "$release"
+publish_line=$(grep -nF 'publish-release.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" release "${{ needs.prepare.outputs.commit }}"' "$release" | cut -d: -f1)
+attest_line=$(grep -nF 'uses: actions/attest@' "$release" | cut -d: -f1)
+(( publish_line < attest_line ))
 grep -Fq 'actions: read' "$release"
 grep -Fq 'download-release-artifacts.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release' "$release"
 [[ $(grep -c 'validate-release-inputs.sh' "$release") -eq 3 ]]
 grep -Fq 'workflow_dispatch:' "$release"
+grep -Fq "group: release-\${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}" "$release"
+grep -Fq 'ref: refs/tags/${{ steps.requested.outputs.tag }}' "$release"
 grep -Fq 'merge-base --is-ancestor "$commit" origin/main' "$release"
 grep -Fq 'subject-checksums: release/SHA256SUMS' "$release"
 grep -Fq 'artifact-metadata: write' "$release"
