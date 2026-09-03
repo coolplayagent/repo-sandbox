@@ -12,12 +12,59 @@ run_test() {
   cargo test -p repo-sandbox-adapters "$name" -- --ignored --exact --nocapture
 }
 
+assert_report_digest() {
+  local report=$1 field=$2
+  grep -Eq "\"${field}\": \"sha256:[0-9a-f]{64}\"" "$report"
+}
+
+assert_report_common() {
+  local report=$1 expected_cleanup=$2
+  [[ -s $report ]]
+  grep -Eq '"task_id": "[0-9]+-[0-9]+"' "$report"
+  assert_report_digest "$report" plan_digest
+  assert_report_digest "$report" image_digest
+  grep -Eq '"id": "[0-9a-f]{64}"' "$report"
+  grep -Fq "\"cleanup\": \"$expected_cleanup\"" "$report"
+}
+
+report_snapshot_id() {
+  sed -nE 's/^[[:space:]]*"id": "([0-9a-f]{64})",?$/\1/p' "$1" | head -n 1
+}
+
+assert_step() {
+  local report=$1 phase=$2 name=$3 status=$4
+  awk -v expected_phase="$phase" -v expected_name="$name" -v expected_status="$status" '
+    $0 ~ "\\\"phase\\\": \\\"" expected_phase "\\\"" { phase_found = 1 }
+    phase_found && $0 ~ "\\\"name\\\": \\\"" expected_name "\\\"" { name_found = 1 }
+    phase_found && name_found && $0 ~ "\\\"status\\\": \\\"" expected_status "\\\"" { found = 1 }
+    phase_found && /}/ { phase_found = 0; name_found = 0 }
+    END { exit !found }
+  ' "$report"
+}
+
+run_expect_status() {
+  local expected=$1
+  shift
+  set +e
+  "$@"
+  local actual=$?
+  set -e
+  [[ $actual -eq $expected ]] || {
+    echo "expected exit $expected, got $actual: $*" >&2
+    return 1
+  }
+}
+
 case "$scenario" in
   cli-build-success|cli-verify-success|cli-build-failure|cli-test-failure|cli-clean-owned-only)
     fixture=$(mktemp -d)
-    cleanup_cli_fixture() { rm -rf -- "$fixture"; }
+    cleanup_cli_fixture() {
+      [[ -z ${foreign:-} ]] || docker rm --force "$foreign" >/dev/null 2>&1 || true
+      rm -rf -- "$fixture"
+    }
     trap cleanup_cli_fixture EXIT
     cp "$root/.repo-sandbox.yaml.example" "$fixture/.repo-sandbox.yaml"
+    printf '.repo-sandbox/\nreport*.json\n' >"$fixture/.gitignore"
     git -C "$fixture" init -q
     git -C "$fixture" config user.email e2e@example.invalid
     git -C "$fixture" config user.name repo-sandbox-e2e
@@ -41,30 +88,123 @@ EOF
     cli="$root/target/debug/repo-sandbox"
     report="$fixture/report.json"
     case "$scenario" in
-      cli-build-success) "$cli" build --repository "$fixture" --report-path "$report" ;;
-      cli-verify-success) "$cli" verify --repository "$fixture" --report-path "$report" ;;
+      cli-build-success)
+        cache_index="$fixture/.repo-sandbox/cache/environment/index.json"
+        [[ ! -e $cache_index ]]
+        "$cli" build --repository "$fixture" --report-path "$report"
+        assert_report_common "$report" removed
+        grep -Fq '"status": "succeeded"' "$report"
+        assert_step "$report" build bazel-build succeeded
+        [[ -f $cache_index ]]
+        first_source=$(report_snapshot_id "$report")
+        [[ -n $first_source ]]
+
+        warm_report="$fixture/report-warm.json"
+        "$cli" build --repository "$fixture" --report-path "$warm_report"
+        assert_report_common "$warm_report" removed
+        assert_step "$warm_report" build bazel-build succeeded
+        [[ $(report_snapshot_id "$warm_report") == "$first_source" ]]
+        [[ -f $cache_index ]]
+
+        printf '# source-change\n' >>"$fixture/BUILD.bazel"
+        git -C "$fixture" add BUILD.bazel
+        git -C "$fixture" commit -qm source-change
+        changed_report="$fixture/report-changed.json"
+        "$cli" build --repository "$fixture" --report-path "$changed_report"
+        assert_report_common "$changed_report" removed
+        assert_step "$changed_report" build bazel-build succeeded
+        [[ $(report_snapshot_id "$changed_report") != "$first_source" ]]
+        echo 'cache=cold_then_warm source_digest=changed'
+        ;;
+      cli-verify-success)
+        "$cli" verify --repository "$fixture" --report-path "$report"
+        assert_report_common "$report" removed
+        grep -Fq '"status": "succeeded"' "$report"
+        assert_step "$report" build bazel-build succeeded
+        assert_step "$report" test bazel-test succeeded
+        [[ $(grep -c '"phase": "build"' "$report") -eq 1 ]]
+        [[ $(grep -c '"phase": "test"' "$report") -eq 1 ]]
+        ;;
       cli-build-failure)
-        set +e; "$cli" build --repository "$fixture" --report-path "$report"; status=$?; set -e
-        [[ $status -eq 10 ]]
+        run_expect_status 10 "$cli" build --repository "$fixture" --report-path "$report"
+        assert_report_common "$report" removed
+        grep -Fq '"status": "command_failed"' "$report"
+        grep -Fq '"phase": "build"' "$report"
+        grep -Fq '"step": "bazel-build"' "$report"
+        assert_step "$report" build bazel-build command_failed
+        grep -Eq '"exit_code": [1-9][0-9]*' "$report"
+        [[ $(grep -c '"phase": "test"' "$report") -eq 0 ]]
         ;;
       cli-test-failure)
-        set +e; "$cli" verify --repository "$fixture" --report-path "$report"; status=$?; set -e
-        [[ $status -eq 11 ]]
+        push_args=()
+        if [[ -n ${REPO_SANDBOX_E2E_REGISTRY_REPOSITORY:-} ]]; then
+          [[ $REPO_SANDBOX_E2E_REGISTRY_REPOSITORY =~ ^[A-Za-z0-9._:/-]+$ ]]
+          sed -i "s|bazelisk_version: \"1.27.0\"|bazelisk_version: \"1.27.0\"\n    registry_repository: \"${REPO_SANDBOX_E2E_REGISTRY_REPOSITORY}\"|" \
+            "$fixture/.repo-sandbox.yaml"
+          git -C "$fixture" add .repo-sandbox.yaml
+          git -C "$fixture" commit -qm registry-policy
+          push_args=(--push)
+        fi
+        run_expect_status 11 "$cli" verify --repository "$fixture" \
+          --report-path "$report" "${push_args[@]}"
+        assert_report_common "$report" removed
+        grep -Fq '"status": "command_failed"' "$report"
+        grep -Fq '"phase": "test"' "$report"
+        grep -Fq '"step": "bazel-test"' "$report"
+        assert_step "$report" build bazel-build succeeded
+        assert_step "$report" test bazel-test command_failed
+        grep -Fq '"exit_code": 23' "$report"
+        ! grep -Fq '"published"' "$report"
         ;;
       cli-clean-owned-only)
         foreign=$(docker create --label io.repo-sandbox.task-id=foreign busybox:1.36 true)
-        set +e; "$cli" build --repository "$fixture" --keep-on-failure --report-path "$report"; status=$?; set -e
-        [[ $status -eq 10 ]]
+        run_expect_status 10 "$cli" build --repository "$fixture" --keep-on-failure \
+          --report-path "$report"
+        assert_report_common "$report" retained_on_failure
+        grep -Fq '"phase": "build"' "$report"
+        grep -Fq '"step": "bazel-build"' "$report"
         before=$(docker inspect --format '{{.Id}}' "$foreign")
-        "$cli" clean --repository "$fixture" --dry-run --include-images --include-cache
+        retained=$(sed -nE 's/^[[:space:]]*"container_id": "([^"]+)",?$/\1/p' "$report")
+        [[ -n $retained ]]
+        retained_before=$(docker inspect --format '{{.Id}}' "$retained")
+        cache_marker="$fixture/.repo-sandbox/cache/.repo-sandbox-owner"
+        [[ -s $cache_marker ]]
+        marker_before=$(sha256sum "$cache_marker")
+
+        dry_run_output=$("$cli" clean --repository "$fixture" --dry-run \
+          --include-images --include-cache)
+        grep -Fq '(dry-run)' <<<"$dry_run_output"
+        grep -Fq 'candidate Container' <<<"$dry_run_output"
+        [[ $(docker inspect --format '{{.Id}}' "$retained") == "$retained_before" ]]
+        [[ $(sha256sum "$cache_marker") == "$marker_before" ]]
+
+        container_manifest=$(grep -Fl '"kind": "container"' \
+          "$fixture"/.repo-sandbox/tasks/*.json | head -n 1)
+        container_manifest_name=$(basename "$container_manifest")
+        mv "$fixture/.repo-sandbox/tasks" "$fixture/.repo-sandbox/tasks-owned"
+        mkdir "$fixture/.repo-sandbox/tasks"
+        forged_manifest="$fixture/.repo-sandbox/tasks/forged-owner-mismatch.json"
+        sed "s|$retained|$foreign|g" \
+          "$fixture/.repo-sandbox/tasks-owned/$container_manifest_name" >"$forged_manifest"
+        run_expect_status 3 "$cli" clean --repository "$fixture" --yes \
+          --include-images --include-cache
+        [[ $(docker inspect --format '{{.Id}}' "$foreign") == "$before" ]]
+        [[ $(docker inspect --format '{{.Id}}' "$retained") == "$retained_before" ]]
+        rm -rf -- "$fixture/.repo-sandbox/tasks"
+        mv "$fixture/.repo-sandbox/tasks-owned" "$fixture/.repo-sandbox/tasks"
+
         "$cli" clean --repository "$fixture" --yes --include-images --include-cache
-        "$cli" clean --repository "$fixture" --yes --include-images --include-cache
+        ! docker inspect "$retained" >/dev/null 2>&1
+        [[ $(docker inspect --format '{{.Id}}' "$foreign") == "$before" ]]
+        idempotent_output=$("$cli" clean --repository "$fixture" --yes \
+          --include-images --include-cache)
+        grep -Fq '0 succeeded' <<<"$idempotent_output"
         [[ $(docker inspect --format '{{.Id}}' "$foreign") == "$before" ]]
         docker rm "$foreign" >/dev/null
+        foreign=
+        echo 'dry_run=unchanged owner_mismatch=refused foreign_resource=preserved cleanup=idempotent'
         ;;
     esac
-    [[ -s "$report" ]]
-    grep -q '"task_id"' "$report"
     echo "$scenario=passed"
     printf 'passed\n' >"$result_directory/$scenario.passed"
     ;;
