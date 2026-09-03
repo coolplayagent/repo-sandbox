@@ -6,7 +6,7 @@ use crate::buildkit::{
     ProcessInvocation, Progress, SystemProcessExecutor,
 };
 use crate::cancellation::{DeadlineCancellation, ProcessCancellation};
-use crate::docker_runner::{DockerRunner, SystemClock, SystemDockerExecutor};
+use crate::docker_runner::{DockerExecutor, DockerRunner, SystemClock, SystemDockerExecutor};
 use crate::doctor::{DoctorProbe, SystemDoctorProbe};
 use crate::registry::{DockerRegistry, OciRegistry, SystemRegistryExecutor};
 use crate::snapshot::GitSnapshotter;
@@ -2675,11 +2675,14 @@ fn bound_state_path(
 
 fn write_state_file(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(target_os = "linux")]
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         const O_NOFOLLOW: i32 = 0x0002_0000;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        const O_NOFOLLOW: i32 = 0x0000_0100;
         options.custom_flags(O_NOFOLLOW);
     }
     #[cfg(windows)]
@@ -2691,15 +2694,21 @@ fn write_state_file(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     let mut file = options
         .open(path)
         .map_err(environment("open bound workflow state file"))?;
-    if is_link_or_reparse(
-        &file
-            .metadata()
-            .map_err(environment("inspect bound workflow state file"))?,
-    ) {
+    let metadata = file
+        .metadata()
+        .map_err(environment("inspect bound workflow state file"))?;
+    if is_link_or_reparse(&metadata)
+        || !metadata.is_file()
+        || !state_file_has_single_link(&file, &metadata)
+    {
         return Err(AppError::Environment(
-            "workflow state file must not be a symlink or reparse point".into(),
+            "workflow state file must be a single-link regular file".into(),
         ));
     }
+    file.set_len(0)
+        .map_err(environment("truncate bound workflow state file"))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(environment("seek bound workflow state file"))?;
     file.write_all(bytes)
         .map_err(environment("write bound workflow state file"))?;
     file.sync_all()
@@ -2766,8 +2775,7 @@ impl OutputReservation {
         let absolute = normalized_output_path(output)?;
         let mut digest = Sha256::new();
         digest.update(absolute.to_string_lossy().as_bytes());
-        let root = std::env::temp_dir().join("repo-sandbox-output-reservations-v1");
-        fs::create_dir_all(&root).map_err(environment("create output reservation directory"))?;
+        let root = output_reservation_root()?;
         let path = root.join(format!("{:x}.lock", digest.finalize()));
         let file = OpenOptions::new()
             .read(true)
@@ -2789,6 +2797,67 @@ impl OutputReservation {
         })?;
         Ok(Self { _file: file })
     }
+}
+
+fn output_reservation_root() -> Result<PathBuf, AppError> {
+    #[cfg(unix)]
+    let root = {
+        let uid = effective_uid();
+        std::env::temp_dir().join(format!("repo-sandbox-{uid}-output-reservations-v1"))
+    };
+    #[cfg(windows)]
+    let root = std::env::temp_dir().join("repo-sandbox-output-reservations-v1");
+
+    if !root.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .or_else(|error| {
+                    (error.kind() == std::io::ErrorKind::AlreadyExists)
+                        .then_some(())
+                        .ok_or(error)
+                })
+                .map_err(environment("create private output reservation directory"))?;
+        }
+        #[cfg(windows)]
+        fs::create_dir(&root)
+            .or_else(|error| {
+                (error.kind() == std::io::ErrorKind::AlreadyExists)
+                    .then_some(())
+                    .ok_or(error)
+            })
+            .map_err(environment("create private output reservation directory"))?;
+    }
+    let metadata = fs::symlink_metadata(&root)
+        .map_err(environment("inspect private output reservation directory"))?;
+    if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(AppError::Environment(
+            "output reservation root must be a real private directory".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = effective_uid();
+        if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+            return Err(AppError::Environment(
+                "output reservation root must be owned by the current user with mode 0700".into(),
+            ));
+        }
+    }
+    Ok(root)
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: geteuid has no arguments or memory-safety preconditions.
+    unsafe { geteuid() }
 }
 
 struct ManifestJournal {
@@ -3013,10 +3082,7 @@ fn seed_registry(
     cancellation: &DeadlineCancellation,
 ) -> Result<ImageRef, AppError> {
     let content = registry_content_ref(repository, digest);
-    for args in [
-        vec!["image", "tag", source.as_str(), content.as_str()],
-        vec!["push", content.as_str()],
-    ] {
+    let run = |args: Vec<&str>| -> Result<(), AppError> {
         let invocation = ProcessInvocation {
             program: "docker".into(),
             args: args.into_iter().map(str::to_owned).collect(),
@@ -3036,6 +3102,25 @@ fn seed_registry(
                 output.stderr.trim()
             )));
         }
+        Ok(())
+    };
+    if let Err(primary) = run(vec!["image", "tag", source.as_str(), content.as_str()]) {
+        let cleanup = remove_local_registry_tag_after_cancellation(&content);
+        return Err(match cleanup {
+            Ok(()) => primary,
+            Err(cleanup) => AppError::Environment(format!(
+                "{primary}; reconcile ambiguous registry seed tag {content}: {cleanup}"
+            )),
+        });
+    }
+    if let Err(primary) = run(vec!["push", content.as_str()]) {
+        let cleanup = remove_local_registry_tag_after_cancellation(&content);
+        return Err(match cleanup {
+            Ok(()) => primary,
+            Err(cleanup) => AppError::Environment(format!(
+                "{primary}; remove failed registry seed tag {content}: {cleanup}"
+            )),
+        });
     }
     Ok(content)
 }
@@ -3061,6 +3146,32 @@ fn remove_local_registry_tag(
     cancellation: &dyn Cancellation,
 ) -> Result<(), AppError> {
     remove_local_registry_tag_with(&SystemProcessExecutor, reference, cancellation)
+}
+
+fn remove_local_registry_tag_after_cancellation(reference: &ImageRef) -> Result<(), AppError> {
+    remove_local_registry_tag_after_cancellation_with(&SystemDockerExecutor, reference)
+}
+
+fn remove_local_registry_tag_after_cancellation_with(
+    executor: &impl DockerExecutor,
+    reference: &ImageRef,
+) -> Result<(), AppError> {
+    let invocation = ProcessInvocation {
+        program: "docker".into(),
+        args: vec!["image".into(), "rm".into(), reference.to_string()],
+        current_dir: None,
+    };
+    let output = executor
+        .execute_cleanup(&invocation, std::time::Duration::from_secs(30))
+        .map_err(environment("remove failed registry seed tag"))?;
+    if output.exit_code == Some(0) || docker_object_absent(&output.stderr) {
+        Ok(())
+    } else {
+        Err(AppError::Environment(format!(
+            "remove failed registry seed tag: {}",
+            output.stderr.trim()
+        )))
+    }
 }
 
 fn remove_unregistered_task_image(
@@ -3327,6 +3438,34 @@ mod tests {
     }
 
     struct FixedExecutor(crate::buildkit::ProcessOutput);
+
+    struct CleanupExecutor {
+        calls: std::sync::Mutex<Vec<ProcessInvocation>>,
+    }
+
+    impl DockerExecutor for CleanupExecutor {
+        fn execute(
+            &self,
+            _invocation: &ProcessInvocation,
+            _timeout: std::time::Duration,
+        ) -> std::io::Result<crate::buildkit::ProcessOutput> {
+            panic!("failed seed cleanup must not use cancellation-aware execution")
+        }
+
+        fn execute_cleanup(
+            &self,
+            invocation: &ProcessInvocation,
+            _timeout: std::time::Duration,
+        ) -> std::io::Result<crate::buildkit::ProcessOutput> {
+            self.calls.lock().unwrap().push(invocation.clone());
+            Ok(crate::buildkit::ProcessOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                interrupted: false,
+            })
+        }
+    }
 
     impl ProcessExecutor for FixedExecutor {
         fn execute(
@@ -3946,6 +4085,16 @@ mod tests {
         drop(reservation);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn output_reservation_root_is_private_to_the_effective_user() {
+        use std::os::unix::fs::MetadataExt;
+        let root = output_reservation_root().unwrap();
+        let metadata = fs::symlink_metadata(root).unwrap();
+        assert_eq!(metadata.uid(), effective_uid());
+        assert_eq!(metadata.mode() & 0o077, 0);
+    }
+
     #[test]
     fn output_reservation_is_recoverable_after_owner_process_termination() {
         let temporary = tempfile::tempdir().unwrap();
@@ -4098,6 +4247,21 @@ mod tests {
         });
         let reference = ImageRef::new("registry.test/team/task:content").unwrap();
         remove_local_registry_tag_with(&executor, &reference, &NeverCancelled).unwrap();
+    }
+
+    #[test]
+    fn failed_seed_cleanup_uses_the_post_cancellation_bounded_path() {
+        let executor = CleanupExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let reference = ImageRef::new("registry.test/team/task:sha256-content").unwrap();
+        remove_local_registry_tag_after_cancellation_with(&executor, &reference).unwrap();
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].args,
+            ["image", "rm", reference.as_str()].map(str::to_owned)
+        );
     }
 
     #[test]
@@ -4867,6 +5031,37 @@ mod tests {
         fs::hard_link(outside.path(), root.path().join(".sequence")).unwrap();
         assert!(next_journal_sequence(root.path()).is_err());
         assert_eq!(fs::read_to_string(outside.path()).unwrap(), "sentinel");
+    }
+
+    #[test]
+    fn cache_owner_marker_hardlink_never_overwrites_external_file() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), "external-sentinel").unwrap();
+        let marker = root.path().join(OWNER_MARKER);
+        fs::hard_link(outside.path(), &marker).unwrap();
+        let error = write_state_file(&marker, b"repository-id").unwrap_err();
+        assert!(error.to_string().contains("single-link regular file"));
+        assert_eq!(
+            fs::read_to_string(outside.path()).unwrap(),
+            "external-sentinel"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_owner_marker_symlink_never_overwrites_external_file() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), "external-sentinel").unwrap();
+        let marker = root.path().join(OWNER_MARKER);
+        symlink(outside.path(), &marker).unwrap();
+        assert!(write_state_file(&marker, b"repository-id").is_err());
+        assert_eq!(
+            fs::read_to_string(outside.path()).unwrap(),
+            "external-sentinel"
+        );
     }
 
     #[test]
