@@ -6,7 +6,7 @@ rust_library(
     srcs = ["src/lib.rs"],
     aliases = aliases(),
     crate_name = "repo_sandbox_cli",
-    version = "0.1.0",
+    version = "0.1.1",
     deps = [
         "//crates/adapters:adapters",
         "//crates/core:core",
@@ -19,7 +19,7 @@ rust_binary(
     name = "repo-sandbox",
     srcs = ["src/main.rs"],
     crate_name = "repo_sandbox",
-    version = "0.1.0",
+    version = "0.1.1",
     deps = [
         ":cli",
         "//crates/adapters:adapters",

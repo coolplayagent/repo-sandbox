@@ -1,6 +1,6 @@
 module(
     name = "repo_sandbox",
-    version = "0.1.0",
+    version = "0.1.1",
 )
 
 bazel_dep(name = "rules_rust", version = "0.74.0")

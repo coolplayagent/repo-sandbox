@@ -55,7 +55,7 @@ Release page. Verify before extraction:
 
 ```console
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf repo-sandbox-0.1.0-linux-amd64.tar.gz
+tar -xzf repo-sandbox-0.1.1-linux-amd64.tar.gz
 ./repo-sandbox --version
 ```
 
