@@ -71,6 +71,7 @@ impl WorkflowPort for SystemWorkflow {
         // Finish every pure plan validation before creating an explicit report
         // parent or any reservation/state file.
         validate_outputs(plan)?;
+        validate_required_secret_environment(plan)?;
         let oci_destination = plan
             .request
             .oci_layout
@@ -755,12 +756,12 @@ impl CleanPort for SystemWorkflow {
                 ));
                 continue;
             }
-            if candidate.kind == ResourceKind::Image && !(request.all || request.include_images) {
+            if candidate.kind == ResourceKind::Image && !request.include_images {
                 plan.refused
                     .push(format!("{}: images not requested", candidate.identifier));
                 continue;
             }
-            if candidate.kind == ResourceKind::Cache && !(request.all || request.include_cache) {
+            if candidate.kind == ResourceKind::Cache && !request.include_cache {
                 plan.refused
                     .push(format!("{}: cache not requested", candidate.identifier));
                 continue;
@@ -1309,6 +1310,16 @@ fn validate_secret_value(name: &str, value: &[u8]) -> Result<(), AppError> {
         return Err(AppError::Configuration(format!(
             "secret environment `{name}` must be non-empty and single-line"
         )));
+    }
+    Ok(())
+}
+
+fn validate_required_secret_environment(plan: &ExecutionPlan) -> Result<(), AppError> {
+    for name in &plan.template.execution.secret_environment {
+        let value = std::env::var_os(name).ok_or_else(|| {
+            AppError::Configuration(format!("required secret environment `{name}` is not set"))
+        })?;
+        validate_secret_value(name, value.to_string_lossy().as_bytes())?;
     }
     Ok(())
 }
@@ -1904,13 +1915,13 @@ fn preflight_registry_with(
         .prefix("repo-sandbox-registry-preflight-")
         .tempdir()
         .map_err(environment("create registry preflight context"))?;
+    fs::write(
+        temporary.path().join("Dockerfile"),
+        "FROM scratch\nLABEL io.repo-sandbox.kind=registry-preflight\n",
+    )
+    .map_err(environment("write registry preflight Dockerfile"))?;
     let push = if buildx_boundary {
         let metadata = temporary.path().join("metadata.json");
-        fs::write(
-            temporary.path().join("Dockerfile"),
-            "FROM scratch\nLABEL io.repo-sandbox.kind=registry-preflight\n",
-        )
-        .map_err(environment("write registry preflight Dockerfile"))?;
         quota_command(
             executor,
             vec![
@@ -1926,22 +1937,19 @@ fn preflight_registry_with(
             cancellation,
         )?
     } else {
-        let archive = temporary.path().join("empty-rootfs.tar");
-        fs::write(&archive, [0_u8; 1024])
-            .map_err(environment("write registry preflight rootfs"))?;
-        let import = quota_command(
+        let build = quota_command(
             executor,
             vec![
-                "image".into(),
-                "import".into(),
-                "--change".into(),
-                "LABEL io.repo-sandbox.kind=registry-preflight".into(),
-                docker_host_path(&archive),
+                "build".into(),
+                "--file".into(),
+                docker_host_path(&temporary.path().join("Dockerfile")),
+                "--tag".into(),
                 probe.to_string(),
+                docker_host_path(temporary.path()),
             ],
             cancellation,
         )?;
-        quota_command_result("import registry preflight image", &import, cancellation)?;
+        quota_command_result("build registry preflight image", &build, cancellation)?;
         quota_command(
             executor,
             vec!["push".into(), probe.to_string()],
@@ -2056,10 +2064,6 @@ fn preflight_writable_layer_quota_with_identity(
         .prefix("repo-sandbox-quota-preflight-")
         .tempdir()
         .map_err(environment("create quota preflight directory"))?;
-    // Two zero tar blocks are a valid empty archive, so this probe never needs
-    // a network pull or a caller-controlled image.
-    let archive = temporary.path().join("empty-rootfs.tar");
-    fs::write(&archive, [0_u8; 1024]).map_err(environment("write quota probe rootfs"))?;
     let image = format!("repo-sandbox-quota-probe:{identity}");
     let container = format!("repo-sandbox-quota-probe-{identity}");
     let kind_label_key = "io.repo-sandbox.kind";
@@ -2067,19 +2071,25 @@ fn preflight_writable_layer_quota_with_identity(
     let kind_label = format!("{kind_label_key}=quota-probe");
     let task_label = format!("{task_label_key}={identity}");
     let cleanup_deadline = DeadlineCancellation::new(std::time::Duration::from_secs(30));
-    let import = quota_command(
+    let dockerfile = temporary.path().join("Dockerfile");
+    fs::write(
+        &dockerfile,
+        format!("FROM scratch\nLABEL {kind_label} {task_label}\n"),
+    )
+    .map_err(environment("write quota probe Dockerfile"))?;
+    let build = quota_command(
         executor,
         vec![
-            "image".into(),
-            "import".into(),
-            "--change".into(),
-            format!("LABEL {kind_label} {task_label}"),
-            docker_host_path(&archive),
+            "build".into(),
+            "--file".into(),
+            docker_host_path(&dockerfile),
+            "--tag".into(),
             image.clone(),
+            docker_host_path(temporary.path()),
         ],
         cancellation,
     )?;
-    let mut primary = quota_command_result("import quota probe image", &import, cancellation);
+    let mut primary = quota_command_result("build quota probe image", &build, cancellation);
     let image_id = reconcile_quota_resource(
         executor,
         "image",
@@ -2089,9 +2099,9 @@ fn preflight_writable_layer_quota_with_identity(
         identity,
         &cleanup_deadline,
     )?;
-    if import.exit_code == Some(0) && image_id.is_none() {
+    if build.exit_code == Some(0) && image_id.is_none() {
         primary = Err(AppError::Environment(
-            "quota probe image disappeared after successful import".into(),
+            "quota probe image disappeared after successful build".into(),
         ));
     }
     if primary.is_ok() {
@@ -3311,7 +3321,6 @@ struct ExternalReportGuard {
     _parent: PathBuf,
     _handle: Option<fs::File>,
     created: Vec<PathBuf>,
-    _parent_reservation: OutputReservation,
 }
 
 /// Pins an OCI destination's parent for the complete workflow. On Unix every
@@ -3325,7 +3334,6 @@ struct ExternalOciGuard {
     handle: Option<fs::File>,
     created: Vec<PathBuf>,
     _output_reservation: OutputReservation,
-    _parent_reservation: OutputReservation,
 }
 
 impl ExternalOciGuard {
@@ -3371,6 +3379,8 @@ impl ExternalOciGuard {
                 return Err(error);
             }
         };
+        #[cfg(all(unix, not(target_os = "linux")))]
+        make_handle_inheritable_for_child(&handle)?;
         let validation = (|| {
             let current_parent = resolved_future_path(&parent)?;
             let bound_identity = state_identity_from_handle(&handle)?;
@@ -3388,13 +3398,13 @@ impl ExternalOciGuard {
             rollback_created_directories(&created);
             return Err(error);
         }
+        drop(parent_reservation);
         Ok(Self {
             path: output,
             _parent: parent,
             handle: Some(handle),
             created,
             _output_reservation: output_reservation,
-            _parent_reservation: parent_reservation,
         })
     }
 
@@ -3469,12 +3479,12 @@ impl ExternalReportGuard {
             rollback_created_directories(&created);
             return Err(error);
         }
+        drop(parent_reservation);
         Ok(Self {
             path: report.to_path_buf(),
             _parent: parent.to_path_buf(),
             _handle: Some(handle),
             created,
-            _parent_reservation: parent_reservation,
         })
     }
 
@@ -3567,6 +3577,26 @@ fn bind_report_parent(parent: &Path) -> Result<fs::File, AppError> {
         )));
     }
     Ok(handle)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn make_handle_inheritable_for_child(handle: &fs::File) -> Result<(), AppError> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
+    }
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    // SAFETY: the retained guard owns a live descriptor for both calls.
+    let flags = unsafe { fcntl(handle.as_raw_fd(), F_GETFD, 0) };
+    if flags < 0 || unsafe { fcntl(handle.as_raw_fd(), F_SETFD, flags & !FD_CLOEXEC) } < 0 {
+        return Err(AppError::Configuration(format!(
+            "cannot expose bound OCI destination to Docker: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -5471,7 +5501,7 @@ mod tests {
         .unwrap();
         let calls = executor.calls.lock().unwrap();
         assert_eq!(calls.len(), 4);
-        assert_eq!(&calls[0].args[..2], ["image", "import"]);
+        assert_eq!(calls[0].args[0], "build");
         assert_eq!(calls[1].args[0], "push");
         assert_eq!(&calls[2].args[..3], ["buildx", "imagetools", "inspect"]);
         assert_eq!(&calls[3].args[..2], ["image", "rm"]);
@@ -5589,13 +5619,8 @@ mod tests {
             .unwrap();
         let calls = executor.calls.lock().unwrap();
         assert_eq!(calls.len(), 6);
-        assert_eq!(&calls[0].args[..2], ["image", "import"]);
-        assert!(
-            calls[0]
-                .args
-                .iter()
-                .any(|arg| arg.ends_with("empty-rootfs.tar"))
-        );
+        assert_eq!(calls[0].args[0], "build");
+        assert!(calls[0].args.iter().any(|arg| arg.ends_with("Dockerfile")));
         assert_eq!(&calls[1].args[..2], ["image", "inspect"]);
         assert_eq!(&calls[2].args[..2], ["container", "create"]);
         assert!(calls[2].args.contains(&"size=384m".into()));
@@ -6234,6 +6259,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn distinct_outputs_can_share_one_already_bound_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("outputs");
+        fs::create_dir(&parent).unwrap();
+        let oci = ExternalOciGuard::prepare(&parent.join("layout")).unwrap();
+        let report = ExternalReportGuard::prepare(&parent.join("report.json")).unwrap();
+        assert_ne!(oci.bound_path().unwrap(), report.bound_path().unwrap());
+    }
+
     #[cfg(unix)]
     #[test]
     fn state_report_remains_bound_after_reports_directory_is_replaced() {
@@ -6709,6 +6744,15 @@ mod tests {
     }
 
     #[test]
+    fn required_secret_availability_is_validated_before_workflow_side_effects() {
+        let mut plan = default_execution_plan();
+        let name = format!("REPO_SANDBOX_MISSING_SECRET_{}", task_id());
+        plan.template.execution.secret_environment = vec![name.clone()];
+        let error = validate_required_secret_environment(&plan).unwrap_err();
+        assert!(error.to_string().contains(&name));
+    }
+
+    #[test]
     fn clean_all_enumerates_local_and_trusted_remote_stores() {
         let repository = tempfile::tempdir().unwrap();
         let canonical = repository.path().canonicalize().unwrap();
@@ -6743,7 +6787,7 @@ mod tests {
                 repository: canonical,
                 all: true,
                 include_images: false,
-                include_cache: false,
+                include_cache: true,
                 dry_run: true,
             })
             .unwrap();

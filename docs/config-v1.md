@@ -104,8 +104,8 @@ the central image, component graph, or build contexts.
 | `11` | test failed |
 
 Build-step failures map to `10`; test-step failures map to `11`.
-Before building, `build` and `verify` perform an offline, task-owned Docker
-image import/container-create probe using the configured temporary-storage
+Before building, `build` and `verify` perform an offline, task-owned `scratch`
+image build/container-create probe using the configured temporary-storage
 limit. A daemon that cannot enforce `--storage-opt size=...` fails as an
 environment prerequisite (`3`); the probe container and image are removed on
 both success and failure after their two ownership labels and exact IDs are
