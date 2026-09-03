@@ -54,7 +54,7 @@ grep -Fq 'version=$(scripts/ci/workspace-version.sh)' "$ci"
 grep -Fq 'bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh' "$ci"
 grep -Fq 'publish-release.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" release "${{ needs.prepare.outputs.commit }}"' "$release"
 publish_line=$(grep -nF 'publish-release.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" release "${{ needs.prepare.outputs.commit }}"' "$release" | cut -d: -f1)
-attest_line=$(grep -nF 'uses: actions/attest@' "$release" | cut -d: -f1)
+attest_line=$(grep -nF 'uses: actions/attest-build-provenance@' "$release" | cut -d: -f1)
 (( publish_line < attest_line ))
 grep -Fq 'actions: read' "$release"
 grep -Fq 'download-release-artifacts.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release' "$release"
@@ -65,7 +65,8 @@ grep -Fq 'ref: refs/tags/${{ steps.requested.outputs.tag }}' "$release"
 grep -Fq '[[ $GITHUB_EVENT_NAME == workflow_dispatch && $GITHUB_SHA != "$commit" ]]' "$release"
 grep -Fq 'manual release must be dispatched with --ref $RELEASE_TAG' "$release"
 grep -Fq 'merge-base --is-ancestor "$commit" origin/main' "$release"
-grep -Fq 'subject-checksums: release/SHA256SUMS' "$release"
+grep -Fq 'uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0' "$release"
+grep -Fq 'subject-path: release/repo-sandbox-*.tar.gz' "$release"
 grep -Fq 'artifact-metadata: write' "$release"
 grep -Fq 'cmp "release-a/$archive" "release-b/$archive"' "$release"
 ! grep -Fq 'git merge-base --is-ancestor "$GITHUB_SHA" origin/main' "$release"
