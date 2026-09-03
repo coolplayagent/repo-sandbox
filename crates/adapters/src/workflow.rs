@@ -16,7 +16,8 @@ use repo_sandbox_core::application::{
     CleanCandidate, CleanPlan, CleanPort, CleanRequest, CleanResult, ExecutionPlan, ResourceKind,
     ResourceState, WorkflowMode, WorkflowPort, WorkflowResult,
 };
-use repo_sandbox_core::build::ImageRef;
+use repo_sandbox_core::build::{BuiltImage, ImageRef};
+use repo_sandbox_core::config::Platform;
 use repo_sandbox_core::registry::{PublishRequest, RegistryRepository, RegistryTag};
 use repo_sandbox_core::runner::{
     ConfigSummary, RunResources, RunSpec, RunStatus, SecretMount, StepPhase, write_report_json,
@@ -47,13 +48,20 @@ impl WorkflowPort for SystemWorkflow {
         let state = repository.join(".repo-sandbox");
         let task_id = task_id();
         let repository_id = repository_id(&repository)?;
-        let journal = ManifestJournal::create(&state, &task_id)?;
         let report_path = plan
             .request
             .report
             .clone()
             .unwrap_or_else(|| state.join("reports").join(format!("{task_id}.json")));
         let _report_reservation = ReportReservation::create(&report_path)?;
+        validate_outputs(plan)?;
+        let _oci_reservation = plan
+            .request
+            .oci_layout
+            .as_deref()
+            .map(OciReservation::create)
+            .transpose()?;
+        let journal = ManifestJournal::create(&state, &task_id)?;
         let registry = plan.template.execution.registry.as_ref();
         if plan.request.push && registry.is_none() {
             return Err(AppError::Configuration(
@@ -90,7 +98,7 @@ impl WorkflowPort for SystemWorkflow {
                     cleanup: CleanupPolicy::Delete,
                 },
             )
-            .map_err(|error| AppError::Environment(error.to_string()))?;
+            .map_err(|error| AppError::Environment(format!("snapshot: {error}")))?;
         let catalog_root = catalog_root(&repository)?;
         let cache_import = cache.join("environment");
         let cache_export = cache.join("environment-next");
@@ -127,7 +135,7 @@ impl WorkflowPort for SystemWorkflow {
                 ),
                 &cancellation,
             )
-            .map_err(|error| AppError::Environment(error.to_string()))?;
+            .map_err(|error| AppError::Environment(format!("environment image: {error}")))?;
         if cache_export.exists() {
             if cache_import.exists() {
                 let _ = fs::remove_dir_all(&cache_import);
@@ -157,7 +165,7 @@ impl WorkflowPort for SystemWorkflow {
                 },
                 &cancellation,
             )
-            .map_err(|error| AppError::Environment(error.to_string()))?;
+            .map_err(|error| AppError::Environment(format!("task image: {error}")))?;
         journal.append(&[CleanCandidate {
             task_id: task_id.clone(),
             repository_id: repository_id.clone(),
@@ -304,6 +312,18 @@ impl WorkflowPort for SystemWorkflow {
             }])?;
         }
 
+        if !failed && let Some(output) = &plan.request.oci_layout {
+            export_verified_oci(
+                plan,
+                &catalog_root,
+                &materialized,
+                &environment_image,
+                &configuration_digest,
+                output,
+                &cancellation,
+            )?;
+        }
+
         let published = if plan.request.push && !failed {
             let policy = registry.expect("checked registry");
             let repository =
@@ -313,19 +333,31 @@ impl WorkflowPort for SystemWorkflow {
                 .iter()
                 .map(|value| RegistryTag::new(value).map_err(AppError::Configuration))
                 .collect::<Result<Vec<_>, _>>()?;
-            let seeded = seed_registry(
-                &task_image.image.image,
-                &repository,
-                task_image.identity.as_str(),
-            )?;
+            let published_task = if plan.request.platforms.len() > 1 {
+                build_multi_platform_task(
+                    plan,
+                    &catalog_root,
+                    &materialized,
+                    &configuration_digest,
+                    &repository,
+                    &cancellation,
+                )?
+            } else {
+                let seeded = seed_registry(
+                    &task_image.image.image,
+                    &repository,
+                    task_image.identity.as_str(),
+                )?;
+                (seeded, task_image.image.clone())
+            };
             Some(
                 DockerRegistry::new(SystemRegistryExecutor)
                     .publish(
                         &PublishRequest {
-                            source: seeded,
+                            source: published_task.0,
                             repository,
-                            digest: task_image.image.digest.clone(),
-                            platform_digests: task_image.image.platform_digests.clone(),
+                            digest: published_task.1.digest,
+                            platform_digests: published_task.1.platform_digests,
                             aliases,
                         },
                         &cancellation,
@@ -484,6 +516,239 @@ impl CleanPort for SystemWorkflow {
     }
 }
 
+fn validate_outputs(plan: &ExecutionPlan) -> Result<(), AppError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for platform in &plan.request.platforms {
+        if !seen.insert(*platform) {
+            return Err(AppError::Configuration(format!(
+                "duplicate --platform {platform}"
+            )));
+        }
+        if !plan.template.target_platforms.contains(platform) {
+            return Err(AppError::Configuration(format!(
+                "template {} does not support {platform}",
+                plan.template.template_id
+            )));
+        }
+    }
+    if plan.request.platforms.len() > 1 && !plan.request.push && plan.request.oci_layout.is_none() {
+        return Err(AppError::Configuration(
+            "multiple --platform values require --push or --oci-layout".into(),
+        ));
+    }
+    if plan.request.oci_layout.as_ref() == plan.request.report.as_ref() {
+        return Err(AppError::Configuration(
+            "--oci-layout and --report-path must be different".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn build_multi_platform_task(
+    plan: &ExecutionPlan,
+    catalog_root: &Path,
+    materialized: &crate::snapshot::MaterializedSnapshot,
+    configuration_digest: &ConfigurationDigest,
+    repository: &RegistryRepository,
+    cancellation: &ProcessCancellation,
+) -> Result<(ImageRef, BuiltImage), AppError> {
+    let environment_repository = format!("{}-environment", repository.as_str());
+    let environment_ref = ImageRef::new(format!(
+        "{}:{}",
+        environment_repository,
+        short_digest(&plan.digest)
+    ))
+    .map_err(AppError::Configuration)?;
+    let environment = BuildKit::new(SystemProcessExecutor)
+        .build(
+            BuildRequest::environment(
+                &plan.template,
+                catalog_root,
+                environment_ref,
+                BuildOptions {
+                    progress: Progress::Plain,
+                    output: ImageOutput::Push,
+                    platforms: plan.request.platforms.clone(),
+                    ..BuildOptions::default()
+                },
+            ),
+            cancellation,
+        )
+        .map_err(|error| AppError::Environment(format!("multi-platform environment: {error}")))?;
+    let task = TaskImageBuilder::new(SystemProcessExecutor)
+        .build(
+            TaskImageRequest {
+                environment: &environment,
+                materialized,
+                template_id: &plan.template.template_id,
+                template_version: &plan.template.template_version,
+                platform: plan.request.platform,
+                configuration_digest,
+                created: "1970-01-01T00:00:00Z",
+                repository: repository.as_str(),
+                options: TaskImageOptions {
+                    progress: Progress::Plain,
+                    output: ImageOutput::Push,
+                    platforms: plan.request.platforms.clone(),
+                    ..TaskImageOptions::default()
+                },
+            },
+            cancellation,
+        )
+        .map_err(|error| AppError::Environment(format!("multi-platform task image: {error}")))?;
+    Ok((task.image.image.clone(), task.image))
+}
+
+fn export_verified_oci(
+    plan: &ExecutionPlan,
+    catalog_root: &Path,
+    materialized: &crate::snapshot::MaterializedSnapshot,
+    primary_environment: &BuiltImage,
+    configuration_digest: &ConfigurationDigest,
+    output: &Path,
+    cancellation: &ProcessCancellation,
+) -> Result<(), AppError> {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = tempfile::Builder::new()
+        .prefix(".repo-sandbox-oci-")
+        .tempdir_in(parent)
+        .map_err(environment("create OCI staging directory"))?;
+    let mut layouts = Vec::new();
+    for (index, platform) in plan.request.platforms.iter().copied().enumerate() {
+        let environment = if platform == plan.request.platform {
+            primary_environment.clone()
+        } else {
+            let image = ImageRef::new(format!(
+                "repo-sandbox-env:{}-{index}",
+                short_digest(&plan.digest)
+            ))
+            .map_err(AppError::Configuration)?;
+            BuildKit::new(SystemProcessExecutor)
+                .build(
+                    BuildRequest::environment(
+                        &plan.template,
+                        catalog_root,
+                        image,
+                        BuildOptions {
+                            progress: Progress::Plain,
+                            platforms: vec![platform],
+                            ..BuildOptions::default()
+                        },
+                    ),
+                    cancellation,
+                )
+                .map_err(|error| {
+                    AppError::Environment(format!("OCI environment for {platform}: {error}"))
+                })?
+        };
+        let layout = temporary.path().join(format!("platform-{index}"));
+        TaskImageBuilder::new(SystemProcessExecutor)
+            .build(
+                TaskImageRequest {
+                    environment: &environment,
+                    materialized,
+                    template_id: &plan.template.template_id,
+                    template_version: &plan.template.template_version,
+                    platform,
+                    configuration_digest,
+                    created: "1970-01-01T00:00:00Z",
+                    repository: "repo-sandbox-task-oci",
+                    options: TaskImageOptions {
+                        progress: Progress::Plain,
+                        output: ImageOutput::OciDirectory(layout.clone()),
+                        platforms: vec![platform],
+                        ..TaskImageOptions::default()
+                    },
+                },
+                cancellation,
+            )
+            .map_err(|error| AppError::Environment(format!("OCI task for {platform}: {error}")))?;
+        layouts.push((platform, layout));
+    }
+    merge_oci_layouts(&layouts, output, temporary.path())
+}
+
+fn merge_oci_layouts(
+    layouts: &[(Platform, PathBuf)],
+    output: &Path,
+    temporary_root: &Path,
+) -> Result<(), AppError> {
+    let merged = temporary_root.join("merged");
+    fs::create_dir(&merged).map_err(environment("create merged OCI layout"))?;
+    let blobs = merged.join("blobs");
+    fs::create_dir(&blobs).map_err(environment("create merged OCI blobs"))?;
+    let mut manifests = Vec::new();
+    for (platform, layout) in layouts {
+        copy_tree(&layout.join("blobs"), &blobs)?;
+        let index: serde_json::Value = serde_json::from_slice(
+            &fs::read(layout.join("index.json")).map_err(environment("read OCI index"))?,
+        )
+        .map_err(|error| AppError::Environment(format!("parse OCI index: {error}")))?;
+        let descriptors = index
+            .get("manifests")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| AppError::Environment("OCI index has no manifests".into()))?;
+        if descriptors.len() != 1 {
+            return Err(AppError::Environment(format!(
+                "single-platform OCI output for {platform} has {} descriptors",
+                descriptors.len()
+            )));
+        }
+        let mut descriptor = descriptors[0].clone();
+        descriptor["platform"] = serde_json::json!({
+            "os": "linux",
+            "architecture": match platform {
+                Platform::LinuxAmd64 => "amd64",
+                Platform::LinuxArm64 => "arm64",
+            }
+        });
+        manifests.push(descriptor);
+    }
+    fs::write(
+        merged.join("oci-layout"),
+        b"{\"imageLayoutVersion\":\"1.0.0\"}\n",
+    )
+    .map_err(environment("write OCI layout marker"))?;
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": manifests,
+    });
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(merged.join("index.json"))
+        .map_err(environment("create merged OCI index"))?;
+    file.write_all(
+        &serde_json::to_vec_pretty(&index).map_err(|error| {
+            AppError::Environment(format!("serialize merged OCI index: {error}"))
+        })?,
+    )
+    .map_err(environment("write merged OCI index"))?;
+    file.sync_all()
+        .map_err(environment("sync merged OCI index"))?;
+    drop(file);
+    fs::rename(&merged, output).map_err(environment("publish OCI layout atomically"))
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<(), AppError> {
+    for entry in fs::read_dir(source).map_err(environment("read OCI blobs"))? {
+        let entry = entry.map_err(environment("read OCI blob entry"))?;
+        let target = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .map_err(environment("inspect OCI blob entry"))?
+            .is_dir()
+        {
+            fs::create_dir_all(&target).map_err(environment("create OCI blob directory"))?;
+            copy_tree(&entry.path(), &target)?;
+        } else if !target.exists() {
+            fs::copy(entry.path(), target).map_err(environment("copy OCI blob"))?;
+        }
+    }
+    Ok(())
+}
+
 fn preflight(plan: &ExecutionPlan, repository: &Path) -> Result<(), AppError> {
     for args in [["info"].as_slice(), ["buildx", "inspect"].as_slice()] {
         let invocation = ProcessInvocation {
@@ -629,6 +894,44 @@ fn environment(operation: &'static str) -> impl FnOnce(std::io::Error) -> AppErr
 
 struct ReportReservation {
     path: PathBuf,
+}
+
+#[derive(Debug)]
+struct OciReservation {
+    path: PathBuf,
+}
+impl OciReservation {
+    fn create(output: &Path) -> Result<Self, AppError> {
+        if output.exists() {
+            return Err(AppError::Configuration(format!(
+                "OCI layout already exists: {}",
+                output.display()
+            )));
+        }
+        let parent = output.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(environment("create OCI output parent"))?;
+        let name = output
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("layout");
+        let path = parent.join(format!(".{name}.repo-sandbox-reservation"));
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                AppError::Configuration(format!(
+                    "cannot reserve OCI layout {}: {error}",
+                    output.display()
+                ))
+            })?;
+        Ok(Self { path })
+    }
+}
+impl Drop for OciReservation {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 impl ReportReservation {
     fn create(report: &Path) -> Result<Self, AppError> {
@@ -851,5 +1154,66 @@ fn remove_candidate(candidate: &CleanCandidate) -> Result<bool, String> {
         ResourceKind::Builder => {
             Err("builder cleanup requires an exact adapter ownership record".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_layout(root: &Path, digest: &str) {
+        fs::create_dir_all(root.join("blobs/sha256")).unwrap();
+        fs::write(root.join("blobs/sha256").join(digest), digest).unwrap();
+        fs::write(
+            root.join("index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "manifests": [{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": format!("sha256:{digest}"),
+                    "size": digest.len()
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn merges_platform_layouts_into_one_real_oci_index() {
+        let temporary = tempfile::tempdir().unwrap();
+        let amd64 = temporary.path().join("amd64");
+        let arm64 = temporary.path().join("arm64");
+        fake_layout(&amd64, &"a".repeat(64));
+        fake_layout(&arm64, &"b".repeat(64));
+        let output = temporary.path().join("result");
+        let staging = temporary.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+
+        merge_oci_layouts(
+            &[(Platform::LinuxAmd64, amd64), (Platform::LinuxArm64, arm64)],
+            &output,
+            &staging,
+        )
+        .unwrap();
+
+        let index: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("index.json")).unwrap()).unwrap();
+        let descriptors = index["manifests"].as_array().unwrap();
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0]["platform"]["architecture"], "amd64");
+        assert_eq!(descriptors[1]["platform"]["architecture"], "arm64");
+        assert!(output.join("blobs/sha256").join("a".repeat(64)).is_file());
+        assert!(output.join("blobs/sha256").join("b".repeat(64)).is_file());
+    }
+
+    #[test]
+    fn oci_reservation_rejects_existing_output_without_overwrite() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("layout");
+        fs::create_dir(&output).unwrap();
+        let error = OciReservation::create(&output).unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert!(output.is_dir());
     }
 }

@@ -122,6 +122,8 @@ pub struct CliOverrides {
     pub repository: Option<String>,
     pub git_ref: Option<String>,
     pub platform: Option<Platform>,
+    pub platforms: Vec<Platform>,
+    pub oci_layout: Option<PathBuf>,
     pub push: bool,
     pub report: Option<PathBuf>,
     pub keep_on_failure: bool,
@@ -133,6 +135,8 @@ pub struct ExecutionRequest {
     pub repository: Option<String>,
     pub git_ref: Option<String>,
     pub platform: Platform,
+    pub platforms: Vec<Platform>,
+    pub oci_layout: Option<PathBuf>,
     pub push: bool,
     pub report: Option<PathBuf>,
     pub keep_on_failure: bool,
@@ -143,14 +147,23 @@ impl ExecutionRequest {
     /// Resolve the finite set of runtime overrides. Repository build logic always
     /// remains in `Config` and is not copied into the override type.
     pub fn resolve(config: &Config, cli: CliOverrides) -> Self {
+        let platform = cli
+            .platform
+            .or_else(|| cli.platforms.first().copied())
+            .or_else(|| config.legacy.as_ref().map(|template| template.platform))
+            .or_else(|| config.template.platform().ok())
+            .expect("validated configurations always define a platform");
+        let platforms = if cli.platforms.is_empty() {
+            vec![platform]
+        } else {
+            cli.platforms
+        };
         Self {
             repository: cli.repository,
             git_ref: cli.git_ref,
-            platform: cli
-                .platform
-                .or_else(|| config.legacy.as_ref().map(|template| template.platform))
-                .or_else(|| config.template.platform().ok())
-                .expect("validated configurations always define a platform"),
+            platform,
+            platforms,
+            oci_layout: cli.oci_layout,
             push: cli.push,
             report: cli.report,
             keep_on_failure: cli.keep_on_failure,

@@ -60,7 +60,10 @@ pub struct RuntimeArgs {
     pub git_ref: Option<String>,
     /// Override the repository-declared target platform.
     #[arg(long, value_name = "PLATFORM")]
-    pub platform: Option<Platform>,
+    pub platform: Vec<Platform>,
+    /// Atomically export a verified OCI image layout.
+    #[arg(long = "oci-layout", value_name = "DIRECTORY")]
+    pub oci_layout: Option<PathBuf>,
     /// Push the verified task image using the central registry policy.
     #[arg(long)]
     pub push: bool,
@@ -102,7 +105,9 @@ impl From<RuntimeArgs> for CliOverrides {
         Self {
             repository: value.repository,
             git_ref: value.git_ref,
-            platform: value.platform,
+            platform: value.platform.first().copied(),
+            platforms: value.platform,
+            oci_layout: value.oci_layout,
             push: value.push,
             report: value.report,
             keep_on_failure: value.keep_on_failure,
@@ -688,7 +693,11 @@ test: [{ name: test, run: cargo test }]
             "--git-ref",
             "refs/heads/topic",
             "--platform",
+            "linux/amd64",
+            "--platform",
             "linux/arm64",
+            "--oci-layout",
+            "out/layout",
             "--push",
             "--report-path",
             "out/report.json",
@@ -705,7 +714,12 @@ test: [{ name: test, run: cargo test }]
             Some("https://example.test/repository.git")
         );
         assert_eq!(overrides.git_ref.as_deref(), Some("refs/heads/topic"));
-        assert_eq!(overrides.platform, Some(Platform::LinuxArm64));
+        assert_eq!(overrides.platform, Some(Platform::LinuxAmd64));
+        assert_eq!(
+            overrides.platforms,
+            vec![Platform::LinuxAmd64, Platform::LinuxArm64]
+        );
+        assert_eq!(overrides.oci_layout, Some(PathBuf::from("out/layout")));
         assert!(overrides.push);
         assert_eq!(overrides.report, Some(PathBuf::from("out/report.json")));
         assert!(overrides.keep_on_failure);

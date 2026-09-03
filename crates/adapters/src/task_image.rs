@@ -48,6 +48,7 @@ pub struct TaskImageOptions {
     pub cache: CacheConfig,
     pub builder: Builder,
     pub output: ImageOutput,
+    pub platforms: Vec<Platform>,
 }
 
 impl Default for TaskImageOptions {
@@ -57,6 +58,7 @@ impl Default for TaskImageOptions {
             cache: CacheConfig::default(),
             builder: Builder::default(),
             output: ImageOutput::Load,
+            platforms: Vec::new(),
         }
     }
 }
@@ -155,12 +157,17 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
         write_context(context.path(), &request, &identity)?;
 
         let environment = immutable_environment_ref(request.environment)?;
+        let platforms = if request.options.platforms.is_empty() {
+            vec![request.platform]
+        } else {
+            request.options.platforms.clone()
+        };
         let plan = TemplatePlan {
             template_id: request.template_id.to_owned(),
             template_version: request.template_version.to_owned(),
             base_image: environment,
             platform: request.platform,
-            target_platforms: vec![request.platform],
+            target_platforms: platforms.clone(),
             build_context: PathBuf::from("."),
             parameters: Default::default(),
             stages: Vec::new(),
@@ -182,6 +189,7 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
                         output: request.options.output,
                         cache: request.options.cache,
                         builder: request.options.builder,
+                        platforms,
                         build_args,
                         ..BuildOptions::default()
                     },

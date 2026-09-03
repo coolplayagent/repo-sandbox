@@ -37,6 +37,18 @@ impl ExecutionPlan {
             &serde_json::to_string(&template).expect("serializable template plan"),
         );
         hash(&mut hasher, &request.platform.to_string());
+        for platform in &request.platforms {
+            hash(&mut hasher, &platform.to_string());
+        }
+        hash(
+            &mut hasher,
+            request
+                .oci_layout
+                .as_ref()
+                .map(|path| path.to_string_lossy())
+                .as_deref()
+                .unwrap_or(""),
+        );
         hash(&mut hasher, request.repository.as_deref().unwrap_or("."));
         hash(&mut hasher, request.git_ref.as_deref().unwrap_or(""));
         hash(
