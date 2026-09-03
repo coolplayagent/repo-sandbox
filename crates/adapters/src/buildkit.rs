@@ -1220,10 +1220,14 @@ mod tests {
         &args[index + 1]
     }
 
+    fn amd64_adapter(executor: &FakeExecutor) -> BuildKit<&FakeExecutor> {
+        BuildKit::new(executor).with_native_platform(Platform::LinuxAmd64)
+    }
+
     #[test]
     fn cold_and_warm_builds_use_the_same_cache_contract_and_return_digest() {
         let executor = FakeExecutor::new(BuildBehavior::Success);
-        let adapter = BuildKit::new(&executor);
+        let adapter = amd64_adapter(&executor);
         let plan = plan();
         let options = BuildOptions {
             progress: Progress::Plain,
@@ -1352,7 +1356,7 @@ mod tests {
         assert_ne!(plan_digest(&original), plan_digest(&changed_template));
 
         let executor = FakeExecutor::new(BuildBehavior::Success);
-        let adapter = BuildKit::new(&executor);
+        let adapter = amd64_adapter(&executor);
         adapter
             .build(request(&original, BuildOptions::default()), &NeverCancelled)
             .unwrap();
@@ -1379,7 +1383,7 @@ mod tests {
     #[test]
     fn argv_keeps_platform_progress_proxy_and_build_args_structured() {
         let executor = FakeExecutor::new(BuildBehavior::Success);
-        let adapter = BuildKit::new(&executor);
+        let adapter = amd64_adapter(&executor);
         let plan = plan();
         adapter
             .build(
@@ -1460,6 +1464,39 @@ mod tests {
     }
 
     #[test]
+    fn arm64_host_native_and_cross_platform_paths_are_deterministic() {
+        let native_executor = FakeExecutor::new(BuildBehavior::Success);
+        let mut arm_plan = plan();
+        arm_plan.platform = Platform::LinuxArm64;
+        let native = BuildKit::new(&native_executor)
+            .with_native_platform(Platform::LinuxArm64)
+            .build(request(&arm_plan, BuildOptions::default()), &NeverCancelled)
+            .unwrap();
+        assert_eq!(native.platform_digests[0].platform, Platform::LinuxArm64);
+        assert_eq!(native_executor.invocations().len(), 1);
+        assert_eq!(
+            value_after(&native_executor.invocations()[0].args, "--platform"),
+            "linux/arm64"
+        );
+
+        let cross_executor = FakeExecutor::new(BuildBehavior::Success);
+        BuildKit::new(&cross_executor)
+            .with_native_platform(Platform::LinuxArm64)
+            .build(request(&plan(), BuildOptions::default()), &NeverCancelled)
+            .unwrap();
+        let cross_invocations = cross_executor.invocations();
+        assert_eq!(cross_invocations.len(), 2);
+        assert_eq!(
+            cross_invocations[0].args,
+            ["buildx", "inspect", "--bootstrap"]
+        );
+        assert_eq!(
+            value_after(&cross_invocations[1].args, "--platform"),
+            "linux/amd64"
+        );
+    }
+
+    #[test]
     fn multi_platform_load_and_duplicate_targets_fail_before_docker() {
         let executor = FakeExecutor::new(BuildBehavior::Success);
         let plan = plan();
@@ -1489,8 +1526,7 @@ mod tests {
         let executor = FakeExecutor::new(BuildBehavior::MissingCrossPlatform);
         let mut arm_plan = plan();
         arm_plan.platform = Platform::LinuxArm64;
-        let error = BuildKit::new(&executor)
-            .with_native_platform(Platform::LinuxAmd64)
+        let error = amd64_adapter(&executor)
             .build(request(&arm_plan, BuildOptions::default()), &NeverCancelled)
             .unwrap_err();
         assert!(matches!(error, BuildError::Capability(_)));
@@ -1520,7 +1556,7 @@ mod tests {
     fn buildkit_failure_preserves_reason_and_exit_code() {
         let executor = FakeExecutor::new(BuildBehavior::Failure);
         let plan = plan();
-        let error = BuildKit::new(&executor)
+        let error = amd64_adapter(&executor)
             .build(request(&plan, BuildOptions::default()), &NeverCancelled)
             .unwrap_err();
         assert_eq!(error.exit_code(), Some(42));
@@ -1535,7 +1571,7 @@ mod tests {
     fn interruption_removes_only_the_builder_created_for_this_task() {
         let executor = FakeExecutor::new(BuildBehavior::Interrupted);
         let plan = plan();
-        let error = BuildKit::new(&executor)
+        let error = amd64_adapter(&executor)
             .build(
                 request(
                     &plan,
@@ -1572,7 +1608,7 @@ mod tests {
     fn existing_builder_is_never_removed() {
         let executor = FakeExecutor::new(BuildBehavior::Failure);
         let plan = plan();
-        let _ = BuildKit::new(&executor).build(
+        let _ = amd64_adapter(&executor).build(
             request(
                 &plan,
                 BuildOptions {
@@ -1594,7 +1630,7 @@ mod tests {
     fn create_name_race_never_removes_the_unowned_builder() {
         let executor = FakeExecutor::new(BuildBehavior::CreateConflict);
         let plan = plan();
-        let error = BuildKit::new(&executor)
+        let error = amd64_adapter(&executor)
             .build(
                 request(
                     &plan,
@@ -1629,7 +1665,7 @@ mod tests {
     fn preexisting_ephemeral_name_is_rejected_without_create_or_remove() {
         let executor = FakeExecutor::new(BuildBehavior::ExistingName);
         let plan = plan();
-        let error = BuildKit::new(&executor)
+        let error = amd64_adapter(&executor)
             .build(
                 request(
                     &plan,
@@ -1656,7 +1692,7 @@ mod tests {
     fn successful_create_then_build_failure_removes_owned_builder() {
         let executor = FakeExecutor::new(BuildBehavior::Failure);
         let plan = plan();
-        let error = BuildKit::new(&executor)
+        let error = amd64_adapter(&executor)
             .build(
                 request(
                     &plan,
