@@ -145,6 +145,7 @@ pub struct PublishedImage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationFactKind {
+    RegistryPreflightStaging,
     EnvironmentStaging,
     TaskStaging,
     TaskIndexStaging,

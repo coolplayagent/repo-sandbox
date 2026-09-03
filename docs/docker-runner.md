@@ -45,8 +45,12 @@ and failed writers clean their private temporary file.
 
 Registry side effects that occur before a final multi-platform artifact exists
 are recorded separately in `publication_progress`. Each entry identifies its
-kind (`environment_staging`, `task_staging`, or `task_index_staging`), exact reference
-and digest, whether it was verified, and whether it is staging or final. The
+kind (`registry_preflight_staging`, `environment_staging`, `task_staging`, or
+`task_index_staging`), exact reference and digest, whether it was verified, and
+whether it is staging or final. The registry preflight entry represents the
+task-unique write used to prove the same daemon/Buildx publication boundary;
+registries do not provide a portable delete operation, so it is an intentional
+remote staging fact. The
 `published` field retains its narrower contract: it describes only the final
 immutable artifact and its requested aliases, so consumers never mistake a
 staging environment/task reference for the requested output.

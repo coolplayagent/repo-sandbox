@@ -1028,6 +1028,10 @@ fn ssh_environment(
 fn unauthenticated_environment(
     temporary_root: &Path,
 ) -> Result<Vec<(OsString, OsString)>, SnapshotError> {
+    let home = temporary_root.join("unauthenticated-home");
+    fs::create_dir(&home).map_err(io_error("create unauthenticated Git home"))?;
+    let global_config = temporary_root.join("unauthenticated-gitconfig");
+    fs::write(&global_config, b"").map_err(io_error("write isolated Git config"))?;
     let config = temporary_root.join("ssh-no-credentials-config");
     fs::write(
         &config,
@@ -1036,9 +1040,23 @@ fn unauthenticated_environment(
     .map_err(io_error("write unauthenticated SSH configuration"))?;
     restrict_file(&config)?;
     Ok(vec![
+        ("HOME".into(), home.as_os_str().to_owned()),
+        ("USERPROFILE".into(), home.as_os_str().to_owned()),
+        ("XDG_CONFIG_HOME".into(), home.as_os_str().to_owned()),
+        ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+        ("GIT_CONFIG_GLOBAL".into(), global_config.into_os_string()),
         ("GIT_CONFIG_COUNT".into(), "1".into()),
         ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
         ("GIT_CONFIG_VALUE_0".into(), "".into()),
+        // Anonymous mode must not leak credentials embedded in inherited proxy
+        // URLs. Callers that require a proxy must select an explicit
+        // authentication mode and provide its external credential references.
+        ("HTTP_PROXY".into(), "".into()),
+        ("HTTPS_PROXY".into(), "".into()),
+        ("ALL_PROXY".into(), "".into()),
+        ("http_proxy".into(), "".into()),
+        ("https_proxy".into(), "".into()),
+        ("all_proxy".into(), "".into()),
         (
             "GIT_SSH_COMMAND".into(),
             "ssh -F \"$REPO_SANDBOX_SSH_CONFIG\"".into(),
@@ -1400,6 +1418,13 @@ impl ProcessTree {
     }
 }
 
+#[cfg(unix)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
 #[cfg(windows)]
 pub(crate) struct ProcessTree {
     job: *mut std::ffi::c_void,
@@ -1453,6 +1478,7 @@ impl ProcessTree {
 #[cfg(windows)]
 impl Drop for ProcessTree {
     fn drop(&mut self) {
+        self.terminate();
         close_windows_handle(self.job);
     }
 }
@@ -1550,7 +1576,7 @@ mod tests {
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::process::Stdio;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
     use std::thread;
@@ -1601,17 +1627,28 @@ mod tests {
     struct LocalPublicGitHttp {
         port: u16,
         stop: Arc<AtomicBool>,
+        requests: Arc<Mutex<Vec<String>>>,
         server: Option<thread::JoinHandle<()>>,
     }
 
     impl LocalPublicGitHttp {
         fn start(root: &Path) -> Self {
+            Self::start_with_mode(root, false)
+        }
+
+        fn start_rejecting_credentials(root: &Path) -> Self {
+            Self::start_with_mode(root, true)
+        }
+
+        fn start_with_mode(root: &Path, reject_credentials: bool) -> Self {
             let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let port = listener.local_addr().unwrap().port();
             listener.set_nonblocking(true).unwrap();
             let root = root.to_owned();
             let stop = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(Mutex::new(Vec::new()));
             let thread_stop = Arc::clone(&stop);
+            let thread_requests = Arc::clone(&requests);
             let server = thread::spawn(move || {
                 let mut workers = Vec::new();
                 while !thread_stop.load(Ordering::Acquire) {
@@ -1619,8 +1656,14 @@ mod tests {
                         Ok((stream, _)) => {
                             stream.set_nodelay(true).unwrap();
                             let root = root.clone();
+                            let requests = Arc::clone(&thread_requests);
                             workers.push(thread::spawn(move || {
-                                serve_public_git_backend(stream, &root)
+                                serve_public_git_backend(
+                                    stream,
+                                    &root,
+                                    &requests,
+                                    reject_credentials,
+                                )
                             }));
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1636,6 +1679,7 @@ mod tests {
             Self {
                 port,
                 stop,
+                requests,
                 server: Some(server),
             }
         }
@@ -1653,6 +1697,10 @@ mod tests {
             );
         }
 
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+
         fn shutdown(&mut self) {
             if let Some(server) = self.server.take() {
                 self.stop.store(true, Ordering::Release);
@@ -1668,7 +1716,12 @@ mod tests {
         }
     }
 
-    fn serve_public_git_backend(mut stream: TcpStream, root: &Path) {
+    fn serve_public_git_backend(
+        mut stream: TcpStream,
+        root: &Path,
+        captured: &Arc<Mutex<Vec<String>>>,
+        reject_credentials: bool,
+    ) {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -1688,6 +1741,13 @@ mod tests {
             request.extend_from_slice(&chunk[..count]);
         };
         let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+        captured.lock().unwrap().push(headers.clone());
+        if reject_credentials {
+            let response = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=repo-sandbox-test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(response).unwrap();
+            stream.flush().unwrap();
+            return;
+        }
         let mut lines = headers.split("\r\n");
         let first = lines.next().unwrap_or_default();
         let mut fields = first.split_whitespace();
@@ -1774,7 +1834,7 @@ mod tests {
         // alive avoids a Windows loopback RST between smart-HTTP requests; the
         // client process closes it when the clone finishes, and the read
         // timeout remains a bounded fallback.
-        serve_public_git_backend(stream, root);
+        serve_public_git_backend(stream, root, captured, reject_credentials);
     }
 
     fn write_http_response(stream: &mut TcpStream, status: &str, body: &[u8]) {
@@ -2165,6 +2225,10 @@ mod tests {
             result = GitSnapshotter::default().create(&source, SnapshotOptions::default());
         }
         server.stop();
+        assert!(server.requests().iter().all(|request| {
+            let lower = request.to_ascii_lowercase();
+            !lower.contains("authorization:") && !lower.contains("cookie:")
+        }));
         let snapshot = result.unwrap();
         assert_eq!(
             fs::read_to_string(snapshot.path().join("tracked.txt"))
@@ -2176,6 +2240,84 @@ mod tests {
             snapshot.snapshot.origin,
             SnapshotOrigin::RemoteGit { .. }
         ));
+    }
+
+    #[test]
+    fn unauthenticated_remote_child_process() {
+        let Some(repository) = env::var_os("REPO_SANDBOX_UNAUTH_CHILD_URL") else {
+            return;
+        };
+        let result = GitSnapshotter::default().create(
+            &SourceSpec::RemoteGit {
+                repository: repository.to_string_lossy().into_owned(),
+                git_ref: "HEAD".into(),
+            },
+            SnapshotOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "credential trap must reject anonymous access"
+        );
+    }
+
+    #[test]
+    fn unauthenticated_remote_ignores_malicious_global_config_and_netrc() {
+        let source = repository();
+        let served = tempfile::tempdir().unwrap();
+        let bare = served.path().join("repo.git");
+        run_git(
+            served.path(),
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                source.path().to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        run_git(&bare, &["update-server-info"]);
+        let mut server = LocalPublicGitHttp::start_rejecting_credentials(served.path());
+        let malicious = tempfile::tempdir().unwrap();
+        let sentinel = malicious.path().join("helper-invoked");
+        let sentinel_text = sentinel.to_string_lossy().replace('\\', "/");
+        let config = malicious.path().join("gitconfig");
+        fs::write(
+            &config,
+            format!(
+                "[http]\n\textraHeader = Authorization: Basic should-not-leak\n[credential]\n\thelper = !echo invoked > \"{sentinel_text}\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            malicious.path().join(".netrc"),
+            "machine 127.0.0.1 login malicious password should-not-leak\n",
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "snapshot::tests::unauthenticated_remote_child_process",
+                "--nocapture",
+            ])
+            .env("REPO_SANDBOX_UNAUTH_CHILD_URL", server.repository())
+            .env("HOME", malicious.path())
+            .env("USERPROFILE", malicious.path())
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .output()
+            .unwrap();
+        server.stop();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!sentinel.exists());
+        assert!(server.requests().iter().all(|request| {
+            let lower = request.to_ascii_lowercase();
+            !lower.contains("authorization:")
+                && !lower.contains("cookie:")
+                && !lower.contains("should-not-leak")
+        }));
     }
 
     #[test]

@@ -81,13 +81,16 @@ impl WorkflowPort for SystemWorkflow {
             ReportDestination::prepare(classify_report_destination(&state, &report_path)?)?;
         let _report_reservation = OutputReservation::report(&report_path)?;
         let mut completed_report = None;
+        let mut early_publication_progress = Vec::new();
         let mut bound_state = None;
         let result = (|| {
             let (state_guard, _workflow_lease, journal) =
                 prepare_leased_workflow_state(&repository, &state, &task_id)?;
             bound_state = Some(state_guard.clone());
             let registry = plan.template.execution.registry.as_ref();
-            preflight(plan, &repository, &cancellation)?;
+            preflight(plan, &repository, &task_id, &cancellation, |fact| {
+                early_publication_progress.push(fact);
+            })?;
             let cache = state.join("cache");
             let cache_io = state_guard.bound_path(&cache)?;
             write_state_file(&cache_io.join(OWNER_MARKER), repository_id.as_bytes())?;
@@ -337,6 +340,9 @@ impl WorkflowPort for SystemWorkflow {
                         .map_err(|error| error.to_string())
                 })
                 .map_err(|error| AppError::Configuration(error.to_string()))?;
+            report
+                .publication_progress
+                .extend(early_publication_progress.clone());
 
             let mut bookkeeping_errors = Vec::new();
             if report.cleanup == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure
@@ -572,7 +578,7 @@ impl WorkflowPort for SystemWorkflow {
                 message: error.to_string(),
                 cleanup: repo_sandbox_core::runner::CleanupResult::NotNeeded,
                 published: None,
-                publication_progress: Vec::new(),
+                publication_progress: early_publication_progress.clone(),
                 container_id: None,
                 source_snapshot: None,
                 config: None,
@@ -1603,6 +1609,16 @@ fn merge_oci_layouts(
     temporary_root: &Path,
     cancellation: &dyn Cancellation,
 ) -> Result<(), AppError> {
+    merge_oci_layouts_with_hook(layouts, output, temporary_root, cancellation, || {})
+}
+
+fn merge_oci_layouts_with_hook(
+    layouts: &[(Platform, PathBuf)],
+    output: &Path,
+    temporary_root: &Path,
+    cancellation: &dyn Cancellation,
+    before_commit: impl FnOnce(),
+) -> Result<(), AppError> {
     ensure_oci_not_cancelled(cancellation)?;
     let merged = temporary_root.join("merged");
     fs::create_dir(&merged).map_err(environment("create merged OCI layout"))?;
@@ -1660,6 +1676,10 @@ fn merge_oci_layouts(
     file.sync_all()
         .map_err(environment("sync merged OCI index"))?;
     drop(file);
+    before_commit();
+    // This is the final cancellation boundary: after the no-replace rename,
+    // the requested OCI artifact is a committed external fact.
+    ensure_oci_not_cancelled(cancellation)?;
     rename_directory_no_replace(&merged, output).map_err(environment(
         "publish OCI layout atomically without replacement",
     ))
@@ -1794,7 +1814,9 @@ fn copy_tree(
 fn preflight(
     plan: &ExecutionPlan,
     repository: &Path,
+    task_id: &str,
     cancellation: &DeadlineCancellation,
+    on_publication: impl FnMut(RemotePublicationFact),
 ) -> Result<(), AppError> {
     let mut outputs = Vec::new();
     for args in [
@@ -1855,7 +1877,14 @@ fn preflight(
             .registry
             .as_ref()
             .expect("validated before preflight");
-        preflight_registry_with(&SystemProcessExecutor, &policy.repository, cancellation)?;
+        preflight_registry_with(
+            &SystemProcessExecutor,
+            &policy.repository,
+            task_id,
+            plan.request.platforms.len() > 1,
+            cancellation,
+            on_publication,
+        )?;
     }
     Ok(())
 }
@@ -1863,34 +1892,165 @@ fn preflight(
 fn preflight_registry_with(
     executor: &impl ProcessExecutor,
     repository: &str,
+    task_id: &str,
+    buildx_boundary: bool,
     cancellation: &DeadlineCancellation,
+    mut on_publication: impl FnMut(RemotePublicationFact),
 ) -> Result<(), AppError> {
-    // This intentionally runs through Docker rather than opening a socket from
-    // the CLI host. Docker therefore applies DOCKER_HOST, daemon networking,
-    // credential helpers, and proxy configuration exactly as publication does.
-    let probe_ref = format!("{repository}:repo-sandbox-preflight-{}", std::process::id());
-    let invocation = ProcessInvocation {
-        program: "docker".into(),
-        args: vec!["manifest".into(), "inspect".into(), probe_ref],
-        current_dir: None,
-    };
-    let output = executor
-        .execute(&invocation, cancellation)
-        .map_err(|error| bounded_error("registry /v2/ preflight", error, cancellation))?;
-    if registry_probe_authenticated(&output) {
-        Ok(())
+    let repository = RegistryRepository::new(repository).map_err(AppError::Configuration)?;
+    let tag = RegistryTag::new(format!("preflight-{task_id}")).map_err(AppError::Configuration)?;
+    let probe = repository.tagged(&tag);
+    let temporary = tempfile::Builder::new()
+        .prefix("repo-sandbox-registry-preflight-")
+        .tempdir()
+        .map_err(environment("create registry preflight context"))?;
+    let push = if buildx_boundary {
+        let metadata = temporary.path().join("metadata.json");
+        fs::write(
+            temporary.path().join("Dockerfile"),
+            "FROM scratch\nLABEL io.repo-sandbox.kind=registry-preflight\n",
+        )
+        .map_err(environment("write registry preflight Dockerfile"))?;
+        quota_command(
+            executor,
+            vec![
+                "buildx".into(),
+                "build".into(),
+                "--progress=plain".into(),
+                "--metadata-file".into(),
+                docker_host_path(&metadata),
+                "--output".into(),
+                format!("type=image,name={probe},push=true"),
+                docker_host_path(temporary.path()),
+            ],
+            cancellation,
+        )?
     } else {
-        Err(AppError::Environment(format!(
-            "registry /v2/ preflight authentication or reachability failed: {}",
-            output.stderr.trim()
-        )))
+        let archive = temporary.path().join("empty-rootfs.tar");
+        fs::write(&archive, [0_u8; 1024])
+            .map_err(environment("write registry preflight rootfs"))?;
+        let import = quota_command(
+            executor,
+            vec![
+                "image".into(),
+                "import".into(),
+                "--change".into(),
+                "LABEL io.repo-sandbox.kind=registry-preflight".into(),
+                docker_host_path(&archive),
+                probe.to_string(),
+            ],
+            cancellation,
+        )?;
+        quota_command_result("import registry preflight image", &import, cancellation)?;
+        quota_command(
+            executor,
+            vec!["push".into(), probe.to_string()],
+            cancellation,
+        )?
+    };
+    quota_command_result("push registry preflight image", &push, cancellation)?;
+    let digest = if buildx_boundary {
+        registry_metadata_digest(&temporary.path().join("metadata.json"))
+            .or_else(|| registry_push_digest(&push))
+    } else {
+        registry_push_digest(&push)
     }
+    .ok_or_else(|| {
+        AppError::Environment(
+            "registry preflight push succeeded without reporting an immutable digest".into(),
+        )
+    })?;
+    on_publication(RemotePublicationFact {
+        kind: PublicationFactKind::RegistryPreflightStaging,
+        reference: probe.clone(),
+        digest: digest.clone(),
+        verified: false,
+        finality: PublicationFinality::Staging,
+    });
+    let inspect = quota_command(
+        executor,
+        vec![
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            format!("{probe}@{digest}"),
+        ],
+        cancellation,
+    )?;
+    if inspect.exit_code != Some(0) {
+        return Err(AppError::Environment(format!(
+            "registry preflight pushed content but immutable verification failed: {}",
+            inspect.stderr.trim()
+        )));
+    }
+    let observed = registry_push_digest(&inspect).ok_or_else(|| {
+        AppError::Environment("registry preflight verification omitted the immutable digest".into())
+    })?;
+    if observed != digest {
+        return Err(AppError::Environment(format!(
+            "registry preflight digest mismatch: pushed {digest}, observed {observed}"
+        )));
+    }
+    on_publication(RemotePublicationFact {
+        kind: PublicationFactKind::RegistryPreflightStaging,
+        reference: probe.clone(),
+        digest,
+        verified: true,
+        finality: PublicationFinality::Staging,
+    });
+    if !buildx_boundary {
+        let cleanup = quota_command(
+            executor,
+            vec!["image".into(), "rm".into(), probe.to_string()],
+            cancellation,
+        )?;
+        quota_command_result(
+            "remove local registry preflight image",
+            &cleanup,
+            cancellation,
+        )?;
+    }
+    Ok(())
+}
+
+fn registry_metadata_digest(path: &Path) -> Option<repo_sandbox_core::build::ImageDigest> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    repo_sandbox_core::build::ImageDigest::new(
+        value.get("containerimage.digest")?.as_str()?.to_owned(),
+    )
+    .ok()
+}
+
+fn registry_push_digest(
+    output: &crate::buildkit::ProcessOutput,
+) -> Option<repo_sandbox_core::build::ImageDigest> {
+    for text in [&output.stdout, &output.stderr] {
+        for (offset, _) in text.match_indices("sha256:") {
+            let end = offset + 7 + 64;
+            if end <= text.len()
+                && let Ok(digest) =
+                    repo_sandbox_core::build::ImageDigest::new(text[offset..end].to_owned())
+            {
+                return Some(digest);
+            }
+        }
+    }
+    None
 }
 
 fn preflight_writable_layer_quota(
     executor: &impl ProcessExecutor,
     storage_mb: u32,
     cancellation: &dyn Cancellation,
+) -> Result<(), AppError> {
+    preflight_writable_layer_quota_with_identity(executor, storage_mb, cancellation, &task_id())
+}
+
+fn preflight_writable_layer_quota_with_identity(
+    executor: &impl ProcessExecutor,
+    storage_mb: u32,
+    cancellation: &dyn Cancellation,
+    identity: &str,
 ) -> Result<(), AppError> {
     let temporary = tempfile::Builder::new()
         .prefix("repo-sandbox-quota-preflight-")
@@ -1900,89 +2060,97 @@ fn preflight_writable_layer_quota(
     // a network pull or a caller-controlled image.
     let archive = temporary.path().join("empty-rootfs.tar");
     fs::write(&archive, [0_u8; 1024]).map_err(environment("write quota probe rootfs"))?;
-    let identity = task_id();
     let image = format!("repo-sandbox-quota-probe:{identity}");
     let container = format!("repo-sandbox-quota-probe-{identity}");
-    let owner = format!("repo-sandbox.quota-probe={identity}");
-    let run = |args: Vec<String>, token: &dyn Cancellation| -> Result<(), AppError> {
-        let invocation = ProcessInvocation {
-            program: "docker".into(),
-            args,
-            current_dir: None,
-        };
-        let output = executor
-            .execute(&invocation, token)
-            .map_err(environment("execute writable-layer quota preflight"))?;
-        if output.interrupted || token.is_cancelled() {
-            return Err(AppError::Environment(
-                "writable-layer quota preflight was cancelled or timed out".into(),
-            ));
-        }
-        if output.exit_code != Some(0) {
-            return Err(AppError::Environment(format!(
-                "Docker daemon does not support the required writable-layer quota: {}",
-                output.stderr.trim()
-            )));
-        }
-        Ok(())
-    };
-    let primary = (|| {
-        run(
-            vec![
-                "image".into(),
-                "import".into(),
-                "--change".into(),
-                format!("LABEL {owner}"),
-                docker_host_path(&archive),
-                image.clone(),
-            ],
-            cancellation,
-        )?;
-        run(
+    let kind_label_key = "io.repo-sandbox.kind";
+    let task_label_key = "io.repo-sandbox.task-id";
+    let kind_label = format!("{kind_label_key}=quota-probe");
+    let task_label = format!("{task_label_key}={identity}");
+    let cleanup_deadline = DeadlineCancellation::new(std::time::Duration::from_secs(30));
+    let import = quota_command(
+        executor,
+        vec![
+            "image".into(),
+            "import".into(),
+            "--change".into(),
+            format!("LABEL {kind_label} {task_label}"),
+            docker_host_path(&archive),
+            image.clone(),
+        ],
+        cancellation,
+    )?;
+    let mut primary = quota_command_result("import quota probe image", &import, cancellation);
+    let image_id = reconcile_quota_resource(
+        executor,
+        "image",
+        &image,
+        kind_label_key,
+        task_label_key,
+        identity,
+        &cleanup_deadline,
+    )?;
+    if import.exit_code == Some(0) && image_id.is_none() {
+        primary = Err(AppError::Environment(
+            "quota probe image disappeared after successful import".into(),
+        ));
+    }
+    if primary.is_ok() {
+        let create = quota_command(
+            executor,
             vec![
                 "container".into(),
                 "create".into(),
                 "--name".into(),
                 container.clone(),
                 "--label".into(),
-                owner,
+                kind_label.clone(),
+                "--label".into(),
+                task_label.clone(),
                 "--storage-opt".into(),
                 format!("size={storage_mb}m"),
                 image.clone(),
                 "/bin/true".into(),
             ],
             cancellation,
-        )
-    })();
-
-    let cleanup_deadline = DeadlineCancellation::new(std::time::Duration::from_secs(30));
+        )?;
+        primary = quota_command_result("create quota probe container", &create, cancellation);
+    }
+    // Container creation can return interruption/error before the daemon's
+    // eventual object becomes visible. Reconcile to a stable absence or an
+    // exact doubly-labelled owned ID before deciding whether removal is safe.
+    let container_id = match reconcile_quota_resource(
+        executor,
+        "container",
+        &container,
+        kind_label_key,
+        task_label_key,
+        identity,
+        &cleanup_deadline,
+    ) {
+        Ok(id) => id,
+        Err(error) => {
+            primary = Err(match primary {
+                Ok(()) => error,
+                Err(primary) => AppError::Environment(format!("{primary}; {error}")),
+            });
+            None
+        }
+    };
     let mut cleanup_errors = Vec::new();
-    for (args, absent) in [
-        (
-            vec!["container".into(), "rm".into(), "--force".into(), container],
-            "no such container",
-        ),
-        (
-            vec!["image".into(), "rm".into(), "--force".into(), image],
-            "no such image",
-        ),
-    ] {
-        let invocation = ProcessInvocation {
-            program: "docker".into(),
-            args,
-            current_dir: None,
-        };
-        match executor.execute(&invocation, &cleanup_deadline) {
-            Ok(output)
-                if output.exit_code == Some(0)
-                    || output.stderr.to_ascii_lowercase().contains(absent) => {}
-            Ok(output) => cleanup_errors.push(format!(
-                "Docker quota probe cleanup failed: {}",
-                output.stderr.trim()
-            )),
-            Err(error) => cleanup_errors.push(format!(
-                "execute Docker quota probe cleanup failed: {error}"
-            )),
+    for (kind, id) in [("container", container_id), ("image", image_id)] {
+        if let Some(id) = id {
+            match quota_command(
+                executor,
+                vec![kind.into(), "rm".into(), "--force".into(), id],
+                &cleanup_deadline,
+            ) {
+                Ok(output) if output.exit_code == Some(0) => {}
+                Ok(output) => cleanup_errors.push(format!(
+                    "Docker quota probe cleanup failed: {}",
+                    output.stderr.trim()
+                )),
+                Err(error) => cleanup_errors.push(error.to_string()),
+            }
         }
     }
     match (primary, cleanup_errors.is_empty()) {
@@ -1997,6 +2165,113 @@ fn preflight_writable_layer_quota(
             cleanup_errors.join("; ")
         ))),
     }
+}
+
+fn quota_command(
+    executor: &impl ProcessExecutor,
+    args: Vec<String>,
+    cancellation: &dyn Cancellation,
+) -> Result<crate::buildkit::ProcessOutput, AppError> {
+    executor
+        .execute(
+            &ProcessInvocation {
+                program: "docker".into(),
+                args,
+                current_dir: None,
+            },
+            cancellation,
+        )
+        .map_err(environment("execute writable-layer quota preflight"))
+}
+
+fn quota_command_result(
+    operation: &str,
+    output: &crate::buildkit::ProcessOutput,
+    cancellation: &dyn Cancellation,
+) -> Result<(), AppError> {
+    if output.interrupted || cancellation.is_cancelled() {
+        Err(AppError::Environment(
+            "writable-layer quota preflight was cancelled or timed out".into(),
+        ))
+    } else if output.exit_code == Some(0) {
+        Ok(())
+    } else {
+        Err(AppError::Environment(format!(
+            "Docker daemon does not support the required writable-layer quota during {operation}: {}",
+            output.stderr.trim()
+        )))
+    }
+}
+
+fn reconcile_quota_resource(
+    executor: &impl ProcessExecutor,
+    kind: &str,
+    name: &str,
+    kind_label_key: &str,
+    task_label_key: &str,
+    owner: &str,
+    cancellation: &dyn Cancellation,
+) -> Result<Option<String>, AppError> {
+    let format = format!(
+        "{{{{.Id}}}}|{{{{index .Config.Labels \"{kind_label_key}\"}}}}|{{{{index .Config.Labels \"{task_label_key}\"}}}}"
+    );
+    let mut consecutive_absent = 0;
+    for _ in 0..20 {
+        if cancellation.is_cancelled() {
+            return Err(AppError::Environment(format!(
+                "quota probe {kind} reconciliation was cancelled or timed out"
+            )));
+        }
+        let output = quota_command(
+            executor,
+            vec![
+                kind.into(),
+                "inspect".into(),
+                "--format".into(),
+                format.clone(),
+                name.into(),
+            ],
+            cancellation,
+        )?;
+        if output.exit_code == Some(0) {
+            let mut identity = output.stdout.trim().split('|');
+            let (id, actual_kind, actual_owner) = (
+                identity.next().unwrap_or_default(),
+                identity.next().unwrap_or_default(),
+                identity.next().unwrap_or_default(),
+            );
+            if identity.next().is_some()
+                || actual_kind != "quota-probe"
+                || actual_owner != owner
+                || !id.starts_with("sha256:")
+            {
+                return Err(AppError::Environment(format!(
+                    "refuse to remove foreign quota probe {kind} named {name}"
+                )));
+            }
+            return Ok(Some(id.to_owned()));
+        }
+        let stderr = output.stderr.to_ascii_lowercase();
+        let absent = match kind {
+            "container" => stderr.contains("no such container"),
+            "image" => stderr.contains("no such image") || stderr.contains("no such object"),
+            _ => false,
+        };
+        if !absent {
+            return Err(AppError::Environment(format!(
+                "inspect quota probe {kind} failed: {}",
+                output.stderr.trim()
+            )));
+        }
+        consecutive_absent += 1;
+        if consecutive_absent >= 3 {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    Err(AppError::Environment(format!(
+        "quota probe {kind} reconciliation did not stabilize"
+    )))
 }
 
 #[cfg(not(windows))]
@@ -2060,29 +2335,6 @@ fn workflow_available_space(
     SystemDoctorProbe
         .available_space(repository)
         .map_err(environment("disk preflight"))
-}
-
-fn registry_probe_authenticated(output: &crate::buildkit::ProcessOutput) -> bool {
-    if output.exit_code == Some(0) {
-        return true;
-    }
-    let stderr = output.stderr.to_ascii_lowercase();
-    if [
-        "unauthorized",
-        "denied",
-        "credential",
-        "connection",
-        "timeout",
-        "tls",
-    ]
-    .iter()
-    .any(|marker| stderr.contains(marker))
-    {
-        return false;
-    }
-    ["manifest unknown", "no such manifest"]
-        .iter()
-        .any(|marker| stderr.contains(marker))
 }
 
 fn repository_path(plan: &ExecutionPlan) -> Result<PathBuf, AppError> {
@@ -3099,7 +3351,12 @@ impl ExternalOciGuard {
                 ))
             })?
             .to_path_buf();
-        let output_reservation = OutputReservation::oci(&output)?;
+        let output_reservation = OutputReservation::oci(&output).map_err(|error| {
+            AppError::Configuration(format!(
+                "invalid OCI layout destination parent for {}: {error}",
+                output.display()
+            ))
+        })?;
         let parent_reservation = OutputReservation::create(&parent, "OCI layout parent")?;
         let created = create_report_parent(&parent)?;
         let handle = match bind_report_parent(&parent).map_err(|error| {
@@ -4451,6 +4708,37 @@ mod tests {
     }
 
     #[test]
+    fn oci_cancellation_at_commit_boundary_never_publishes_destination() {
+        struct Flag(std::sync::atomic::AtomicBool);
+        impl Cancellation for Flag {
+            fn is_cancelled(&self) -> bool {
+                self.0.load(std::sync::atomic::Ordering::Acquire)
+            }
+        }
+        let source_root = tempfile::tempdir().unwrap();
+        let layout = source_root.path().join("amd64");
+        fake_layout(&layout, &"a".repeat(64));
+        let destination_root = tempfile::tempdir().unwrap();
+        let output = destination_root.path().join("layout");
+        let staging = tempfile::tempdir().unwrap();
+        let cancellation = Flag(std::sync::atomic::AtomicBool::new(false));
+        let error = merge_oci_layouts_with_hook(
+            &[(Platform::LinuxAmd64, layout)],
+            &output,
+            staging.path(),
+            &cancellation,
+            || {
+                cancellation
+                    .0
+                    .store(true, std::sync::atomic::Ordering::Release)
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("OCI publication cancelled"));
+        assert!(!output.exists());
+    }
+
+    #[test]
     fn oci_primary_must_equal_the_runner_verified_manifest() {
         let image = |value: char| BuiltImage {
             image: ImageRef::new("repo-sandbox-task:test").unwrap(),
@@ -4480,7 +4768,7 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(
-            state_identity(staging.path().parent().unwrap()).unwrap(),
+            state_identity_from_handle(guard.handle.as_ref().unwrap()).unwrap(),
             state_identity(&parent).unwrap()
         );
     }
@@ -5150,57 +5438,132 @@ mod tests {
     }
 
     #[test]
-    fn registry_probe_requires_reachable_authenticated_v2_response() {
-        use crate::buildkit::ProcessOutput;
-        let output = |code, stderr: &str| ProcessOutput {
-            exit_code: code,
-            stdout: String::new(),
-            stderr: stderr.into(),
+    fn registry_preflight_uses_the_single_platform_push_boundary_and_records_remote_fact() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let success = |stdout: &str| crate::buildkit::ProcessOutput {
+            exit_code: Some(0),
+            stdout: stdout.into(),
+            stderr: String::new(),
             interrupted: false,
         };
-        assert!(registry_probe_authenticated(&output(Some(0), "")));
-        assert!(registry_probe_authenticated(&output(
-            Some(1),
-            "manifest unknown"
-        )));
-        assert!(!registry_probe_authenticated(&output(
-            Some(1),
-            "unauthorized: authentication required"
-        )));
-        assert!(!registry_probe_authenticated(&output(
-            None,
-            "connection refused"
-        )));
-        assert!(!registry_probe_authenticated(&output(
-            Some(1),
-            "credential helper executable not found"
-        )));
-        assert!(!registry_probe_authenticated(&output(
-            Some(1),
-            "unauthorized: manifest unknown"
-        )));
-    }
-
-    #[test]
-    fn registry_preflight_uses_docker_network_context_without_host_socket_probe() {
         let executor = SequenceExecutor {
             calls: std::sync::Mutex::new(Vec::new()),
             outputs: std::sync::Mutex::new(
-                [crate::buildkit::ProcessOutput {
-                    exit_code: Some(1),
-                    stdout: String::new(),
-                    stderr: "manifest unknown".into(),
-                    interrupted: false,
-                }]
+                [
+                    success(""),
+                    success(&format!("digest: {digest}")),
+                    success(&format!("Digest: {digest}")),
+                    success(""),
+                ]
                 .into(),
             ),
         };
         let deadline = DeadlineCancellation::new(std::time::Duration::from_secs(2));
-        preflight_registry_with(&executor, "localhost:5000/team/image", &deadline).unwrap();
+        let mut facts = Vec::new();
+        preflight_registry_with(
+            &executor,
+            "localhost:5000/team/image",
+            "fixture",
+            false,
+            &deadline,
+            |fact| facts.push(fact),
+        )
+        .unwrap();
         let calls = executor.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(&calls[0].args[..2], ["manifest", "inspect"]);
-        assert!(calls[0].args[2].starts_with("localhost:5000/team/image:"));
+        assert_eq!(calls.len(), 4);
+        assert_eq!(&calls[0].args[..2], ["image", "import"]);
+        assert_eq!(calls[1].args[0], "push");
+        assert_eq!(&calls[2].args[..3], ["buildx", "imagetools", "inspect"]);
+        assert_eq!(&calls[3].args[..2], ["image", "rm"]);
+        assert_eq!(facts.len(), 2);
+        assert!(!facts[0].verified);
+        assert!(facts[1].verified);
+        assert_eq!(facts[1].kind, PublicationFactKind::RegistryPreflightStaging);
+    }
+
+    #[test]
+    fn registry_preflight_uses_the_multi_platform_buildx_push_boundary() {
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let success = |stdout: &str| crate::buildkit::ProcessOutput {
+            exit_code: Some(0),
+            stdout: stdout.into(),
+            stderr: String::new(),
+            interrupted: false,
+        };
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [
+                    success(&format!("pushing manifest@{digest}")),
+                    success(&format!("Digest: {digest}")),
+                ]
+                .into(),
+            ),
+        };
+        let deadline = DeadlineCancellation::new(std::time::Duration::from_secs(2));
+        let mut facts = Vec::new();
+        preflight_registry_with(
+            &executor,
+            "localhost:5000/team/image",
+            "fixture",
+            true,
+            &deadline,
+            |fact| facts.push(fact),
+        )
+        .unwrap();
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(&calls[0].args[..2], ["buildx", "build"]);
+        assert!(
+            calls[0]
+                .args
+                .iter()
+                .any(|arg| arg.contains("type=image") && arg.contains("push=true"))
+        );
+        assert_eq!(&calls[1].args[..3], ["buildx", "imagetools", "inspect"]);
+        assert_eq!(facts.last().unwrap().digest.as_str(), digest);
+    }
+
+    #[test]
+    fn registry_preflight_retains_the_remote_fact_when_verification_fails() {
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [
+                    crate::buildkit::ProcessOutput {
+                        exit_code: Some(0),
+                        stdout: format!("pushed@{digest}"),
+                        stderr: String::new(),
+                        interrupted: false,
+                    },
+                    crate::buildkit::ProcessOutput {
+                        exit_code: Some(1),
+                        stdout: String::new(),
+                        stderr: "verification unavailable".into(),
+                        interrupted: false,
+                    },
+                ]
+                .into(),
+            ),
+        };
+        let deadline = DeadlineCancellation::new(std::time::Duration::from_secs(2));
+        let mut facts = Vec::new();
+        let error = preflight_registry_with(
+            &executor,
+            "localhost:5000/team/image",
+            "fixture",
+            true,
+            &deadline,
+            |fact| facts.push(fact),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("immutable verification failed"));
+        assert_eq!(facts.len(), 1);
+        assert!(!facts[0].verified);
+        assert_eq!(
+            facts[0].reference.as_str(),
+            "localhost:5000/team/image:preflight-fixture"
+        );
     }
 
     #[test]
@@ -5211,13 +5574,21 @@ mod tests {
             stderr: String::new(),
             interrupted: false,
         };
+        let owned = |kind: char| crate::buildkit::ProcessOutput {
+            stdout: format!(
+                "sha256:{}|quota-probe|fixture\n",
+                kind.to_string().repeat(64)
+            ),
+            ..ok()
+        };
         let executor = SequenceExecutor {
             calls: std::sync::Mutex::new(Vec::new()),
-            outputs: std::sync::Mutex::new([ok(), ok(), ok(), ok()].into()),
+            outputs: std::sync::Mutex::new([ok(), owned('a'), ok(), owned('b'), ok(), ok()].into()),
         };
-        preflight_writable_layer_quota(&executor, 384, &NeverCancelled).unwrap();
+        preflight_writable_layer_quota_with_identity(&executor, 384, &NeverCancelled, "fixture")
+            .unwrap();
         let calls = executor.calls.lock().unwrap();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 6);
         assert_eq!(&calls[0].args[..2], ["image", "import"]);
         assert!(
             calls[0]
@@ -5225,10 +5596,13 @@ mod tests {
                 .iter()
                 .any(|arg| arg.ends_with("empty-rootfs.tar"))
         );
-        assert_eq!(&calls[1].args[..2], ["container", "create"]);
-        assert!(calls[1].args.contains(&"size=384m".into()));
-        assert_eq!(&calls[2].args[..3], ["container", "rm", "--force"]);
-        assert_eq!(&calls[3].args[..3], ["image", "rm", "--force"]);
+        assert_eq!(&calls[1].args[..2], ["image", "inspect"]);
+        assert_eq!(&calls[2].args[..2], ["container", "create"]);
+        assert!(calls[2].args.contains(&"size=384m".into()));
+        assert_eq!(&calls[3].args[..2], ["container", "inspect"]);
+        assert_eq!(&calls[4].args[..3], ["container", "rm", "--force"]);
+        assert!(calls[4].args[3].starts_with("sha256:"));
+        assert_eq!(&calls[5].args[..3], ["image", "rm", "--force"]);
     }
 
     #[test]
@@ -5244,17 +5618,109 @@ mod tests {
             outputs: std::sync::Mutex::new(
                 [
                     output(0, ""),
+                    crate::buildkit::ProcessOutput {
+                        stdout: format!("sha256:{}|quota-probe|fixture\n", "a".repeat(64)),
+                        ..output(0, "")
+                    },
                     output(1, "storage quota unsupported"),
-                    output(0, ""),
+                    output(1, "No such container"),
+                    output(1, "No such container"),
+                    output(1, "No such container"),
                     output(0, ""),
                 ]
                 .into(),
             ),
         };
-        let error = preflight_writable_layer_quota(&executor, 512, &NeverCancelled).unwrap_err();
+        let error = preflight_writable_layer_quota_with_identity(
+            &executor,
+            512,
+            &NeverCancelled,
+            "fixture",
+        )
+        .unwrap_err();
         assert_eq!(error.exit_code().as_i32(), 3);
         assert!(error.to_string().contains("writable-layer quota"));
-        assert_eq!(executor.calls.lock().unwrap().len(), 4);
+        assert_eq!(executor.calls.lock().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn writable_layer_quota_never_removes_a_foreign_same_name_container() {
+        let output = |code, stdout: &str, stderr: &str| crate::buildkit::ProcessOutput {
+            exit_code: Some(code),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            interrupted: false,
+        };
+        let image_id = format!("sha256:{}", "a".repeat(64));
+        let foreign_id = format!("sha256:{}", "b".repeat(64));
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [
+                    output(0, "", ""),
+                    output(0, &format!("{image_id}|quota-probe|fixture\n"), ""),
+                    output(1, "", "name already in use"),
+                    output(0, &format!("{foreign_id}|quota-probe|foreign\n"), ""),
+                    output(0, "", ""),
+                ]
+                .into(),
+            ),
+        };
+        let error = preflight_writable_layer_quota_with_identity(
+            &executor,
+            512,
+            &NeverCancelled,
+            "fixture",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("foreign quota probe container"));
+        let calls = executor.calls.lock().unwrap();
+        assert!(!calls.iter().any(|call| {
+            call.args
+                .starts_with(&["container".into(), "rm".into(), "--force".into()])
+        }));
+        assert_eq!(calls.last().unwrap().args.last(), Some(&image_id));
+    }
+
+    #[test]
+    fn writable_layer_quota_reconciles_an_owned_container_created_after_interruption() {
+        let output = |code, stdout: &str, stderr: &str| crate::buildkit::ProcessOutput {
+            exit_code: Some(code),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            interrupted: false,
+        };
+        let image_id = format!("sha256:{}", "a".repeat(64));
+        let container_id = format!("sha256:{}", "b".repeat(64));
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [
+                    output(0, "", ""),
+                    output(0, &format!("{image_id}|quota-probe|fixture\n"), ""),
+                    crate::buildkit::ProcessOutput {
+                        interrupted: true,
+                        ..output(1, "", "interrupted")
+                    },
+                    output(1, "", "No such container"),
+                    output(0, &format!("{container_id}|quota-probe|fixture\n"), ""),
+                    output(0, "", ""),
+                    output(0, "", ""),
+                ]
+                .into(),
+            ),
+        };
+        let error = preflight_writable_layer_quota_with_identity(
+            &executor,
+            512,
+            &NeverCancelled,
+            "fixture",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled or timed out"));
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls[calls.len() - 2].args.last(), Some(&container_id));
+        assert_eq!(calls[calls.len() - 1].args.last(), Some(&image_id));
     }
 
     #[cfg(not(windows))]

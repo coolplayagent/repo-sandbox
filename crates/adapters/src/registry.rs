@@ -79,9 +79,15 @@ impl RegistryExecutor for SystemRegistryExecutor {
             let _ = child.kill();
             let _ = child.wait();
         })?;
-        if let Some(secret) = stdin {
-            child.stdin.take().expect("piped stdin").write_all(secret)?;
-        }
+        let stdin_writer = stdin.map(|secret| {
+            let mut secret = secret.to_vec();
+            let mut pipe = child.stdin.take().expect("piped stdin");
+            thread::spawn(move || {
+                let result = pipe.write_all(&secret);
+                secret.fill(0);
+                result
+            })
+        });
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let stdout_reader = thread::spawn(move || read_output(stdout));
@@ -99,6 +105,14 @@ impl RegistryExecutor for SystemRegistryExecutor {
         // A registry CLI can exit while its Buildx plugin or credential helper
         // still owns the pipes. Terminate the creation-time tree before joining.
         process_tree.terminate();
+        if let Some(writer) = stdin_writer {
+            match writer.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(io::Error::other("registry stdin writer panicked")),
+            }
+        }
         Ok(RegistryOutput {
             exit_code: status.code(),
             stdout: join_output(stdout_reader)?,
@@ -877,6 +891,63 @@ mod tests {
             .execute(&invocation, None, &ImmediatelyCancelled)
             .unwrap();
         assert!(output.interrupted);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn system_registry_executor_cancels_a_blocked_secret_stdin_writer() {
+        struct CancelSoon(std::time::Instant);
+        impl Cancellation for CancelSoon {
+            fn is_cancelled(&self) -> bool {
+                self.0.elapsed() >= Duration::from_millis(100)
+            }
+        }
+        #[cfg(unix)]
+        let invocation = RegistryInvocation {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            current_dir: None,
+        };
+        #[cfg(windows)]
+        let invocation = RegistryInvocation {
+            program: "cmd".into(),
+            args: vec![
+                "/d".into(),
+                "/s".into(),
+                "/c".into(),
+                "ping -n 30 127.0.0.1 >NUL".into(),
+            ],
+            current_dir: None,
+        };
+        let secret = vec![b'x'; 4 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let output = SystemRegistryExecutor
+            .execute(&invocation, Some(&secret), &CancelSoon(started))
+            .unwrap();
+        assert!(output.interrupted);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn system_registry_executor_bounds_broken_pipe_from_unread_secret_stdin() {
+        #[cfg(unix)]
+        let invocation = RegistryInvocation {
+            program: "sh".into(),
+            args: vec!["-c".into(), "exit 0".into()],
+            current_dir: None,
+        };
+        #[cfg(windows)]
+        let invocation = RegistryInvocation {
+            program: "cmd".into(),
+            args: vec!["/d".into(), "/c".into(), "exit 0".into()],
+            current_dir: None,
+        };
+        let secret = vec![b'x'; 4 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let output = SystemRegistryExecutor
+            .execute(&invocation, Some(&secret), &NeverCancelled)
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 

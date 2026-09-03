@@ -108,8 +108,11 @@ Before building, `build` and `verify` perform an offline, task-owned Docker
 image import/container-create probe using the configured temporary-storage
 limit. A daemon that cannot enforce `--storage-opt size=...` fails as an
 environment prerequisite (`3`); the probe container and image are removed on
-both success and failure. Registry preflight runs through Docker itself so it
-uses the selected `DOCKER_HOST`, daemon network, proxy, and credential context.
+both success and failure after their two ownership labels and exact IDs are
+verified. Registry preflight performs a task-unique real push: single-platform
+publication uses the selected Docker daemon, while multi-platform publication
+uses the selected Buildx builder. The resulting remote staging manifest cannot
+be portably deleted and is reported in `publication_progress`.
 For `clean`, dry-run, policy-excluded, and already-absent resources are a
 successful result. An active workflow lease, operator cancellation, or an owned
 image that is still referenced is unfinished work and exits `3`; inspection or
