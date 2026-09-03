@@ -18,10 +18,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const TASK_LABEL: &str = "io.repo-sandbox.task-id";
 pub const REPOSITORY_LABEL: &str = "io.repo-sandbox.repository-id";
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const CREATE_RECONCILE_ABSENCE_GRACE: Duration = Duration::from_millis(500);
 
-fn docker_absent(stderr: &str) -> bool {
+fn docker_container_absent(stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
-    stderr.contains("no such container") || stderr.contains("not found")
+    stderr.contains("no such container")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -761,22 +762,39 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
             "{{.Id}}|{{ index .Config.Labels \"io.repo-sandbox.task-id\" }}|{{ index .Config.Labels \"io.repo-sandbox.repository-id\" }}",
             &run_plan.container_name,
         ]);
-        let output = match self.executor.execute_cleanup(&inspect, CLEANUP_TIMEOUT) {
-            Ok(output) if output.exit_code == Some(0) => output,
-            Ok(output) if docker_absent(&output.stderr) => return,
-            Ok(output) => {
-                report.cleanup = CleanupResult::Failed;
-                report.cleanup_error = Some(format!(
-                    "reconcile interrupted container creation: {}",
-                    output.stderr.trim()
-                ));
-                return;
-            }
-            Err(error) => {
+        let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        let mut absence_observed_at = None;
+        let output = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 report.cleanup = CleanupResult::Failed;
                 report.cleanup_error =
-                    Some(format!("reconcile interrupted container creation: {error}"));
+                    Some("reconcile interrupted container creation timed out".into());
                 return;
+            }
+            match self.executor.execute_cleanup(&inspect, remaining) {
+                Ok(output) if output.exit_code == Some(0) => break output,
+                Ok(output) if docker_container_absent(&output.stderr) => {
+                    let first = absence_observed_at.get_or_insert_with(Instant::now);
+                    if first.elapsed() >= CREATE_RECONCILE_ABSENCE_GRACE {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Ok(output) => {
+                    report.cleanup = CleanupResult::Failed;
+                    report.cleanup_error = Some(format!(
+                        "reconcile interrupted container creation: {}",
+                        output.stderr.trim()
+                    ));
+                    return;
+                }
+                Err(error) => {
+                    report.cleanup = CleanupResult::Failed;
+                    report.cleanup_error =
+                        Some(format!("reconcile interrupted container creation: {error}"));
+                    return;
+                }
             }
         };
         let mut fields = output.stdout.trim().split('|');
@@ -1841,6 +1859,57 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("ownership labels")
+        );
+        assert_eq!(executor.invocations().len(), 3);
+    }
+
+    #[test]
+    fn interrupted_create_retries_an_initial_absence_until_owned_container_appears() {
+        let clock = FakeClock(Rc::new(Cell::new(0)));
+        let specification = spec(true);
+        let inspect = format!(
+            "late-id|{}|{}",
+            specification.task_id, specification.repository_id
+        );
+        let executor = FakeExecutor::new(
+            &clock,
+            vec![
+                output(0, "", ""),
+                timed_out(),
+                output(1, "", "Error: No such container: repo-sandbox-task-7"),
+                output(0, &inspect, ""),
+                output(0, "", ""),
+            ],
+        );
+        let report = DockerRunner::new(&executor, clock)
+            .run(&specification)
+            .unwrap();
+        assert_eq!(report.container_id.as_deref(), Some("late-id"));
+        assert_eq!(report.cleanup, CleanupResult::Removed);
+        assert_eq!(executor.invocations().len(), 5);
+    }
+
+    #[test]
+    fn interrupted_create_does_not_treat_unrelated_not_found_as_container_absence() {
+        let clock = FakeClock(Rc::new(Cell::new(0)));
+        let executor = FakeExecutor::new(
+            &clock,
+            vec![
+                output(0, "", ""),
+                timed_out(),
+                output(1, "", "credential helper not found"),
+            ],
+        );
+        let report = DockerRunner::new(&executor, clock)
+            .run(&spec(true))
+            .unwrap();
+        assert_eq!(report.cleanup, CleanupResult::Failed);
+        assert!(
+            report
+                .cleanup_error
+                .as_deref()
+                .unwrap()
+                .contains("credential helper")
         );
         assert_eq!(executor.invocations().len(), 3);
     }

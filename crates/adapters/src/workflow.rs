@@ -8,7 +8,7 @@ use crate::buildkit::{
 use crate::cancellation::{DeadlineCancellation, ProcessCancellation};
 use crate::docker_runner::{DockerExecutor, DockerRunner, SystemClock, SystemDockerExecutor};
 use crate::doctor::{DoctorProbe, SystemDoctorProbe};
-use crate::registry::{DockerRegistry, OciRegistry, SystemRegistryExecutor};
+use crate::registry::{DockerRegistry, SystemRegistryExecutor};
 use crate::snapshot::GitSnapshotter;
 use crate::task_image::{TaskImageBuilder, TaskImageOptions, TaskImageRequest};
 use repo_sandbox_core::AppError;
@@ -216,16 +216,10 @@ impl WorkflowPort for SystemWorkflow {
                 &execution_image,
                 task_image.identity.oci_value(),
             )]) {
-                let cleanup_cancellation =
-                    DeadlineCancellation::new(std::time::Duration::from_secs(30));
-                let cleanup =
-                    remove_unregistered_task_image(&execution_image, &cleanup_cancellation);
-                return Err(match cleanup {
-                    Ok(()) => primary,
-                    Err(cleanup) => AppError::Environment(format!(
-                        "{primary}; remove unregistered task image {execution_image}: {cleanup}"
-                    )),
-                });
+                return Err(registration_failure_with_safe_retention(
+                    primary,
+                    &execution_image,
+                ));
             }
 
             let execution = &plan.template.execution;
@@ -409,6 +403,7 @@ impl WorkflowPort for SystemWorkflow {
                     .iter()
                     .map(|value| RegistryTag::new(value).map_err(AppError::Configuration))
                     .collect::<Result<Vec<_>, _>>()?;
+                let mut local_seed = None;
                 let published_task = if plan.request.platforms.len() > 1 {
                     build_multi_platform_task(
                         plan,
@@ -429,10 +424,10 @@ impl WorkflowPort for SystemWorkflow {
                         &task_image.image.digest,
                         &cancellation,
                     )?;
-                    (seeded, task_image.image.clone())
+                    let reference = seeded.reference.clone();
+                    local_seed = Some(seeded);
+                    (reference, task_image.image.clone())
                 };
-                let local_seed =
-                    (plan.request.platforms.len() == 1).then(|| published_task.0.clone());
                 if plan.request.platforms.len() == 1 {
                     // The seed push is already an irreversible remote fact. Record it
                     // before alias publication/verification so a later failure report
@@ -440,27 +435,30 @@ impl WorkflowPort for SystemWorkflow {
                     report.published = Some(seeded_publication(&published_task));
                     completed_report = Some(report.clone());
                 }
+                let publish_request = PublishRequest {
+                    source: published_task.0,
+                    repository,
+                    digest: published_task.1.digest,
+                    platform_digests: published_task.1.platform_digests,
+                    aliases,
+                };
                 let publication = DockerRegistry::new(SystemRegistryExecutor)
-                    .publish(
-                        &PublishRequest {
-                            source: published_task.0,
-                            repository,
-                            digest: published_task.1.digest,
-                            platform_digests: published_task.1.platform_digests,
-                            aliases,
-                        },
-                        &cancellation,
-                    )
+                    .publish_with_progress(&publish_request, &cancellation, |published| {
+                        report.published = Some(published.clone());
+                        completed_report = Some(report.clone());
+                    })
                     .map_err(|error| bounded_error("publish", error, &cancellation))?;
                 // Publication is an irreversible remote fact. Persist it in the
                 // in-memory failure-report snapshot before attempting local tag
                 // cleanup, which is a separate best-effort cleanup phase.
                 report.published = Some(publication.clone());
                 completed_report = Some(report.clone());
-                if let Some(seed) = local_seed {
+                if let Some(seed) = local_seed
+                    && seed.owned_local_tag
+                {
                     publication_cleanup_error = apply_publication_cleanup(
                         &mut report,
-                        remove_local_registry_tag(&seed, &cancellation),
+                        remove_local_registry_tag(&seed.reference, &cancellation),
                     );
                 }
                 Some(publication)
@@ -1971,6 +1969,12 @@ fn owned_task_image_candidate(
     }
 }
 
+fn registration_failure_with_safe_retention(primary: AppError, image_id: &ImageRef) -> AppError {
+    AppError::Environment(format!(
+        "{primary}; local task image {image_id} was safely retained because concurrent identical builds may share that immutable image ID"
+    ))
+}
+
 #[cfg(test)]
 fn owned_environment_image_candidate(
     task_id: &str,
@@ -2772,9 +2776,61 @@ impl OutputReservation {
     }
 
     fn create(output: &Path, description: &str) -> Result<Self, AppError> {
-        let absolute = normalized_output_path(output)?;
+        let absolute = resolved_future_path(output)?;
+        Self::create_identity(&absolute.to_string_lossy(), output, description)
+    }
+
+    fn create_identity(
+        identity: &str,
+        display: &Path,
+        description: &str,
+    ) -> Result<Self, AppError> {
+        let file = Self::open_identity(identity, display, description)?;
+        file.try_lock().map_err(|error| {
+            AppError::Configuration(format!(
+                "cannot reserve {description} {}: {error}",
+                display.display()
+            ))
+        })?;
+        Ok(Self { _file: file })
+    }
+
+    fn wait_identity(
+        identity: &str,
+        display: &Path,
+        description: &str,
+        cancellation: &dyn Cancellation,
+    ) -> Result<Self, AppError> {
+        let file = Self::open_identity(identity, display, description)?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) if !cancellation.is_cancelled() => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(AppError::Environment(format!(
+                        "workflow cancelled while waiting to reserve {description} {}",
+                        display.display()
+                    )));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(AppError::Environment(format!(
+                        "lock {description} {}: {error}",
+                        display.display()
+                    )));
+                }
+            }
+        }
+    }
+
+    fn open_identity(
+        identity: &str,
+        display: &Path,
+        description: &str,
+    ) -> Result<fs::File, AppError> {
         let mut digest = Sha256::new();
-        digest.update(absolute.to_string_lossy().as_bytes());
+        digest.update(identity.as_bytes());
         let root = output_reservation_root()?;
         let path = root.join(format!("{:x}.lock", digest.finalize()));
         let file = OpenOptions::new()
@@ -2786,16 +2842,10 @@ impl OutputReservation {
             .map_err(|error| {
                 AppError::Environment(format!(
                     "cannot reserve {description} {}: {error}",
-                    output.display()
+                    display.display()
                 ))
             })?;
-        file.try_lock().map_err(|error| {
-            AppError::Configuration(format!(
-                "cannot reserve {description} {}: {error}",
-                output.display()
-            ))
-        })?;
-        Ok(Self { _file: file })
+        Ok(file)
     }
 }
 
@@ -3080,8 +3130,19 @@ fn seed_registry(
     repository: &RegistryRepository,
     digest: &repo_sandbox_core::build::ImageDigest,
     cancellation: &DeadlineCancellation,
-) -> Result<ImageRef, AppError> {
+) -> Result<RegistrySeed, AppError> {
     let content = registry_content_ref(repository, digest);
+    let lease = OutputReservation::wait_identity(
+        &format!("local-registry-content-tag:{content}"),
+        Path::new(content.as_str()),
+        "local registry content tag",
+        cancellation,
+    )?;
+    let source_id = inspect_local_image_id(source, cancellation)?.ok_or_else(|| {
+        AppError::Environment(format!("registry seed source image is absent: {source}"))
+    })?;
+    let existing = inspect_local_image_id(&content, cancellation)?;
+    let owned_local_tag = local_seed_tag_is_owned(&source_id, existing.as_deref(), &content)?;
     let run = |args: Vec<&str>| -> Result<(), AppError> {
         let invocation = ProcessInvocation {
             program: "docker".into(),
@@ -3104,7 +3165,9 @@ fn seed_registry(
         }
         Ok(())
     };
-    if let Err(primary) = run(vec!["image", "tag", source.as_str(), content.as_str()]) {
+    if owned_local_tag
+        && let Err(primary) = run(vec!["image", "tag", source.as_str(), content.as_str()])
+    {
         let cleanup = remove_local_registry_tag_after_cancellation(&content);
         return Err(match cleanup {
             Ok(()) => primary,
@@ -3114,15 +3177,81 @@ fn seed_registry(
         });
     }
     if let Err(primary) = run(vec!["push", content.as_str()]) {
-        let cleanup = remove_local_registry_tag_after_cancellation(&content);
-        return Err(match cleanup {
-            Ok(()) => primary,
-            Err(cleanup) => AppError::Environment(format!(
-                "{primary}; remove failed registry seed tag {content}: {cleanup}"
-            )),
-        });
+        if owned_local_tag {
+            let cleanup = remove_local_registry_tag_after_cancellation(&content);
+            return Err(match cleanup {
+                Ok(()) => primary,
+                Err(cleanup) => AppError::Environment(format!(
+                    "{primary}; remove failed registry seed tag {content}: {cleanup}"
+                )),
+            });
+        }
+        return Err(AppError::Environment(format!(
+            "{primary}; pre-existing shared local content tag {content} was safely retained"
+        )));
     }
-    Ok(content)
+    Ok(RegistrySeed {
+        reference: content,
+        owned_local_tag,
+        _lease: lease,
+    })
+}
+
+struct RegistrySeed {
+    reference: ImageRef,
+    owned_local_tag: bool,
+    _lease: OutputReservation,
+}
+
+fn local_seed_tag_is_owned(
+    source_id: &str,
+    existing_id: Option<&str>,
+    content: &ImageRef,
+) -> Result<bool, AppError> {
+    match existing_id {
+        None => Ok(true),
+        Some(existing) if existing == source_id => Ok(false),
+        Some(_) => Err(AppError::Environment(format!(
+            "refused to replace pre-existing local registry content tag {content}"
+        ))),
+    }
+}
+
+fn inspect_local_image_id(
+    reference: &ImageRef,
+    cancellation: &dyn Cancellation,
+) -> Result<Option<String>, AppError> {
+    let invocation = ProcessInvocation {
+        program: "docker".into(),
+        args: vec![
+            "image".into(),
+            "inspect".into(),
+            "--format".into(),
+            "{{.Id}}".into(),
+            reference.to_string(),
+        ],
+        current_dir: None,
+    };
+    let output = SystemProcessExecutor
+        .execute(&invocation, cancellation)
+        .map_err(environment("inspect local registry seed tag"))?;
+    if output.exit_code == Some(0) {
+        let id = output.stdout.trim();
+        if id.is_empty() {
+            Err(AppError::Environment(format!(
+                "inspect local registry seed tag returned no image ID for {reference}"
+            )))
+        } else {
+            Ok(Some(id.to_owned()))
+        }
+    } else if docker_object_absent(&output.stderr) {
+        Ok(None)
+    } else {
+        Err(AppError::Environment(format!(
+            "inspect local registry seed tag: {}",
+            output.stderr.trim()
+        )))
+    }
 }
 
 fn registry_content_ref(
@@ -3169,41 +3298,6 @@ fn remove_local_registry_tag_after_cancellation_with(
     } else {
         Err(AppError::Environment(format!(
             "remove failed registry seed tag: {}",
-            output.stderr.trim()
-        )))
-    }
-}
-
-fn remove_unregistered_task_image(
-    image_id: &ImageRef,
-    cancellation: &dyn Cancellation,
-) -> Result<(), AppError> {
-    remove_unregistered_task_image_with(&SystemProcessExecutor, image_id, cancellation)
-}
-
-fn remove_unregistered_task_image_with(
-    executor: &impl ProcessExecutor,
-    image_id: &ImageRef,
-    cancellation: &dyn Cancellation,
-) -> Result<(), AppError> {
-    let invocation = ProcessInvocation {
-        program: "docker".into(),
-        args: vec![
-            "image".into(),
-            "rm".into(),
-            "--force".into(),
-            image_id.to_string(),
-        ],
-        current_dir: None,
-    };
-    let output = executor
-        .execute(&invocation, cancellation)
-        .map_err(environment("remove unregistered task image"))?;
-    if output.exit_code == Some(0) || docker_object_absent(&output.stderr) {
-        Ok(())
-    } else {
-        Err(AppError::Environment(format!(
-            "remove unregistered task image: {}",
             output.stderr.trim()
         )))
     }
@@ -4135,6 +4229,79 @@ mod tests {
         }
     }
 
+    fn assert_aliased_output_reservations_conflict(real: &Path, alias: &Path) {
+        let _reservation = OutputReservation::report(&real.join("output")).unwrap();
+        for kind in ["report", "oci"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workflow::tests::aliased_output_reservation_process_helper",
+                    "--nocapture",
+                ])
+                .env(
+                    "REPO_SANDBOX_ALIAS_RESERVATION_OUTPUT",
+                    alias.join("output"),
+                )
+                .env("REPO_SANDBOX_ALIAS_RESERVATION_KIND", kind)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "{kind} alias acquired a distinct reservation"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_aliased_output_reservations_share_one_cross_process_lock() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        assert_aliased_output_reservations_conflict(&real, &alias);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_aliased_output_reservations_share_one_cross_process_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = root.path().join("alias");
+        assert!(
+            std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &alias.to_string_lossy(),
+                    &real.to_string_lossy()
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_aliased_output_reservations_conflict(&real, &alias);
+        fs::remove_dir(alias).unwrap();
+    }
+
+    #[test]
+    fn aliased_output_reservation_process_helper() {
+        let Some(output) = std::env::var_os("REPO_SANDBOX_ALIAS_RESERVATION_OUTPUT") else {
+            return;
+        };
+        let result = if std::env::var("REPO_SANDBOX_ALIAS_RESERVATION_KIND").as_deref() == Ok("oci")
+        {
+            OutputReservation::oci(Path::new(&output))
+        } else {
+            OutputReservation::report(Path::new(&output))
+        };
+        assert!(result.is_err());
+    }
+
     #[test]
     fn registry_probe_requires_reachable_authenticated_v2_response() {
         use crate::buildkit::ProcessOutput;
@@ -4265,17 +4432,57 @@ mod tests {
     }
 
     #[test]
-    fn unregistered_task_image_cleanup_targets_only_the_resolved_immutable_id() {
-        let executor = InspectExecutor {
-            calls: std::sync::Mutex::new(Vec::new()),
-            image_id: String::new(),
-        };
-        let image_id = ImageRef::new(format!("sha256:{}", "d".repeat(64))).unwrap();
-        remove_unregistered_task_image_with(&executor, &image_id, &NeverCancelled).unwrap();
-        assert_eq!(
-            executor.calls.lock().unwrap()[0].args,
-            ["image", "rm", "--force", image_id.as_str()].map(str::to_owned)
+    fn preexisting_shared_seed_tag_is_never_claimed_or_removed() {
+        let content = ImageRef::new("registry.test/team/task:sha256-content").unwrap();
+        assert!(!local_seed_tag_is_owned("sha256:same", Some("sha256:same"), &content).unwrap());
+        assert!(local_seed_tag_is_owned("sha256:new", None, &content).unwrap());
+        assert!(
+            local_seed_tag_is_owned("sha256:expected", Some("sha256:foreign"), &content)
+                .unwrap_err()
+                .to_string()
+                .contains("refused to replace")
         );
+    }
+
+    #[test]
+    fn identical_concurrent_seed_tags_share_one_exclusive_lease() {
+        let identity = "local-registry-content-tag:registry.test/team/task:sha256-content";
+        let display = Path::new("registry.test/team/task:sha256-content");
+        let first = OutputReservation::create_identity(identity, display, "seed").unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let lease = OutputReservation::wait_identity(
+                identity,
+                display,
+                "seed",
+                &DeadlineCancellation::new(std::time::Duration::from_secs(2)),
+            )
+            .unwrap();
+            sender.send(()).unwrap();
+            lease
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        drop(first);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        drop(second.join().unwrap());
+    }
+
+    #[test]
+    fn unregistered_shared_task_image_is_retained_instead_of_force_removed() {
+        let image_id = ImageRef::new(format!("sha256:{}", "d".repeat(64))).unwrap();
+        let error = registration_failure_with_safe_retention(
+            AppError::Environment("journal full".into()),
+            &image_id,
+        );
+        assert!(error.to_string().contains("journal full"));
+        assert!(error.to_string().contains("safely retained"));
+        assert!(error.to_string().contains(image_id.as_str()));
     }
 
     #[test]

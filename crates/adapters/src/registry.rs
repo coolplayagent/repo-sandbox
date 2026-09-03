@@ -233,6 +233,49 @@ impl<E> DockerRegistry<E> {
     }
 }
 
+impl<E: RegistryExecutor> DockerRegistry<E> {
+    /// Publish while reporting only remote references whose manifest copy and
+    /// digest/platform verification have both completed successfully.
+    pub fn publish_with_progress(
+        &self,
+        request: &PublishRequest,
+        cancellation: &dyn Cancellation,
+        mut progress: impl FnMut(&PublishedImage),
+    ) -> Result<PublishedImage, RegistryError> {
+        validate_publish(request)?;
+        let content_tag = RegistryTag::for_digest(&request.digest);
+        let immutable = request.repository.tagged(&content_tag);
+        let source = digest_ref(&request.source, &request.digest)?;
+        self.copy_manifest(&source, &immutable, &[], cancellation)?;
+        let mut published = PublishedImage {
+            immutable: immutable.clone(),
+            aliases: Vec::new(),
+            digest: request.digest.clone(),
+            platform_digests: request.platform_digests.clone(),
+        };
+        // A successful copy is an irreversible remote fact even if the
+        // following verification request fails. Surface it immediately.
+        progress(&published);
+        let inspected = self.inspect_digest(&immutable, &request.platform_digests, cancellation)?;
+        ensure_digest(&request.digest, &inspected.digest, "published content tag")?;
+        published.digest = inspected.digest;
+        published.platform_digests = inspected.platforms;
+        progress(&published);
+        for alias in &request.aliases {
+            let target = request.repository.tagged(alias);
+            let pinned = digest_ref(&immutable, &request.digest)?;
+            self.copy_manifest(&pinned, &target, &[], cancellation)?;
+            published.aliases.push(target.clone());
+            progress(&published);
+            let alias_manifest =
+                self.inspect_digest(&target, &request.platform_digests, cancellation)?;
+            ensure_digest(&request.digest, &alias_manifest.digest, "published alias")?;
+            progress(&published);
+        }
+        Ok(published)
+    }
+}
+
 impl DockerRegistry<SystemRegistryExecutor> {
     pub fn login_default(
         &self,
@@ -319,30 +362,7 @@ impl<E: RegistryExecutor> OciRegistry for DockerRegistry<E> {
         request: &PublishRequest,
         cancellation: &dyn Cancellation,
     ) -> Result<PublishedImage, RegistryError> {
-        validate_publish(request)?;
-        let content_tag = RegistryTag::for_digest(&request.digest);
-        let immutable = request.repository.tagged(&content_tag);
-        let source = digest_ref(&request.source, &request.digest)?;
-        self.copy_manifest(&source, &immutable, &[], cancellation)?;
-        let inspected = self.inspect_digest(&immutable, &request.platform_digests, cancellation)?;
-        ensure_digest(&request.digest, &inspected.digest, "published content tag")?;
-
-        let mut aliases = Vec::with_capacity(request.aliases.len());
-        for alias in &request.aliases {
-            let target = request.repository.tagged(alias);
-            let pinned = digest_ref(&immutable, &request.digest)?;
-            self.copy_manifest(&pinned, &target, &[], cancellation)?;
-            let alias_manifest =
-                self.inspect_digest(&target, &request.platform_digests, cancellation)?;
-            ensure_digest(&request.digest, &alias_manifest.digest, "published alias")?;
-            aliases.push(target);
-        }
-        Ok(PublishedImage {
-            immutable,
-            aliases,
-            digest: inspected.digest,
-            platform_digests: inspected.platforms,
-        })
+        self.publish_with_progress(request, cancellation, |_| {})
     }
 
     fn pull_and_verify(
@@ -857,6 +877,15 @@ mod tests {
         }
     }
 
+    fn failed(stderr: impl Into<String>) -> RegistryOutput {
+        RegistryOutput {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: stderr.into(),
+            interrupted: false,
+        }
+    }
+
     fn multiarch() -> String {
         format!(
             r#"{{"schemaVersion":2,"manifests":[{{"digest":"{AMD}","platform":{{"os":"linux","architecture":"amd64"}}}},{{"digest":"{ARM}","platform":{{"os":"linux","architecture":"arm64","variant":"v8"}}}}]}}
@@ -993,6 +1022,106 @@ mod tests {
                 .iter()
                 .any(|arg| arg == &format!("registry.test/source/image:build@{}", root_digest()))
         );
+    }
+
+    #[test]
+    fn single_manifest_publication_progress_retains_verified_immutable_on_alias_failure() {
+        let executor = FakeExecutor::new(vec![
+            ok(""),
+            ok(described()),
+            ok(single_manifest()),
+            failed("alias copy denied"),
+        ]);
+        let registry = DockerRegistry::new(executor);
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/source/image:build").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: vec![PlatformDigest {
+                platform: Platform::LinuxAmd64,
+                digest: root_digest(),
+            }],
+            aliases: vec![RegistryTag::new("latest").unwrap()],
+        };
+        let mut observed = Vec::new();
+        assert!(
+            registry
+                .publish_with_progress(&request, &NeverCancelled, |state| observed
+                    .push(state.clone()))
+                .is_err()
+        );
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed.last().unwrap().digest, root_digest());
+        assert!(observed.last().unwrap().aliases.is_empty());
+    }
+
+    #[test]
+    fn multi_manifest_publication_progress_retains_each_verified_alias_before_later_failure() {
+        let executor = FakeExecutor::new(vec![
+            ok(""),
+            ok(described()),
+            ok(multiarch()),
+            ok(""),
+            ok(described()),
+            ok(multiarch()),
+            ok(""),
+            failed("alias inspect transport failure"),
+        ]);
+        let registry = DockerRegistry::new(executor);
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/source/image:build").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: platform_digests(),
+            aliases: vec![
+                RegistryTag::new("stable").unwrap(),
+                RegistryTag::new("latest").unwrap(),
+            ],
+        };
+        let mut observed = Vec::new();
+        assert!(
+            registry
+                .publish_with_progress(&request, &NeverCancelled, |state| observed
+                    .push(state.clone()))
+                .is_err()
+        );
+        assert_eq!(observed.len(), 5);
+        assert!(observed[0].aliases.is_empty());
+        assert_eq!(observed[3].aliases.len(), 1);
+        assert!(observed[3].aliases[0].as_str().ends_with(":stable"));
+        assert_eq!(observed.last().unwrap().aliases.len(), 2);
+        assert!(
+            observed.last().unwrap().aliases[1]
+                .as_str()
+                .ends_with(":latest")
+        );
+        assert_eq!(
+            observed.last().unwrap().platform_digests,
+            platform_digests()
+        );
+    }
+
+    #[test]
+    fn immutable_copy_fact_is_reported_even_when_its_verification_transport_fails() {
+        let executor = FakeExecutor::new(vec![ok(""), failed("inspect timed out")]);
+        let registry = DockerRegistry::new(executor);
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/source/image:build").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: platform_digests(),
+            aliases: Vec::new(),
+        };
+        let mut observed = Vec::new();
+        assert!(
+            registry
+                .publish_with_progress(&request, &NeverCancelled, |state| observed
+                    .push(state.clone()))
+                .is_err()
+        );
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].digest, request.digest);
+        assert_eq!(observed[0].platform_digests, request.platform_digests);
     }
 
     #[test]
