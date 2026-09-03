@@ -49,6 +49,9 @@ grep -Fq 'verify-glibc-baseline.sh" "$temporary/repo-sandbox" 2.28' \
 grep -Fq 'raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-glibc-baseline.sh' \
   "$release"
 grep -Fq 'version=$(scripts/ci/workspace-version.sh)' "$ci"
+grep -Fq 'docker buildx inspect "$builder" --bootstrap' "$ci"
+grep -Fq "Platforms:.*linux/amd64" "$ci"
+grep -Fq 'REPO_SANDBOX_E2E_PROFILE_SECRET: repo-sandbox-ci-profile-secret-not-a-credential' "$ci"
 ! grep -Fq "grep -Fx 'repo-sandbox 0.1.0'" "$ci"
 grep -Fq 'bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh' "$ci"
 grep -Fq 'publish-release.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" release "$GITHUB_SHA"' "$release"

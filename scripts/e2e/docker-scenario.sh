@@ -473,7 +473,7 @@ EOF
     ;;
   cli-profile-contracts)
     profile_root=$(mktemp -d)
-    profile_secret="repo-sandbox-profile-secret-$RANDOM-$RANDOM"
+    profile_secret=${REPO_SANDBOX_E2E_PROFILE_SECRET:-repo-sandbox-profile-secret-$RANDOM-$RANDOM}
     cleanup_profile_fixtures() { rm -rf -- "$profile_root"; }
     trap cleanup_profile_fixtures EXIT
     export REPO_SANDBOX_ENABLE_ACCEPTANCE_PROFILES=1
