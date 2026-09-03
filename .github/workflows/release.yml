@@ -48,6 +48,10 @@ jobs:
           RELEASE_TAG: ${{ steps.requested.outputs.tag }}
         run: |
           commit=$(git rev-parse HEAD)
+          if [[ $GITHUB_EVENT_NAME == workflow_dispatch && $GITHUB_SHA != "$commit" ]]; then
+            echo "manual release must be dispatched with --ref $RELEASE_TAG" >&2
+            exit 1
+          fi
           git -C "$GITHUB_WORKSPACE" -c "safe.directory=$GITHUB_WORKSPACE" \
             merge-base --is-ancestor "$commit" origin/main
           GITHUB_SHA=$commit scripts/ci/validate-release-inputs.sh "$RELEASE_TAG"

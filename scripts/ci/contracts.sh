@@ -62,6 +62,8 @@ grep -Fq 'download-release-artifacts.sh "${{ needs.prepare.outputs.tag }}" "$GIT
 grep -Fq 'workflow_dispatch:' "$release"
 grep -Fq "group: release-\${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}" "$release"
 grep -Fq 'ref: refs/tags/${{ steps.requested.outputs.tag }}' "$release"
+grep -Fq '[[ $GITHUB_EVENT_NAME == workflow_dispatch && $GITHUB_SHA != "$commit" ]]' "$release"
+grep -Fq 'manual release must be dispatched with --ref $RELEASE_TAG' "$release"
 grep -Fq 'merge-base --is-ancestor "$commit" origin/main' "$release"
 grep -Fq 'subject-checksums: release/SHA256SUMS' "$release"
 grep -Fq 'artifact-metadata: write' "$release"

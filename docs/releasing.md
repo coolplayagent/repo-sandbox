@@ -30,7 +30,13 @@ cache entries cannot become release inputs.
 The same existing tag can be selected through `workflow_dispatch` for an
 operator-controlled retry. Manual dispatch does not broaden the release set:
 the tag must still be canonical, resolve to the version declared by the tagged
-tree, and point to a commit already contained in `origin/main`.
+tree, and point to a commit already contained in `origin/main`. Dispatch the
+workflow from that same tag so the artifact attestation is bound to the tagged
+commit, for example:
+
+```bash
+gh workflow run release.yml --ref v0.1.0 -f tag=v0.1.0
+```
 
 The tag workflow validates that the tagged commit is already on `origin/main`,
 the tag is canonical, and all version declarations match before it builds
