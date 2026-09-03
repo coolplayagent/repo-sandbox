@@ -148,7 +148,7 @@ impl WorkflowPort for SystemWorkflow {
                 .tempdir()
                 .map_err(environment("create environment OCI staging"))?;
             let environment_layout = environment_export.path().join("layout");
-            let environment_image = BuildKit::new(SystemProcessExecutor)
+            let environment_result = BuildKit::new(SystemProcessExecutor)
                 .build(
                     BuildRequest::environment(
                         &plan.template,
@@ -166,7 +166,13 @@ impl WorkflowPort for SystemWorkflow {
                     ),
                     &cancellation,
                 )
-                .map_err(|error| bounded_error("environment image", error, &cancellation))?;
+                .map_err(|error| bounded_error("environment image", error, &cancellation));
+            let environment_image = match environment_result {
+                Ok(image) => image,
+                Err(primary) => {
+                    return Err(clean_failed_cache_export(&cache_export, primary));
+                }
+            };
             if cache_export.exists() {
                 rotate_cache_export(&cache_io, &cache_export, &cache_import, &cancellation)?;
             }
@@ -1311,12 +1317,8 @@ fn build_multi_platform_task(
             digest: task.image.digest,
         });
     }
-    let index = ImageRef::new(format!(
-        "{}:multi-{}",
-        repository.as_str(),
-        short_digest(&plan.digest)
-    ))
-    .map_err(AppError::Configuration)?;
+    let index =
+        multi_platform_index_ref(repository, &plan.digest, materialized.snapshot.id.as_str())?;
     let digest = create_multi_platform_index(&index, &sources, cancellation)?;
     Ok((
         index.clone(),
@@ -1326,6 +1328,20 @@ fn build_multi_platform_task(
             platform_digests: task_manifests,
         },
     ))
+}
+
+fn multi_platform_index_ref(
+    repository: &RegistryRepository,
+    plan_digest: &str,
+    source_digest: &str,
+) -> Result<ImageRef, AppError> {
+    ImageRef::new(format!(
+        "{}:multi-{}-{}",
+        repository.as_str(),
+        short_digest(plan_digest),
+        short_digest(source_digest)
+    ))
+    .map_err(AppError::Configuration)
 }
 
 #[allow(clippy::too_many_arguments)] // Keeps every immutable export input explicit at the port boundary.
@@ -1557,9 +1573,7 @@ fn preflight(
             )));
         }
     }
-    let free = SystemDoctorProbe
-        .available_space(repository)
-        .map_err(environment("disk preflight"))?;
+    let free = workflow_available_space(repository, cancellation)?;
     let required = (1024_u64 * 1024 * 1024)
         .max(u64::from(plan.template.execution.resources.temporary_storage_mb) * 2 * 1024 * 1024);
     if free < required {
@@ -1603,6 +1617,69 @@ fn preflight(
         }
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn workflow_available_space(
+    repository: &Path,
+    cancellation: &dyn Cancellation,
+) -> Result<u64, AppError> {
+    workflow_available_space_with(&SystemProcessExecutor, repository, cancellation)
+}
+
+#[cfg(not(windows))]
+fn workflow_available_space_with(
+    executor: &impl ProcessExecutor,
+    repository: &Path,
+    cancellation: &dyn Cancellation,
+) -> Result<u64, AppError> {
+    let invocation = ProcessInvocation {
+        program: "df".into(),
+        args: vec!["-Pk".into(), repository.to_string_lossy().into_owned()],
+        current_dir: None,
+    };
+    let output = executor
+        .execute(&invocation, cancellation)
+        .map_err(environment("execute disk preflight"))?;
+    if output.interrupted {
+        return Err(AppError::Environment("disk preflight was cancelled".into()));
+    }
+    if output.exit_code != Some(0) {
+        return Err(AppError::Environment(format!(
+            "disk preflight failed: {}",
+            output.stderr.trim()
+        )));
+    }
+    parse_df_available_space(&output.stdout)
+}
+
+#[cfg(not(windows))]
+fn parse_df_available_space(stdout: &str) -> Result<u64, AppError> {
+    let line = stdout
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .ok_or_else(|| AppError::Environment("disk preflight returned no data".into()))?;
+    let kib = line
+        .split_whitespace()
+        .nth(3)
+        .ok_or_else(|| AppError::Environment("disk preflight returned invalid data".into()))?
+        .parse::<u64>()
+        .map_err(|error| AppError::Environment(format!("disk preflight invalid bytes: {error}")))?;
+    kib.checked_mul(1024)
+        .ok_or_else(|| AppError::Environment("disk preflight byte count overflowed".into()))
+}
+
+#[cfg(windows)]
+fn workflow_available_space(
+    repository: &Path,
+    cancellation: &dyn Cancellation,
+) -> Result<u64, AppError> {
+    if cancellation.is_cancelled() {
+        return Err(AppError::Environment("disk preflight was cancelled".into()));
+    }
+    SystemDoctorProbe
+        .available_space(repository)
+        .map_err(environment("disk preflight"))
 }
 
 fn registry_probe_authenticated(output: &crate::buildkit::ProcessOutput) -> bool {
@@ -1805,6 +1882,17 @@ fn short_digest(value: &str) -> &str {
 
 fn task_cache_export(cache: &Path, task_id: &str) -> PathBuf {
     cache.join(format!("environment-next-{task_id}"))
+}
+
+fn clean_failed_cache_export(path: &Path, primary: AppError) -> AppError {
+    match fs::remove_dir_all(path) {
+        Ok(()) => primary,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => primary,
+        Err(error) => AppError::Environment(format!(
+            "{primary}; remove failed task cache export {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 fn owned_task_image_candidate(
@@ -2665,13 +2753,37 @@ impl ManifestJournal {
 fn next_journal_sequence(root: &Path) -> Result<u64, AppError> {
     fs::create_dir_all(root).map_err(environment("create journal directory"))?;
     let path = root.join(".sequence");
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const O_NOFOLLOW: i32 = 0x0002_0000;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        const O_NOFOLLOW: i32 = 0x0000_0100;
+        options.custom_flags(O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
         .open(&path)
         .map_err(environment("open journal sequence"))?;
+    let metadata = file
+        .metadata()
+        .map_err(environment("inspect journal sequence"))?;
+    if is_link_or_reparse(&metadata)
+        || !metadata.is_file()
+        || !state_file_has_single_link(&file, &metadata)
+    {
+        return Err(AppError::Environment(
+            "journal sequence must be a single-link regular file".into(),
+        ));
+    }
     file.lock().map_err(environment("lock journal sequence"))?;
     let mut text = String::new();
     file.read_to_string(&mut text)
@@ -2694,6 +2806,50 @@ fn next_journal_sequence(root: &Path) -> Result<u64, AppError> {
     file.sync_all()
         .map_err(environment("sync journal sequence"))?;
     Ok(next)
+}
+
+#[cfg(unix)]
+fn state_file_has_single_link(_file: &fs::File, metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() == 1
+}
+
+#[cfg(windows)]
+fn state_file_has_single_link(file: &fs::File, _metadata: &fs::Metadata) -> bool {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    struct FileInformation {
+        attributes: u32,
+        creation: FileTime,
+        access: FileTime,
+        write: FileTime,
+        volume: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut c_void,
+            information: *mut FileInformation,
+        ) -> i32;
+    }
+    let mut information = std::mem::MaybeUninit::<FileInformation>::uninit();
+    // SAFETY: the file handle remains valid for the call and the output points
+    // to correctly sized writable storage initialized by Kernel32 on success.
+    let success = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    success != 0 && unsafe { information.assume_init() }.links == 1
 }
 
 fn new_event_sequence(path: &Path) -> Option<u64> {
@@ -3195,6 +3351,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_task_cache_cleanup_removes_only_its_unique_export() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let failed = task_cache_export(&cache, "failed-task");
+        let sibling = task_cache_export(&cache, "concurrent-task");
+        fs::create_dir_all(&failed).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(failed.join("partial"), "partial").unwrap();
+        fs::write(sibling.join("complete"), "complete").unwrap();
+        let primary = AppError::Environment("environment image: interrupted".into());
+        let returned = clean_failed_cache_export(&failed, primary);
+        assert!(
+            returned
+                .to_string()
+                .contains("environment image: interrupted")
+        );
+        assert!(!failed.exists());
+        assert_eq!(
+            fs::read_to_string(sibling.join("complete")).unwrap(),
+            "complete"
+        );
+    }
+
+    #[test]
     fn multi_platform_environment_stays_in_the_configured_repository() {
         let repository = RegistryRepository::new("registry.test/team/task").unwrap();
         let reference =
@@ -3204,6 +3384,16 @@ mod tests {
             format!("registry.test/team/task:environment-{}", "a".repeat(24))
         );
         assert!(!reference.as_str().contains("task-environment"));
+    }
+
+    #[test]
+    fn multi_platform_staging_index_is_unique_per_source_snapshot() {
+        let repository = RegistryRepository::new("registry.test/team/task").unwrap();
+        let plan = format!("sha256:{}", "a".repeat(64));
+        let first = multi_platform_index_ref(&repository, &plan, &"b".repeat(64)).unwrap();
+        let second = multi_platform_index_ref(&repository, &plan, &"c".repeat(64)).unwrap();
+        assert_ne!(first, second);
+        assert!(first.as_str().starts_with("registry.test/team/task:multi-"));
     }
 
     #[test]
@@ -3460,7 +3650,7 @@ mod tests {
         assert!(!result.complete());
         assert_eq!(result.absent, vec![missing.display().to_string()]);
         assert_eq!(result.failed.len(), 1);
-        assert!(result.failed[0].contains("workflow state component"));
+        assert!(result.failed[0].contains("workflow state component must be a real directory"));
         assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unchanged");
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
         fs::remove_file(tasks).unwrap();
@@ -3657,6 +3847,27 @@ mod tests {
             Some(1),
             "unauthorized: manifest unknown"
         )));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn disk_preflight_propagates_cancellation_from_its_subprocess() {
+        let executor = FixedExecutor(crate::buildkit::ProcessOutput {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            interrupted: true,
+        });
+        let error =
+            workflow_available_space_with(&executor, Path::new("."), &NeverCancelled).unwrap_err();
+        assert!(error.to_string().contains("disk preflight was cancelled"));
+        assert_eq!(
+            parse_df_available_space(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/test 100 20 80 20% /"
+            )
+            .unwrap(),
+            80 * 1024
+        );
     }
 
     #[test]
@@ -4312,6 +4523,55 @@ mod tests {
         sequences.sort_unstable();
         assert_eq!(sequences, (1..=40).collect::<Vec<_>>());
         assert_eq!(next_journal_sequence(root.path()).unwrap(), 41);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_sequence_symlink_never_overwrites_external_file() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), "sentinel").unwrap();
+        symlink(outside.path(), root.path().join(".sequence")).unwrap();
+        assert!(next_journal_sequence(root.path()).is_err());
+        assert_eq!(fs::read_to_string(outside.path()).unwrap(), "sentinel");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn journal_sequence_junction_never_writes_external_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, "unchanged").unwrap();
+        let sequence = root.path().join(".sequence");
+        assert!(
+            std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &sequence.to_string_lossy(),
+                    &outside.path().to_string_lossy(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(next_journal_sequence(root.path()).is_err());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unchanged");
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+        fs::remove_dir(sequence).unwrap();
+    }
+
+    #[test]
+    fn journal_sequence_hardlink_never_overwrites_external_file() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), "sentinel").unwrap();
+        fs::hard_link(outside.path(), root.path().join(".sequence")).unwrap();
+        assert!(next_journal_sequence(root.path()).is_err());
+        assert_eq!(fs::read_to_string(outside.path()).unwrap(), "sentinel");
     }
 
     #[test]
