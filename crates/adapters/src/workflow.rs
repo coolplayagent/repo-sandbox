@@ -66,6 +66,14 @@ impl WorkflowPort for SystemWorkflow {
                 .clone()
                 .unwrap_or_else(|| state.join("reports").join(format!("{task_id}.json"))),
         )?;
+        if let Some(output) = plan.request.oci_layout.as_deref() {
+            resolved_future_path(output).map_err(|error| {
+                AppError::Configuration(format!(
+                    "invalid OCI layout destination parent for {}: {error}",
+                    output.display()
+                ))
+            })?;
+        }
         validate_output_path_overlap(plan)?;
         validate_state_outputs(&state, &report_path, plan.request.oci_layout.as_deref())?;
         // Finish every pure plan validation before creating an explicit report
@@ -1931,7 +1939,6 @@ fn preflight_registry_with(
         ),
     )
     .map_err(environment("write registry preflight Dockerfile"))?;
-    let cleanup_deadline = DeadlineCancellation::new(std::time::Duration::from_secs(30));
     let mut primary = None;
     let mut push_attempted = buildx_boundary;
     let push = if buildx_boundary {
@@ -1991,6 +1998,7 @@ fn preflight_registry_with(
             }
         }
     };
+    let cleanup_deadline = PostCancellationDeadline::new(registry_reconciliation_timeout());
     let reported = match push {
         Ok(output) => {
             let observed = if let Some(digest) = if buildx_boundary {
@@ -2028,19 +2036,24 @@ fn preflight_registry_with(
         }
     };
     if push_attempted {
-        match reconcile_registry_manifest(executor, &probe, &cleanup_deadline) {
-            Ok(Some(observed)) => {
-                if reported.as_ref().is_some_and(|digest| digest != &observed) {
-                    add_primary_error(
-                        &mut primary,
-                        AppError::Environment(format!(
-                            "registry preflight digest mismatch: reported {}, observed {observed}",
-                            reported.as_ref().expect("checked")
-                        )),
-                    );
+        match reconcile_registry_manifest(executor, &probe, task_id, &cleanup_deadline) {
+            Ok(Some(observed)) => match &reported {
+                Some(expected) if expected == &observed => {
+                    on_publication(registry_preflight_fact(&probe, observed, true));
                 }
-                on_publication(registry_preflight_fact(&probe, observed, true));
-            }
+                Some(expected) => add_primary_error(
+                    &mut primary,
+                    AppError::Environment(format!(
+                        "registry preflight digest mismatch: reported {expected}, observed {observed}"
+                    )),
+                ),
+                None => add_primary_error(
+                    &mut primary,
+                    AppError::Environment(format!(
+                        "registry preflight observed {observed} but cannot attribute it without the task's expected digest"
+                    )),
+                ),
+            },
             Ok(None) => {
                 if primary.is_none() {
                     add_primary_error(
@@ -2056,6 +2069,8 @@ fn preflight_registry_with(
         }
     }
     if !buildx_boundary {
+        let local_cleanup_deadline =
+            PostCancellationDeadline::new(std::time::Duration::from_secs(30));
         let local_id = reconcile_quota_resource(
             executor,
             "image",
@@ -2064,19 +2079,21 @@ fn preflight_registry_with(
             "io.repo-sandbox.kind",
             "io.repo-sandbox.task-id",
             task_id,
-            &cleanup_deadline,
+            &local_cleanup_deadline,
         );
+        let local_removal_deadline =
+            PostCancellationDeadline::new(std::time::Duration::from_secs(30));
         match local_id {
             Ok(Some(id)) => match quota_command(
                 executor,
                 vec!["image".into(), "rm".into(), "--force".into(), id],
-                &cleanup_deadline,
+                &local_removal_deadline,
             ) {
                 Ok(output) => {
                     if let Err(error) = quota_command_result(
                         "remove local registry preflight image",
                         &output,
-                        &cleanup_deadline,
+                        &local_removal_deadline,
                     ) {
                         add_primary_error(&mut primary, error);
                     }
@@ -2093,13 +2110,22 @@ fn preflight_registry_with(
 fn reconcile_registry_manifest(
     executor: &impl ProcessExecutor,
     probe: &ImageRef,
+    task_id: &str,
     cancellation: &dyn Cancellation,
 ) -> Result<Option<repo_sandbox_core::build::ImageDigest>, AppError> {
-    let mut consecutive_absent = 0;
+    let mut saw_only_absence = true;
     let mut last_error = String::new();
-    for _ in 0..20 {
+    let mut delay = registry_reconciliation_initial_delay();
+    let mut observed = None;
+    for _ in 0..10 {
         if cancellation.is_cancelled() {
-            break;
+            return if saw_only_absence {
+                Ok(None)
+            } else {
+                Err(AppError::Environment(format!(
+                    "registry preflight reconciliation did not stabilize: {last_error}"
+                )))
+            };
         }
         match quota_command(
             executor,
@@ -2112,32 +2138,76 @@ fn reconcile_registry_manifest(
             cancellation,
         ) {
             Ok(output) if output.exit_code == Some(0) => {
-                return registry_push_digest(&output).map(Some).ok_or_else(|| {
+                observed = Some(registry_push_digest(&output).ok_or_else(|| {
                     AppError::Environment(
                         "registry preflight reconciliation omitted the immutable digest".into(),
                     )
-                });
+                })?);
+                break;
             }
             Ok(output) if registry_manifest_absent(&output.stderr) => {
-                consecutive_absent += 1;
-                if consecutive_absent >= 3 {
-                    return Ok(None);
-                }
+                last_error = output.stderr.trim().to_owned();
             }
             Ok(output) => {
-                consecutive_absent = 0;
+                saw_only_absence = false;
                 last_error = output.stderr.trim().to_owned();
             }
             Err(error) => {
-                consecutive_absent = 0;
+                saw_only_absence = false;
                 last_error = error.to_string();
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(std::time::Duration::from_secs(1));
     }
-    Err(AppError::Environment(format!(
-        "registry preflight reconciliation did not stabilize: {last_error}"
-    )))
+    let Some(digest) = observed else {
+        return if saw_only_absence {
+            Ok(None)
+        } else {
+            Err(AppError::Environment(format!(
+                "registry preflight reconciliation did not stabilize: {last_error}"
+            )))
+        };
+    };
+    let identity = quota_command(
+        executor,
+        vec![
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            "--format".into(),
+            "{{json .Image.Config.Labels}}".into(),
+            format!("{probe}@{digest}"),
+        ],
+        cancellation,
+    )?;
+    if identity.exit_code != Some(0) || !registry_probe_labels_match(&identity.stdout, task_id) {
+        return Err(AppError::Environment(
+            "registry preflight manifest has foreign or unverifiable ownership labels".into(),
+        ));
+    }
+    Ok(Some(digest))
+}
+
+fn registry_reconciliation_initial_delay() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        std::time::Duration::ZERO
+    }
+    #[cfg(not(test))]
+    {
+        std::time::Duration::from_millis(50)
+    }
+}
+
+fn registry_probe_labels_match(value: &str, task_id: &str) -> bool {
+    let Ok(labels) =
+        serde_json::from_str::<std::collections::BTreeMap<String, String>>(value.trim())
+    else {
+        return false;
+    };
+    labels.get("io.repo-sandbox.kind").map(String::as_str) == Some("registry-preflight")
+        && labels.get("io.repo-sandbox.task-id").map(String::as_str) == Some(task_id)
 }
 
 fn registry_preflight_fact(
@@ -2154,6 +2224,17 @@ fn registry_preflight_fact(
     }
 }
 
+fn registry_reconciliation_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        std::time::Duration::from_millis(250)
+    }
+    #[cfg(not(test))]
+    {
+        std::time::Duration::from_secs(30)
+    }
+}
+
 fn registry_manifest_absent(stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
     stderr.contains("manifest unknown") || stderr.contains("no such manifest")
@@ -2164,6 +2245,26 @@ fn add_primary_error(primary: &mut Option<AppError>, error: AppError) {
         Some(existing) => AppError::Environment(format!("{existing}; {error}")),
         None => error,
     });
+}
+
+/// A bounded reconciliation/cleanup budget that deliberately ignores the
+/// already-consumed process Ctrl-C flag.
+struct PostCancellationDeadline {
+    deadline: std::time::Instant,
+}
+
+impl PostCancellationDeadline {
+    fn new(timeout: std::time::Duration) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + timeout,
+        }
+    }
+}
+
+impl Cancellation for PostCancellationDeadline {
+    fn is_cancelled(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
 }
 
 fn registry_metadata_digest(path: &Path) -> Option<repo_sandbox_core::build::ImageDigest> {
@@ -2215,7 +2316,6 @@ fn preflight_writable_layer_quota_with_identity(
     let task_label_key = "io.repo-sandbox.task-id";
     let kind_label = format!("{kind_label_key}=quota-probe");
     let task_label = format!("{task_label_key}={identity}");
-    let cleanup_deadline = DeadlineCancellation::new(std::time::Duration::from_secs(30));
     let dockerfile = temporary.path().join("Dockerfile");
     fs::write(
         &dockerfile,
@@ -2241,6 +2341,8 @@ fn preflight_writable_layer_quota_with_identity(
         ),
         Err(error) => (Err(error), false),
     };
+    let image_reconcile_deadline =
+        PostCancellationDeadline::new(std::time::Duration::from_secs(30));
     let image_id = reconcile_quota_resource(
         executor,
         "image",
@@ -2249,7 +2351,7 @@ fn preflight_writable_layer_quota_with_identity(
         kind_label_key,
         task_label_key,
         identity,
-        &cleanup_deadline,
+        &image_reconcile_deadline,
     )?;
     if build_succeeded && image_id.is_none() {
         primary = Err(AppError::Environment(
@@ -2282,6 +2384,7 @@ fn preflight_writable_layer_quota_with_identity(
             Err(error) => Err(error),
         };
     }
+    let cleanup_deadline = PostCancellationDeadline::new(std::time::Duration::from_secs(30));
     // Container creation can return interruption/error before the daemon's
     // eventual object becomes visible. Reconcile to a stable absence or an
     // exact doubly-labelled owned ID before deciding whether removal is safe.
@@ -2304,13 +2407,14 @@ fn preflight_writable_layer_quota_with_identity(
             None
         }
     };
+    let removal_deadline = PostCancellationDeadline::new(std::time::Duration::from_secs(30));
     let mut cleanup_errors = Vec::new();
     for (kind, id) in [("container", container_id), ("image", image_id)] {
         if let Some(id) = id {
             match quota_command(
                 executor,
                 vec![kind.into(), "rm".into(), "--force".into(), id],
-                &cleanup_deadline,
+                &removal_deadline,
             ) {
                 Ok(output) if output.exit_code == Some(0) => {}
                 Ok(output) => cleanup_errors.push(format!(
@@ -4717,6 +4821,15 @@ mod tests {
         >,
     }
 
+    #[test]
+    fn post_cancellation_budget_is_fresh_and_bounded() {
+        let fresh = PostCancellationDeadline::new(std::time::Duration::from_secs(60));
+        let expired = PostCancellationDeadline::new(std::time::Duration::ZERO);
+
+        assert!(!fresh.is_cancelled());
+        assert!(expired.is_cancelled());
+    }
+
     impl ProcessExecutor for SequenceExecutor {
         fn execute(
             &self,
@@ -5648,6 +5761,9 @@ mod tests {
                     success(""),
                     success(&format!("digest: {digest}")),
                     success(&format!("Digest: {digest}")),
+                    success(
+                        r#"{"io.repo-sandbox.kind":"registry-preflight","io.repo-sandbox.task-id":"fixture"}"#,
+                    ),
                     success(&format!(
                         "sha256:{}|registry-preflight|fixture",
                         "d".repeat(64)
@@ -5669,12 +5785,13 @@ mod tests {
         )
         .unwrap();
         let calls = executor.calls.lock().unwrap();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 6);
         assert_eq!(calls[0].args[0], "build");
         assert_eq!(calls[1].args[0], "push");
         assert_eq!(&calls[2].args[..3], ["buildx", "imagetools", "inspect"]);
-        assert_eq!(&calls[3].args[..2], ["image", "inspect"]);
-        assert_eq!(&calls[4].args[..3], ["image", "rm", "--force"]);
+        assert_eq!(&calls[3].args[..3], ["buildx", "imagetools", "inspect"]);
+        assert_eq!(&calls[4].args[..2], ["image", "inspect"]);
+        assert_eq!(&calls[5].args[..3], ["image", "rm", "--force"]);
         assert_eq!(facts.len(), 2);
         assert!(!facts[0].verified);
         assert!(facts[1].verified);
@@ -5696,6 +5813,9 @@ mod tests {
                 [
                     success(&format!("pushing manifest@{digest}")),
                     success(&format!("Digest: {digest}")),
+                    success(
+                        r#"{"io.repo-sandbox.kind":"registry-preflight","io.repo-sandbox.task-id":"fixture"}"#,
+                    ),
                 ]
                 .into(),
             ),
@@ -5780,12 +5900,18 @@ mod tests {
                     crate::buildkit::ProcessOutput {
                         exit_code: Some(1),
                         stdout: String::new(),
-                        stderr: "connection closed after upload".into(),
+                        stderr: format!("connection closed after upload digest: {digest}"),
                         interrupted: false,
                     },
                     crate::buildkit::ProcessOutput {
                         exit_code: Some(0),
                         stdout: format!("Digest: {digest}"),
+                        stderr: String::new(),
+                        interrupted: false,
+                    },
+                    crate::buildkit::ProcessOutput {
+                        exit_code: Some(0),
+                        stdout: r#"{"io.repo-sandbox.kind":"registry-preflight","io.repo-sandbox.task-id":"fixture"}"#.into(),
                         stderr: String::new(),
                         interrupted: false,
                     },
@@ -5805,9 +5931,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("push registry preflight image"));
+        assert_eq!(facts.len(), 2);
+        assert!(!facts[0].verified);
+        assert!(facts[1].verified);
+        assert_eq!(facts[1].digest.as_str(), digest);
+    }
+
+    #[test]
+    fn registry_preflight_waits_for_delayed_visibility_and_rejects_foreign_labels() {
+        let digest = format!("sha256:{}", "e".repeat(64));
+        let output = |code, stdout: &str, stderr: &str| crate::buildkit::ProcessOutput {
+            exit_code: Some(code),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            interrupted: false,
+        };
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [
+                    output(0, &format!("pushed@{digest}"), ""),
+                    output(1, "", "manifest unknown"),
+                    output(1, "", "manifest unknown"),
+                    output(0, &format!("Digest: {digest}"), ""),
+                    output(
+                        0,
+                        r#"{"io.repo-sandbox.kind":"registry-preflight","io.repo-sandbox.task-id":"foreign"}"#,
+                        "",
+                    ),
+                ]
+                .into(),
+            ),
+        };
+        let deadline = DeadlineCancellation::new(std::time::Duration::from_secs(2));
+        let mut facts = Vec::new();
+        let error = preflight_registry_with(
+            &executor,
+            "localhost:5000/team/image",
+            "fixture",
+            true,
+            &deadline,
+            |fact| facts.push(fact),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("foreign or unverifiable ownership")
+        );
         assert_eq!(facts.len(), 1);
-        assert!(facts[0].verified);
-        assert_eq!(facts[0].digest.as_str(), digest);
+        assert!(!facts[0].verified);
     }
 
     #[test]
@@ -5825,6 +5998,13 @@ mod tests {
                 [
                     output(0, "", ""),
                     output(1, "", "push failed"),
+                    output(1, "", "manifest unknown"),
+                    output(1, "", "manifest unknown"),
+                    output(1, "", "manifest unknown"),
+                    output(1, "", "manifest unknown"),
+                    output(1, "", "manifest unknown"),
+                    output(1, "", "manifest unknown"),
+                    output(1, "", "manifest unknown"),
                     output(1, "", "manifest unknown"),
                     output(1, "", "manifest unknown"),
                     output(1, "", "manifest unknown"),
@@ -5846,7 +6026,11 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("push registry preflight image"));
         let calls = executor.calls.lock().unwrap();
-        assert_eq!(calls.last().unwrap().args.last(), Some(&image_id));
+        assert_eq!(
+            calls.last().unwrap().args.last(),
+            Some(&image_id),
+            "calls: {calls:?}"
+        );
     }
 
     #[test]
