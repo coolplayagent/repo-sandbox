@@ -124,6 +124,12 @@ impl<E> TaskImageBuilder<E> {
             buildkit: BuildKit::new(executor),
         }
     }
+
+    #[cfg(test)]
+    fn with_native_platform(mut self, platform: Platform) -> Self {
+        self.buildkit = self.buildkit.with_native_platform(platform);
+        self
+    }
 }
 
 impl<E: ProcessExecutor> TaskImageBuilder<E> {
@@ -518,12 +524,14 @@ mod tests {
         let config = config();
         let executor = InspectingExecutor::new();
         let first = TaskImageBuilder::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
             .build(
                 request(&environment, &materialized, &config),
                 &NeverCancelled,
             )
             .unwrap();
         let second = TaskImageBuilder::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
             .build(
                 request(&environment, &materialized, &config),
                 &NeverCancelled,
@@ -540,6 +548,33 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["--build-arg", "TASK_CONFIG_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]));
         assert!(args.windows(2).any(|pair| pair == ["--build-arg", "BASE_IMAGE=repo-sandbox/environment:stable@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]));
         assert_eq!(value_after(args, "--target"), "task");
+    }
+
+    #[test]
+    fn arm64_host_and_task_target_use_the_native_build_path() {
+        let (_repository, materialized) = materialize(&[("source.rs", "safe")]);
+        let environment = environment();
+        let config = config();
+        let executor = InspectingExecutor::new();
+        let mut arm_request = request(&environment, &materialized, &config);
+        arm_request.platform = Platform::LinuxArm64;
+
+        let built = TaskImageBuilder::new(&executor)
+            .with_native_platform(Platform::LinuxArm64)
+            .build(arm_request, &NeverCancelled)
+            .unwrap();
+
+        assert_eq!(
+            built.image.platform_digests[0].platform,
+            Platform::LinuxArm64
+        );
+        let invocations = executor.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            value_after(&invocations[0].args, "--platform"),
+            "linux/arm64"
+        );
+        assert!(!invocations[0].args.contains(&"--bootstrap".to_owned()));
     }
 
     #[test]
@@ -651,6 +686,7 @@ mod tests {
         let config = config();
         let executor = InspectingExecutor::new();
         let first = TaskImageBuilder::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
             .build(
                 request(&environment, &materialized, &config),
                 &NeverCancelled,
@@ -659,6 +695,7 @@ mod tests {
         let mut changed = request(&environment, &materialized, &config);
         changed.created = "2026-09-01T00:00:01Z";
         let second = TaskImageBuilder::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
             .build(changed, &NeverCancelled)
             .unwrap();
         assert_ne!(first.identity, second.identity);
