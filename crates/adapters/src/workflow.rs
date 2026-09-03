@@ -952,11 +952,7 @@ fn preflight(
         let output = SystemProcessExecutor
             .execute(&invocation, cancellation)
             .map_err(environment("registry /v2/ preflight"))?;
-        let stderr = output.stderr.to_ascii_lowercase();
-        let authenticated_missing = ["manifest unknown", "no such manifest", "not found"]
-            .iter()
-            .any(|marker| stderr.contains(marker));
-        if output.exit_code != Some(0) && !authenticated_missing {
+        if !registry_probe_authenticated(&output) {
             return Err(AppError::Environment(format!(
                 "registry /v2/ preflight authentication or reachability failed: {}",
                 output.stderr.trim()
@@ -964,6 +960,16 @@ fn preflight(
         }
     }
     Ok(())
+}
+
+fn registry_probe_authenticated(output: &crate::buildkit::ProcessOutput) -> bool {
+    if output.exit_code == Some(0) {
+        return true;
+    }
+    let stderr = output.stderr.to_ascii_lowercase();
+    ["manifest unknown", "no such manifest", "not found"]
+        .iter()
+        .any(|marker| stderr.contains(marker))
 }
 
 fn repository_path(plan: &ExecutionPlan) -> Result<PathBuf, AppError> {
@@ -1406,5 +1412,29 @@ mod tests {
         let error = OciReservation::create(&output).unwrap_err();
         assert!(error.to_string().contains("already exists"));
         assert!(output.is_dir());
+    }
+
+    #[test]
+    fn registry_probe_requires_reachable_authenticated_v2_response() {
+        use crate::buildkit::ProcessOutput;
+        let output = |code, stderr: &str| ProcessOutput {
+            exit_code: code,
+            stdout: String::new(),
+            stderr: stderr.into(),
+            interrupted: false,
+        };
+        assert!(registry_probe_authenticated(&output(Some(0), "")));
+        assert!(registry_probe_authenticated(&output(
+            Some(1),
+            "manifest unknown"
+        )));
+        assert!(!registry_probe_authenticated(&output(
+            Some(1),
+            "unauthorized: authentication required"
+        )));
+        assert!(!registry_probe_authenticated(&output(
+            None,
+            "connection refused"
+        )));
     }
 }

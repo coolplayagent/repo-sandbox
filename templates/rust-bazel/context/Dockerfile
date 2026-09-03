@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 ARG BASE_IMAGE=docker.io/library/rust:1.97.0-bookworm
 
 # The official Rust image is intentionally confined to the assembly stage. Its

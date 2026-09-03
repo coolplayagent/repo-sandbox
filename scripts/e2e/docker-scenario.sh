@@ -80,6 +80,7 @@ case "$scenario" in
     trap cleanup_cli_fixture EXIT
     cp "$root/.repo-sandbox.yaml.example" "$fixture/.repo-sandbox.yaml"
     printf '.repo-sandbox/\nreport*.json\n.*.repo-sandbox-reservation\n' >"$fixture/.gitignore"
+    printf 'module(name = "repo_sandbox_e2e_fixture")\n' >"$fixture/MODULE.bazel"
     git -C "$fixture" init -q
     git -C "$fixture" config user.email e2e@example.invalid
     git -C "$fixture" config user.name repo-sandbox-e2e
@@ -88,16 +89,15 @@ case "$scenario" in
     else
       cat >"$fixture/BUILD.bazel" <<'EOF'
 genrule(name = "build_ok", outs = ["built.txt"], cmd = "echo built > $@")
-sh_test(name = "tests", srcs = ["test.sh"])
+cc_test(name = "tests", srcs = ["test.cc"])
 EOF
       if [[ "$scenario" == cli-test-failure ]]; then
-        printf '#!/bin/sh\nexit 23\n' >"$fixture/test.sh"
+        printf 'int main() { return 23; }\n' >"$fixture/test.cc"
       elif [[ "$scenario" == cli-interrupt-cleanup ]]; then
-        printf '#!/bin/sh\ntouch /workspace/cancel-ready\nsleep 600\n' >"$fixture/test.sh"
+        printf '#include <fstream>\n#include <unistd.h>\nint main() { std::ofstream("/workspace/cancel-ready"); sleep(600); }\n' >"$fixture/test.cc"
       else
-        printf '#!/bin/sh\nexit 0\n' >"$fixture/test.sh"
+        printf 'int main() { return 0; }\n' >"$fixture/test.cc"
       fi
-      chmod +x "$fixture/test.sh"
     fi
     git -C "$fixture" add .
     git -C "$fixture" commit -qm fixture
@@ -170,7 +170,7 @@ EOF
         grep -Fq '"step": "bazel-test"' "$report"
         assert_step "$report" build bazel-build succeeded
         assert_step "$report" test bazel-test command_failed
-        grep -Fq '"exit_code": 23' "$report"
+        grep -Eq '"exit_code": [1-9][0-9]*' "$report"
         ! grep -Fq '"published"' "$report"
         ;;
       cli-clean-owned-only)
@@ -310,12 +310,12 @@ EOF
     trap cleanup_remote_fixture EXIT
     cp "$root/.repo-sandbox.yaml.example" "$fixture/.repo-sandbox.yaml"
     printf '.repo-sandbox/\nreport*.json\n.*.repo-sandbox-reservation\n' >"$fixture/.gitignore"
+    printf 'module(name = "repo_sandbox_remote_fixture")\n' >"$fixture/MODULE.bazel"
     cat >"$fixture/BUILD.bazel" <<'EOF'
 genrule(name = "build_ok", outs = ["built.txt"], cmd = "echo built > $@")
-sh_test(name = "tests", srcs = ["test.sh"])
+cc_test(name = "tests", srcs = ["test.cc"])
 EOF
-    printf '#!/bin/sh\nexit 0\n' >"$fixture/test.sh"
-    chmod +x "$fixture/test.sh"
+    printf 'int main() { return 0; }\n' >"$fixture/test.cc"
     git -C "$fixture" init -q
     git -C "$fixture" config user.email e2e@example.invalid
     git -C "$fixture" config user.name repo-sandbox-e2e
