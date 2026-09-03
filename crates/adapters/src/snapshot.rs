@@ -1241,14 +1241,17 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(arguments)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
         .envs(environment.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_process_tree(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|error| SnapshotError::Git(format!("could not execute Git: {error}")))?;
     let stdout = child.stdout.take().expect("Git stdout is piped");
@@ -1265,7 +1268,7 @@ where
     });
     let status = loop {
         if cancellation.is_cancelled() {
-            let _ = child.kill();
+            terminate_process_tree(&mut child);
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
@@ -1294,6 +1297,37 @@ where
         stdout,
         stderr,
     })
+}
+
+#[cfg(unix)]
+fn configure_process_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_process_tree(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    let process_group = -(child.id() as i32);
+    // SAFETY: the child was placed in a distinct process group whose id is its
+    // pid; a negative pid targets only that group.
+    let _ = unsafe { kill(process_group, SIGKILL) };
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
 }
 
 fn io_error(operation: &'static str) -> impl FnOnce(std::io::Error) -> SnapshotError {
@@ -1658,6 +1692,30 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("cancelled or timed out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_terminates_descendants_that_hold_git_output_pipes() {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = std::time::Instant::now();
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let reader = thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut stdout = stdout;
+            stdout.read_to_end(&mut output).unwrap();
+        });
+        terminate_process_tree(&mut child);
+        child.wait().unwrap();
+        reader.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(unix)]

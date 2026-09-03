@@ -1038,12 +1038,7 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
                 stderr_bytes: Vec::new(),
             });
         }
-        let secrets = spec
-            .secret_mounts
-            .iter()
-            .filter_map(|secret| std::fs::read(&secret.source).ok())
-            .filter(|secret| !secret.is_empty())
-            .collect::<Vec<_>>();
+        let secrets = load_redaction_secrets(&spec.secret_mounts)?;
         if secrets.is_empty() {
             return self.executor.execute_streaming(
                 invocation,
@@ -1132,6 +1127,26 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
         report.duration_ms = ended.monotonic_ms.saturating_sub(started.monotonic_ms);
         report
     }
+}
+
+fn load_redaction_secrets(
+    mounts: &[repo_sandbox_core::runner::SecretMount],
+) -> io::Result<Vec<Vec<u8>>> {
+    mounts
+        .iter()
+        .map(|secret| {
+            std::fs::read(&secret.source).and_then(|value| {
+                if value.is_empty() {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("secret redaction source is empty: {}", secret.environment),
+                    ))
+                } else {
+                    Ok(value)
+                }
+            })
+        })
+        .collect()
 }
 
 fn infrastructure(operation: impl Into<String>, message: impl Into<String>) -> RunStatus {
@@ -1395,6 +1410,21 @@ mod tests {
             !String::from_utf8_lossy(&sink.stdout.lock().unwrap()).contains("token-super-secret")
         );
         assert!(json.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn unreadable_secret_redaction_source_fails_closed_before_step_execution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("removed-secret");
+        fs::write(&source, "secret-value").unwrap();
+        let mount = SecretMount {
+            environment: "TOKEN".into(),
+            source: source.clone(),
+        };
+        fs::remove_file(source).unwrap();
+        let error = load_redaction_secrets(&[mount]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!error.to_string().contains("secret-value"));
     }
 
     #[test]

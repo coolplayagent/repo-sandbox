@@ -58,13 +58,18 @@ impl WorkflowPort for SystemWorkflow {
         let repository_id = repository_id_for_plan(plan, &repository)?;
         let state = state_root(plan, &repository, &repository_id);
         validate_state_root(&repository, &state)?;
-        let report_path = plan
-            .request
-            .report
-            .clone()
-            .unwrap_or_else(|| state.join("reports").join(format!("{task_id}.json")));
+        let report_path = normalized_output_path(
+            &plan
+                .request
+                .report
+                .clone()
+                .unwrap_or_else(|| state.join("reports").join(format!("{task_id}.json"))),
+        )?;
         validate_output_path_overlap(plan)?;
         validate_state_outputs(&state, &report_path, plan.request.oci_layout.as_deref())?;
+        if plan.request.report.is_some() && !path_is_within_state(&state, &report_path)? {
+            validate_report_destination(&report_path)?;
+        }
         let _report_reservation = OutputReservation::report(&report_path)?;
         let mut completed_report = None;
         let mut bound_state = None;
@@ -469,11 +474,7 @@ impl WorkflowPort for SystemWorkflow {
             annotate_report(&mut report);
             completed_report = Some(report.clone());
 
-            let report_io = if report_path.starts_with(&state) {
-                state_guard.bound_path(&report_path)?
-            } else {
-                report_path.clone()
-            };
+            let report_io = bound_state_path(&bound_state, &state, &report_path)?;
             write_report_json(&report, &report_io).map_err(environment("write atomic report"))?;
             let result = WorkflowResult {
                 plan_digest: plan.digest.clone(),
@@ -592,7 +593,7 @@ fn optional_failure_report_path(
     state: &Path,
     report: &Path,
 ) -> Result<Option<PathBuf>, AppError> {
-    if bound_state.is_none() && report.starts_with(state) {
+    if bound_state.is_none() && path_is_within_state(state, report)? {
         return Ok(None);
     }
     bound_state_path(bound_state, state, report).map(Some)
@@ -1566,7 +1567,83 @@ fn merge_oci_layouts(
     file.sync_all()
         .map_err(environment("sync merged OCI index"))?;
     drop(file);
-    fs::rename(&merged, output).map_err(environment("publish OCI layout atomically"))
+    rename_directory_no_replace(&merged, output).map_err(environment(
+        "publish OCI layout atomically without replacement",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn rename_directory_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    const AT_FDCWD: i32 = -100;
+    const RENAME_NOREPLACE: u32 = 1;
+    unsafe extern "C" {
+        fn renameat2(
+            olddirfd: i32,
+            oldpath: *const std::ffi::c_char,
+            newdirfd: i32,
+            newpath: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in OCI source"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in OCI destination")
+    })?;
+    // SAFETY: both C strings remain alive for the syscall and file descriptors
+    // use the documented AT_FDCWD sentinel.
+    if unsafe {
+        renameat2(
+            AT_FDCWD,
+            source.as_ptr(),
+            AT_FDCWD,
+            destination.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_directory_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    const RENAME_EXCL: u32 = 0x4;
+    unsafe extern "C" {
+        fn renamex_np(
+            old: *const std::ffi::c_char,
+            new: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in OCI source"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in OCI destination")
+    })?;
+    // SAFETY: both C strings remain alive for the libc call.
+    if unsafe { renamex_np(source.as_ptr(), destination.as_ptr(), RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_directory_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if destination.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "OCI destination already exists",
+        ));
+    }
+    fs::rename(source, destination)
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), AppError> {
@@ -2667,14 +2744,47 @@ fn bound_state_path(
     state: &Path,
     path: &Path,
 ) -> Result<PathBuf, AppError> {
-    if path.starts_with(state) {
+    let resolved_state = resolved_future_path(state)?;
+    let resolved_path = resolved_future_path(path)?;
+    if let Ok(relative) = resolved_path.strip_prefix(&resolved_state) {
         guard
             .as_ref()
             .ok_or_else(|| AppError::Environment("workflow state is not bound".into()))?
-            .bound_path(path)
+            .bound_path(&state.join(relative))
     } else {
         Ok(path.to_path_buf())
     }
+}
+
+fn path_is_within_state(state: &Path, path: &Path) -> Result<bool, AppError> {
+    Ok(resolved_future_path(path)?.starts_with(resolved_future_path(state)?))
+}
+
+fn validate_report_destination(report: &Path) -> Result<(), AppError> {
+    let parent = report.parent().ok_or_else(|| {
+        AppError::Configuration(format!("report path has no parent: {}", report.display()))
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        AppError::Configuration(format!(
+            "cannot prepare report destination {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let probe = tempfile::Builder::new()
+        .prefix(".repo-sandbox-report-probe-")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            AppError::Configuration(format!(
+                "report destination is not writable {}: {error}",
+                parent.display()
+            ))
+        })?;
+    probe.as_file().sync_all().map_err(|error| {
+        AppError::Configuration(format!(
+            "report destination cannot persist files {}: {error}",
+            parent.display()
+        ))
+    })
 }
 
 fn write_state_file(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
@@ -3631,6 +3741,23 @@ mod tests {
         assert_eq!(descriptors[1]["platform"]["architecture"], "arm64");
         assert!(output.join("blobs/sha256").join("a".repeat(64)).is_file());
         assert!(output.join("blobs/sha256").join("b".repeat(64)).is_file());
+    }
+
+    #[test]
+    fn oci_publication_never_replaces_a_late_noncooperating_destination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let amd64 = temporary.path().join("amd64");
+        fake_layout(&amd64, &"a".repeat(64));
+        let output = temporary.path().join("result");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("sentinel"), "unchanged").unwrap();
+        let staging = temporary.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        assert!(merge_oci_layouts(&[(Platform::LinuxAmd64, amd64)], &output, &staging).is_err());
+        assert_eq!(
+            fs::read_to_string(output.join("sentinel")).unwrap(),
+            "unchanged"
+        );
     }
 
     #[test]
@@ -4666,6 +4793,30 @@ mod tests {
             None
         );
         assert!(!state.exists());
+    }
+
+    #[test]
+    fn relative_state_report_is_classified_by_resolved_identity() {
+        let current = std::env::current_dir().unwrap();
+        let state = current.join(".repo-sandbox");
+        assert!(
+            path_is_within_state(&state, Path::new(".repo-sandbox/reports/result.json")).unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_report_parent_fails_before_workflow_side_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let file_parent = root.path().join("Cargo.toml");
+        fs::write(&file_parent, "not a directory").unwrap();
+        let report = file_parent.join("result.json");
+        let error = validate_report_destination(&report).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot prepare report destination")
+        );
+        assert_eq!(fs::read_to_string(file_parent).unwrap(), "not a directory");
     }
 
     #[test]
