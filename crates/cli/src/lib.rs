@@ -371,6 +371,10 @@ fn prepare_execution_cancellable(
     mut arguments: RuntimeArgs,
     cancellation: &dyn repo_sandbox_adapters::buildkit::Cancellation,
 ) -> Result<ExecutionPlan, AppError> {
+    arguments.git_ssh_private_key =
+        canonicalize_credential_path(arguments.git_ssh_private_key.take(), "SSH private key")?;
+    arguments.git_ssh_known_hosts =
+        canonicalize_credential_path(arguments.git_ssh_known_hosts.take(), "SSH known_hosts")?;
     if arguments.recurse_submodules && arguments.git_https_token_env.is_some() {
         return Err(AppError::Configuration(
             "--recurse-submodules with --git-https-token-env requires separately scoped submodule credentials, which are not supported in v1".into(),
@@ -433,6 +437,21 @@ fn prepare_execution_cancellable(
     execution_plan_from_source(&source, arguments)
 }
 
+fn canonicalize_credential_path(
+    path: Option<PathBuf>,
+    description: &str,
+) -> Result<Option<PathBuf>, AppError> {
+    path.map(|path| {
+        path.canonicalize().map_err(|error| {
+            AppError::Configuration(format!(
+                "cannot resolve {description} {}: {error}",
+                path.display()
+            ))
+        })
+    })
+    .transpose()
+}
+
 fn preparation_phase(error: &AppError) -> &'static str {
     match error {
         AppError::Configuration(_) => "configuration",
@@ -455,6 +474,7 @@ fn write_cli_failure_report(
         message: error.to_string(),
         cleanup: repo_sandbox_core::runner::CleanupResult::NotNeeded,
         published: None,
+        publication_progress: Vec::new(),
         container_id: None,
         source_snapshot: None,
         config: None,
@@ -746,6 +766,19 @@ mod tests {
     }
 
     #[test]
+    fn relative_ssh_credential_paths_are_resolved_from_invocation_directory() {
+        let resolved =
+            canonicalize_credential_path(Some(PathBuf::from("Cargo.toml")), "SSH private key")
+                .unwrap()
+                .unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(
+            resolved,
+            PathBuf::from("Cargo.toml").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
     fn only_cancellation_aware_commands_install_the_interrupt_handler() {
         for command in ["doctor", "plan"] {
             let cli = Cli::try_parse_from(["repo-sandbox", command]).unwrap();
@@ -878,6 +911,7 @@ test: [{ name: test, run: cargo test }]
             "message",
             "cleanup",
             "published",
+            "publication_progress",
             "container_id",
             "source_snapshot",
             "config",

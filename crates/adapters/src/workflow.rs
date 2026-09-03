@@ -20,7 +20,8 @@ use repo_sandbox_core::application::{
 use repo_sandbox_core::build::{BuiltImage, ImageRef};
 use repo_sandbox_core::config::{Platform, RemoteAuthentication};
 use repo_sandbox_core::registry::{
-    PublishRequest, PublishedImage, RegistryRepository, RegistryTag,
+    PublicationFactKind, PublicationFinality, PublishRequest, PublishedImage, RegistryRepository,
+    RegistryTag, RemotePublicationFact,
 };
 use repo_sandbox_core::runner::{
     ConfigSummary, RunResources, RunSpec, RunStatus, SecretMount, StepPhase, write_report_json,
@@ -338,23 +339,26 @@ impl WorkflowPort for SystemWorkflow {
                 .map_err(|error| AppError::Configuration(error.to_string()))?;
 
             let mut bookkeeping_errors = Vec::new();
-            if report.cleanup == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure {
-                materialized.retain_on_failure();
-                if !materialized.is_automatically_cleaned() {
-                    if let Err(error) = fs::write(materialized.path().join(OWNER_MARKER), &task_id)
-                        .map_err(environment("mark retained source"))
-                    {
-                        bookkeeping_errors.push(error.to_string());
-                    } else if let Err(error) = journal.append(&[CleanCandidate {
-                        task_id: task_id.clone(),
-                        repository_id: repository_id.clone(),
-                        kind: ResourceKind::Source,
-                        identifier: materialized.path().display().to_string(),
-                        owner: task_id.clone(),
-                        state: ResourceState::Retained,
-                    }]) {
-                        bookkeeping_errors.push(error.to_string());
-                    }
+            if report.cleanup == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure
+                && materialized.is_automatically_cleaned()
+            {
+                let registration =
+                    retain_source_after_registration(&mut materialized, |source_path| {
+                        fs::write(source_path.join(OWNER_MARKER), &task_id)
+                            .map_err(environment("mark retained source"))
+                            .and_then(|()| {
+                                journal.append(&[CleanCandidate {
+                                    task_id: task_id.clone(),
+                                    repository_id: repository_id.clone(),
+                                    kind: ResourceKind::Source,
+                                    identifier: source_path.display().to_string(),
+                                    owner: task_id.clone(),
+                                    state: ResourceState::Retained,
+                                }])
+                            })
+                    });
+                if let Err(error) = registration {
+                    bookkeeping_errors.push(error.to_string());
                 }
             }
             if let Some(container) = &report.container_id
@@ -417,6 +421,10 @@ impl WorkflowPort for SystemWorkflow {
                         &repository_id,
                         &repository,
                         &cancellation,
+                        |progress| {
+                            report.publication_progress.push(progress);
+                            completed_report = Some(report.clone());
+                        },
                     )?
                 } else {
                     let seeded = seed_registry(
@@ -443,12 +451,24 @@ impl WorkflowPort for SystemWorkflow {
                     platform_digests: published_task.1.platform_digests,
                     aliases,
                 };
-                let publication = DockerRegistry::new(SystemRegistryExecutor)
+                let publication_result = DockerRegistry::new(SystemRegistryExecutor)
                     .publish_with_progress(&publish_request, &cancellation, |published| {
                         report.published = Some(published.clone());
                         completed_report = Some(report.clone());
                     })
-                    .map_err(|error| bounded_error("publish", error, &cancellation))?;
+                    .map_err(|error| bounded_error("publish", error, &cancellation));
+                let publication = match publication_result {
+                    Ok(publication) => publication,
+                    Err(primary) => {
+                        let seed = local_seed
+                            .as_ref()
+                            .map(|seed| (&seed.reference, seed.owned_local_tag));
+                        let error =
+                            cleanup_seed_after_publication_failure(&mut report, seed, primary);
+                        completed_report = Some(report.clone());
+                        return Err(error);
+                    }
+                };
                 // Publication is an irreversible remote fact. Persist it in the
                 // in-memory failure-report snapshot before attempting local tag
                 // cleanup, which is a separate best-effort cleanup phase.
@@ -551,6 +571,7 @@ impl WorkflowPort for SystemWorkflow {
                 message: error.to_string(),
                 cleanup: repo_sandbox_core::runner::CleanupResult::NotNeeded,
                 published: None,
+                publication_progress: Vec::new(),
                 container_id: None,
                 source_snapshot: None,
                 config: None,
@@ -582,6 +603,17 @@ impl WorkflowPort for SystemWorkflow {
         }
         result
     }
+}
+
+fn retain_source_after_registration(
+    materialized: &mut crate::snapshot::MaterializedSnapshot,
+    register: impl FnOnce(&Path) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    register(materialized.path())?;
+    // Relinquish automatic deletion only after ownership registration is
+    // durable. An error leaves TempDir deletion armed.
+    materialized.retain_on_failure();
+    Ok(())
 }
 
 fn optional_failure_report_path(
@@ -941,6 +973,7 @@ fn journal_revision(entries: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug)]
 struct WorkflowLease {
     _file: fs::File,
 }
@@ -950,13 +983,38 @@ impl WorkflowLease {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(environment("create workflow lease directory"))?;
         }
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            const O_NOFOLLOW: i32 = 0x0002_0000;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            const O_NOFOLLOW: i32 = 0x0000_0100;
+            options.custom_flags(O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = options
             .open(path)
-            .map_err(environment("open workflow lease"))
+            .map_err(environment("open workflow lease"))?;
+        let metadata = file
+            .metadata()
+            .map_err(environment("inspect workflow lease"))?;
+        if is_link_or_reparse(&metadata)
+            || !metadata.is_file()
+            || !state_file_has_single_link(&file, &metadata)
+        {
+            return Err(AppError::Environment(
+                "workflow lease must be an owned regular single-link file".into(),
+            ));
+        }
+        Ok(file)
     }
 
     fn shared(state: &Path) -> Result<Self, AppError> {
@@ -1281,6 +1339,7 @@ fn build_multi_platform_task(
     repository_id: &str,
     repository: &RegistryRepository,
     cancellation: &DeadlineCancellation,
+    mut on_progress: impl FnMut(RemotePublicationFact),
 ) -> Result<(ImageRef, BuiltImage), AppError> {
     let environment_ref = multi_environment_ref(repository, &plan.digest)?;
     let environment = BuildKit::new(SystemProcessExecutor)
@@ -1302,6 +1361,13 @@ fn build_multi_platform_task(
             cancellation,
         )
         .map_err(|error| bounded_error("multi-platform environment", error, cancellation))?;
+    on_progress(RemotePublicationFact {
+        kind: PublicationFactKind::EnvironmentStaging,
+        reference: environment.image.clone(),
+        digest: environment.digest.clone(),
+        verified: true,
+        finality: PublicationFinality::Staging,
+    });
     let primary_environment_manifest = environment
         .platform_digests
         .iter()
@@ -1365,15 +1431,35 @@ fn build_multi_platform_task(
         if *platform == plan.request.platform {
             verify_primary_digest(&task.image, verified_task, "multi-platform task")?;
         }
+        // Before a final task index exists, retain this explicitly typed
+        // staging fact so failures never claim the push had no side effects.
+        on_progress(RemotePublicationFact {
+            kind: PublicationFactKind::TaskStaging,
+            reference: task.image.image.clone(),
+            digest: task.image.digest.clone(),
+            verified: true,
+            finality: PublicationFinality::Staging,
+        });
         sources.push(format!("{}@{}", task.image.image, task.image.digest));
         task_manifests.push(repo_sandbox_core::build::PlatformDigest {
             platform: *platform,
             digest: task.image.digest,
         });
     }
-    let index =
-        multi_platform_index_ref(repository, &plan.digest, materialized.snapshot.id.as_str())?;
+    let index = multi_platform_index_ref(
+        repository,
+        &plan.digest,
+        materialized.snapshot.id.as_str(),
+        &sources,
+    )?;
     let digest = create_multi_platform_index(&index, &sources, cancellation)?;
+    on_progress(RemotePublicationFact {
+        kind: PublicationFactKind::TaskIndexStaging,
+        reference: index.clone(),
+        digest: digest.clone(),
+        verified: true,
+        finality: PublicationFinality::Staging,
+    });
     Ok((
         index.clone(),
         BuiltImage {
@@ -1388,12 +1474,20 @@ fn multi_platform_index_ref(
     repository: &RegistryRepository,
     plan_digest: &str,
     source_digest: &str,
+    sources: &[String],
 ) -> Result<ImageRef, AppError> {
+    let mut source_hasher = Sha256::new();
+    for source in sources {
+        source_hasher.update(source.len().to_le_bytes());
+        source_hasher.update(source.as_bytes());
+    }
+    let manifest_identity = format!("{:x}", source_hasher.finalize());
     ImageRef::new(format!(
-        "{}:multi-{}-{}",
+        "{}:multi-{}-{}-{}",
         repository.as_str(),
         short_digest(plan_digest),
-        short_digest(source_digest)
+        short_digest(source_digest),
+        &manifest_identity[..12]
     ))
     .map_err(AppError::Configuration)
 }
@@ -3272,7 +3366,46 @@ impl ManifestJournal {
         .map_err(environment("write task manifest event"))?;
         file.sync_all()
             .map_err(environment("sync task manifest event"))?;
-        fs::rename(&temporary, &final_path).map_err(environment("publish task manifest event"))
+        publish_journal_event(&temporary, &final_path, &self.root)
+    }
+}
+
+#[cfg(unix)]
+fn publish_journal_event(temporary: &Path, final_path: &Path, root: &Path) -> Result<(), AppError> {
+    fs::rename(temporary, final_path).map_err(environment("publish task manifest event"))?;
+    bind_state_directory(root)?
+        .sync_all()
+        .map_err(environment("sync task manifest directory"))
+}
+
+#[cfg(windows)]
+fn publish_journal_event(
+    temporary: &Path,
+    final_path: &Path,
+    _root: &Path,
+) -> Result<(), AppError> {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, target: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    let existing = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = final_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both UTF-16 buffers are NUL-terminated and live for the call.
+    if unsafe { MoveFileExW(existing.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(environment("publish durable task manifest event")(
+            std::io::Error::last_os_error(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -3611,6 +3744,35 @@ fn apply_publication_cleanup(
             None => message,
         });
     })
+}
+
+fn cleanup_seed_after_publication_failure(
+    report: &mut repo_sandbox_core::runner::RunReport,
+    seed: Option<(&ImageRef, bool)>,
+    primary: AppError,
+) -> AppError {
+    cleanup_seed_after_publication_failure_with(report, seed, primary, |reference| {
+        remove_local_registry_tag_after_cancellation(reference)
+    })
+}
+
+fn cleanup_seed_after_publication_failure_with(
+    report: &mut repo_sandbox_core::runner::RunReport,
+    seed: Option<(&ImageRef, bool)>,
+    primary: AppError,
+    cleanup: impl FnOnce(&ImageRef) -> Result<(), AppError>,
+) -> AppError {
+    let Some((reference, true)) = seed else {
+        return primary;
+    };
+    match cleanup(reference) {
+        Ok(()) => primary,
+        Err(error) => {
+            let message = error.to_string();
+            let _ = apply_publication_cleanup(report, Err(error));
+            AppError::Environment(format!("{primary}; local seed cleanup failed: {message}"))
+        }
+    }
 }
 
 fn remove_local_registry_tag_with(
@@ -4105,10 +4267,30 @@ mod tests {
     fn multi_platform_staging_index_is_unique_per_source_snapshot() {
         let repository = RegistryRepository::new("registry.test/team/task").unwrap();
         let plan = format!("sha256:{}", "a".repeat(64));
-        let first = multi_platform_index_ref(&repository, &plan, &"b".repeat(64)).unwrap();
-        let second = multi_platform_index_ref(&repository, &plan, &"c".repeat(64)).unwrap();
+        let first = multi_platform_index_ref(
+            &repository,
+            &plan,
+            &"b".repeat(64),
+            &[format!("registry.test/task@sha256:{}", "d".repeat(64))],
+        )
+        .unwrap();
+        let second = multi_platform_index_ref(
+            &repository,
+            &plan,
+            &"c".repeat(64),
+            &[format!("registry.test/task@sha256:{}", "d".repeat(64))],
+        )
+        .unwrap();
         assert_ne!(first, second);
         assert!(first.as_str().starts_with("registry.test/team/task:multi-"));
+        let changed_environment = multi_platform_index_ref(
+            &repository,
+            &plan,
+            &"b".repeat(64),
+            &[format!("registry.test/task@sha256:{}", "e".repeat(64))],
+        )
+        .unwrap();
+        assert_ne!(first, changed_environment);
     }
 
     #[test]
@@ -4799,6 +4981,38 @@ mod tests {
     }
 
     #[test]
+    fn failed_source_registration_keeps_automatic_deletion_armed() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("tracked.txt"), "source").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(source.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut materialized = GitSnapshotter::default()
+            .create(
+                &SourceSpec::LocalDirectory(source.path().to_path_buf()),
+                SnapshotOptions {
+                    recurse_submodules: false,
+                    cleanup: CleanupPolicy::Delete,
+                },
+            )
+            .unwrap();
+        let materialized_path = materialized.path().to_path_buf();
+        let error = retain_source_after_registration(&mut materialized, |_| {
+            Err(AppError::Environment("journal unavailable".into()))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("journal unavailable"));
+        assert!(materialized.is_automatically_cleaned());
+        drop(materialized);
+        assert!(!materialized_path.exists());
+    }
+
+    #[test]
     fn publication_cleanup_failure_preserves_remote_publication_in_report() {
         use repo_sandbox_core::build::ImageDigest;
         use repo_sandbox_core::registry::PublishedImage;
@@ -4847,11 +5061,12 @@ mod tests {
             cleanup: CleanupResult::Removed,
             cleanup_error: None,
             published: Some(publication.clone()),
+            publication_progress: Vec::new(),
         };
         let error = AppError::Environment("remove local registry content tag: denied".into());
         let returned = apply_publication_cleanup(&mut report, Err(error)).unwrap();
         annotate_report(&mut report);
-        assert_eq!(report.published, Some(publication));
+        assert_eq!(report.published, Some(publication.clone()));
         assert_eq!(report.cleanup, CleanupResult::Failed);
         assert!(report.cleanup_error.as_deref().unwrap().contains("denied"));
         assert_eq!(report.exit_code, 3);
@@ -4859,6 +5074,35 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("sha256-content"));
         assert!(json.contains("verified"));
+
+        let seed = ImageRef::new("registry.test/team/task:sha256-seed").unwrap();
+        let called = std::cell::Cell::new(false);
+        let primary = cleanup_seed_after_publication_failure_with(
+            &mut report,
+            Some((&seed, true)),
+            AppError::Environment("alias verification failed".into()),
+            |observed| {
+                assert_eq!(observed, &seed);
+                called.set(true);
+                Ok(())
+            },
+        );
+        assert!(called.get());
+        assert!(primary.to_string().contains("alias verification failed"));
+        assert_eq!(report.published, Some(publication));
+
+        report.published = None;
+        report.publication_progress = vec![RemotePublicationFact {
+            kind: PublicationFactKind::TaskStaging,
+            reference: seed,
+            digest: report.image_digest.clone(),
+            verified: true,
+            finality: PublicationFinality::Staging,
+        }];
+        let partial = serde_json::to_string(&report).unwrap();
+        assert!(partial.contains("\"kind\":\"task_staging\""));
+        assert!(partial.contains("\"finality\":\"staging\""));
+        assert!(!partial.contains("\"immutable\""));
     }
 
     fn default_execution_plan() -> ExecutionPlan {
@@ -5214,6 +5458,19 @@ mod tests {
         let result = execute_clean(&plan, false, &NeverCancelled).unwrap();
         assert!(!result.complete());
         assert!(result.unfinished[0].contains("plan changed"));
+    }
+
+    #[test]
+    fn workflow_lease_refuses_a_linked_control_file_without_touching_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let sentinel = temporary.path().join("sentinel");
+        fs::write(&sentinel, "unchanged").unwrap();
+        fs::hard_link(&sentinel, state.join(".workflow.lock")).unwrap();
+        let error = WorkflowLease::shared(&state).unwrap_err();
+        assert!(error.to_string().contains("single-link"));
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "unchanged");
     }
 
     #[test]

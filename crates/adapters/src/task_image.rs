@@ -159,6 +159,7 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
             template_id: request.template_id,
             template_version: request.template_version,
             configuration_digest: request.configuration_digest,
+            repository_id: request.repository_id,
             created: request.created,
         });
         let image = ImageRef::new(format!("{}:{}", request.repository, identity.tag()))

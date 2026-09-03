@@ -142,6 +142,32 @@ pub struct PublishedImage {
     pub platform_digests: Vec<PlatformDigest>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationFactKind {
+    EnvironmentStaging,
+    TaskStaging,
+    TaskIndexStaging,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationFinality {
+    Staging,
+    Final,
+}
+
+/// An irreversible remote side effect observed before final publication.
+/// These facts never masquerade as the final immutable/alias contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RemotePublicationFact {
+    pub kind: PublicationFactKind,
+    pub reference: ImageRef,
+    pub digest: ImageDigest,
+    pub verified: bool,
+    pub finality: PublicationFinality,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PulledImage {
     pub image: ImageRef,

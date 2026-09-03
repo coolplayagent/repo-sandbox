@@ -1,5 +1,6 @@
 //! Docker Buildx/BuildKit adapter for central environment templates.
 
+use crate::snapshot::{ProcessTree, configure_process_tree};
 use repo_sandbox_core::build::{BuiltImage, ImageDigest, ImageRef, PlatformDigest};
 use repo_sandbox_core::config::Platform;
 use repo_sandbox_core::template::TemplatePlan;
@@ -72,19 +73,25 @@ impl ProcessExecutor for SystemProcessExecutor {
         invocation: &ProcessInvocation,
         cancellation: &dyn Cancellation,
     ) -> io::Result<ProcessOutput> {
-        let mut child = Command::new(&invocation.program)
+        let mut command = Command::new(&invocation.program);
+        command
             .args(&invocation.args)
             .current_dir(invocation.current_dir.as_deref().unwrap_or(Path::new(".")))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn()?;
+        let process_tree = ProcessTree::attach(&mut child).inspect_err(|_error| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
         let stdout = child.stdout.take().expect("piped stdout is available");
         let stderr = child.stderr.take().expect("piped stderr is available");
         let stdout_reader = thread::spawn(move || read_stream(stdout));
         let stderr_reader = thread::spawn(move || read_stream(stderr));
         let (status, interrupted) = loop {
             if cancellation.is_cancelled() {
-                child.kill()?;
+                process_tree.terminate();
                 break (child.wait()?, true);
             }
             if let Some(status) = child.try_wait()? {
@@ -92,6 +99,7 @@ impl ProcessExecutor for SystemProcessExecutor {
             }
             thread::sleep(Duration::from_millis(25));
         };
+        process_tree.terminate();
         Ok(ProcessOutput {
             exit_code: status.code(),
             stdout: join_reader(stdout_reader)?,
@@ -1049,6 +1057,41 @@ mod tests {
     use repo_sandbox_core::config::Platform;
     use repo_sandbox_core::template::PlanStage;
     use std::sync::Mutex;
+
+    struct ImmediatelyCancelled;
+
+    impl Cancellation for ImmediatelyCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn system_executor_bounds_descendants_that_inherit_output_pipes() {
+        #[cfg(unix)]
+        let invocation = ProcessInvocation {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 30 & wait".into()],
+            current_dir: None,
+        };
+        #[cfg(windows)]
+        let invocation = ProcessInvocation {
+            program: "cmd".into(),
+            args: vec![
+                "/d".into(),
+                "/s".into(),
+                "/c".into(),
+                "start \"\" /b cmd /d /s /c \"ping -n 30 127.0.0.1 >NUL\"".into(),
+            ],
+            current_dir: None,
+        };
+        let started = std::time::Instant::now();
+        let output = SystemProcessExecutor
+            .execute(&invocation, &ImmediatelyCancelled)
+            .unwrap();
+        assert!(output.interrupted);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 

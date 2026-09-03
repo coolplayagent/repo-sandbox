@@ -43,6 +43,14 @@ flush plus `sync_all`, and an atomic create-if-absent hard-link publication.
 Existing reports are never overwritten; concurrent writers produce one winner,
 and failed writers clean their private temporary file.
 
+Registry side effects that occur before a final multi-platform artifact exists
+are recorded separately in `publication_progress`. Each entry identifies its
+kind (`environment_staging`, `task_staging`, or `task_index_staging`), exact reference
+and digest, whether it was verified, and whether it is staging or final. The
+`published` field retains its narrower contract: it describes only the final
+immutable artifact and its requested aliases, so consumers never mistake a
+staging environment/task reference for the requested output.
+
 By default the exact container ID returned by this task's successful create is
 removed on success and failure. `keep_on_failure` retains that container only on
 a non-success outcome and marks the report `retained_on_failure`. Snapshot

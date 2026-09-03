@@ -663,6 +663,7 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
             cleanup: CleanupResult::NotNeeded,
             cleanup_error: None,
             published: None,
+            publication_progress: Vec::new(),
         };
 
         if let Err(status) = self.ensure_unowned(&run_plan, spec, started.monotonic_ms) {

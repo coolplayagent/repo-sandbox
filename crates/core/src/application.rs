@@ -3,7 +3,7 @@
 use crate::AppError;
 use crate::build::{ImageDigest, ImageRef};
 use crate::config::ExecutionRequest;
-use crate::registry::PublishedImage;
+use crate::registry::{PublishedImage, RemotePublicationFact};
 use crate::runner::{CleanupResult, ConfigSummary, RunReport, StepResult};
 use crate::snapshot::SourceSnapshot;
 use crate::template::TemplatePlan;
@@ -175,6 +175,7 @@ pub struct WorkflowFailureReport {
     pub message: String,
     pub cleanup: CleanupResult,
     pub published: Option<PublishedImage>,
+    pub publication_progress: Vec<RemotePublicationFact>,
     pub container_id: Option<String>,
     pub source_snapshot: Option<SourceSnapshot>,
     pub config: Option<ConfigSummary>,

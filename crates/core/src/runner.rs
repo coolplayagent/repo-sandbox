@@ -2,7 +2,7 @@
 
 use crate::build::{ImageDigest, ImageRef};
 use crate::config::{Config, Platform};
-use crate::registry::PublishedImage;
+use crate::registry::{PublishedImage, RemotePublicationFact};
 use crate::snapshot::SourceSnapshot;
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
@@ -179,6 +179,7 @@ pub struct RunReport {
     pub cleanup_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub published: Option<PublishedImage>,
+    pub publication_progress: Vec<RemotePublicationFact>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

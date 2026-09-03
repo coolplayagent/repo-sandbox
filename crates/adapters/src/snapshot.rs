@@ -1308,30 +1308,30 @@ where
 }
 
 #[cfg(unix)]
-fn configure_process_tree(command: &mut Command) {
+pub(crate) fn configure_process_tree(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
 #[cfg(windows)]
-fn configure_process_tree(command: &mut Command) {
+pub(crate) fn configure_process_tree(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_SUSPENDED: u32 = 0x0000_0004;
     command.creation_flags(CREATE_SUSPENDED);
 }
 
 #[cfg(unix)]
-struct ProcessTree {
+pub(crate) struct ProcessTree {
     pid: u32,
 }
 
 #[cfg(unix)]
 impl ProcessTree {
-    fn attach(child: &mut std::process::Child) -> std::io::Result<Self> {
+    pub(crate) fn attach(child: &mut std::process::Child) -> std::io::Result<Self> {
         Ok(Self { pid: child.id() })
     }
 
-    fn terminate(&self) {
+    pub(crate) fn terminate(&self) {
         unsafe extern "C" {
             fn kill(pid: i32, signal: i32) -> i32;
         }
@@ -1343,13 +1343,13 @@ impl ProcessTree {
 }
 
 #[cfg(windows)]
-struct ProcessTree {
+pub(crate) struct ProcessTree {
     job: *mut std::ffi::c_void,
 }
 
 #[cfg(windows)]
 impl ProcessTree {
-    fn attach(child: &mut std::process::Child) -> std::io::Result<Self> {
+    pub(crate) fn attach(child: &mut std::process::Child) -> std::io::Result<Self> {
         use std::os::windows::io::AsRawHandle;
         unsafe extern "system" {
             fn CreateJobObjectW(
@@ -1383,7 +1383,7 @@ impl ProcessTree {
         Ok(Self { job })
     }
 
-    fn terminate(&self) {
+    pub(crate) fn terminate(&self) {
         unsafe extern "system" {
             fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
         }

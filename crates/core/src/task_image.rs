@@ -65,6 +65,8 @@ pub struct TaskImageInputs<'a> {
     pub template_id: &'a str,
     pub template_version: &'a str,
     pub configuration_digest: &'a ConfigurationDigest,
+    /// Ownership boundary for daemon-global image tags and labels.
+    pub repository_id: &'a str,
     /// Reproducible OCI creation time. It participates in identity so one tag
     /// can never name two image configurations with different timestamps.
     pub created: &'a str,
@@ -73,7 +75,7 @@ pub struct TaskImageInputs<'a> {
 /// Versioned, length-delimited content identity. Field boundaries cannot collide.
 pub fn task_image_identity(inputs: &TaskImageInputs<'_>) -> TaskImageIdentity {
     let mut hasher = Sha256::new();
-    hash_field(&mut hasher, "repo-sandbox-task-image-v1");
+    hash_field(&mut hasher, "repo-sandbox-task-image-v2");
     hash_field(&mut hasher, inputs.environment_digest.as_str());
     hash_field(&mut hasher, inputs.snapshot.id.as_str());
     hash_field(
@@ -83,6 +85,7 @@ pub fn task_image_identity(inputs: &TaskImageInputs<'_>) -> TaskImageIdentity {
     hash_field(&mut hasher, inputs.template_id);
     hash_field(&mut hasher, inputs.template_version);
     hash_field(&mut hasher, inputs.configuration_digest.as_str());
+    hash_field(&mut hasher, inputs.repository_id);
     hash_field(&mut hasher, inputs.created);
     TaskImageIdentity(format!("{:x}", hasher.finalize()))
 }
@@ -124,6 +127,7 @@ mod tests {
             template_id: "rust-bazel",
             template_version: "1.0.0",
             configuration_digest: config,
+            repository_id: "repository-a",
             created: "2026-09-01T00:00:00Z",
         })
     }
@@ -169,11 +173,31 @@ mod tests {
             template_id: "rust-bazel",
             template_version: "1.0.0",
             configuration_digest: &config,
+            repository_id: "repository-a",
             created,
         };
         assert_ne!(
             task_image_identity(&inputs("2026-09-01T00:00:00Z")),
             task_image_identity(&inputs("2026-09-01T00:00:01Z"))
         );
+    }
+
+    #[test]
+    fn different_repository_owners_cannot_share_a_daemon_tag() {
+        let source = snapshot('a');
+        let config = ConfigurationDigest::parse("c".repeat(64)).unwrap();
+        let environment = ImageDigest::new(format!("sha256:{}", "e".repeat(64))).unwrap();
+        let identity = |repository_id| {
+            task_image_identity(&TaskImageInputs {
+                environment_digest: &environment,
+                snapshot: &source,
+                template_id: "rust-bazel",
+                template_version: "1.0.0",
+                configuration_digest: &config,
+                repository_id,
+                created: "2026-09-01T00:00:00Z",
+            })
+        };
+        assert_ne!(identity("repository-a"), identity("repository-b"));
     }
 }
