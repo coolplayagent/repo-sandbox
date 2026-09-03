@@ -19,6 +19,11 @@ pub const TASK_LABEL: &str = "io.repo-sandbox.task-id";
 pub const REPOSITORY_LABEL: &str = "io.repo-sandbox.repository-id";
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn docker_absent(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("no such container") || stderr.contains("not found")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClockReading {
     pub unix_ms: u64,
@@ -666,6 +671,7 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
         let create = match self.execute_remaining(&run_plan.create, spec, started.monotonic_ms) {
             Ok(output) if output.interrupted => {
                 report.status = interrupted_run_status(None, None);
+                self.reconcile_interrupted_create(&run_plan, spec, &mut report, hook);
                 return Ok(self.finish(report, started));
             }
             Ok(output) if output.exit_code == Some(0) => output,
@@ -739,6 +745,66 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
             }
         }
         Ok(self.finish(report, started))
+    }
+
+    fn reconcile_interrupted_create(
+        &self,
+        run_plan: &DockerRunPlan,
+        spec: &RunSpec,
+        report: &mut RunReport,
+        hook: impl FnOnce(&str) -> Result<(), String>,
+    ) {
+        let inspect = docker(vec![
+            "container",
+            "inspect",
+            "--format",
+            "{{.Id}}|{{ index .Config.Labels \"io.repo-sandbox.task-id\" }}|{{ index .Config.Labels \"io.repo-sandbox.repository-id\" }}",
+            &run_plan.container_name,
+        ]);
+        let output = match self.executor.execute_cleanup(&inspect, CLEANUP_TIMEOUT) {
+            Ok(output) if output.exit_code == Some(0) => output,
+            Ok(output) if docker_absent(&output.stderr) => return,
+            Ok(output) => {
+                report.cleanup = CleanupResult::Failed;
+                report.cleanup_error = Some(format!(
+                    "reconcile interrupted container creation: {}",
+                    output.stderr.trim()
+                ));
+                return;
+            }
+            Err(error) => {
+                report.cleanup = CleanupResult::Failed;
+                report.cleanup_error =
+                    Some(format!("reconcile interrupted container creation: {error}"));
+                return;
+            }
+        };
+        let mut fields = output.stdout.trim().split('|');
+        let id = fields.next().unwrap_or_default();
+        let task = fields.next().unwrap_or_default();
+        let repository = fields.next().unwrap_or_default();
+        if id.is_empty() || task != spec.task_id || repository != spec.repository_id {
+            report.cleanup = CleanupResult::Failed;
+            report.cleanup_error = Some(
+                "refused to remove interrupted container because ownership labels do not match"
+                    .into(),
+            );
+            return;
+        }
+        report.container_id = Some(id.into());
+        if let Err(error) = hook(id) {
+            report.cleanup_error = Some(format!("register interrupted owned container: {error}"));
+        }
+        match self.cleanup(id) {
+            Ok(()) => report.cleanup = CleanupResult::Removed,
+            Err(error) => {
+                report.cleanup = CleanupResult::Failed;
+                report.cleanup_error = Some(match report.cleanup_error.take() {
+                    Some(primary) => format!("{primary}; {error}"),
+                    None => error.to_string(),
+                });
+            }
+        }
     }
 
     fn ensure_unowned(
@@ -1718,6 +1784,65 @@ mod tests {
         assert_eq!(report.status, RunStatus::TimedOut);
         assert_eq!(report.steps[0].status, StepStatus::TimedOut);
         assert_eq!(executor.invocations().last().unwrap().args[1], "rm");
+    }
+
+    #[test]
+    fn interrupted_create_reconciles_and_removes_only_the_exact_owned_container() {
+        let clock = FakeClock(Rc::new(Cell::new(0)));
+        let specification = spec(true);
+        let inspect = format!(
+            "container-id-7|{}|{}",
+            specification.task_id, specification.repository_id
+        );
+        let executor = FakeExecutor::new(
+            &clock,
+            vec![
+                output(0, "", ""),
+                timed_out(),
+                output(0, &inspect, ""),
+                output(0, "", ""),
+            ],
+        );
+        let registered = Rc::new(RefCell::new(None));
+        let observed = Rc::clone(&registered);
+        let report = DockerRunner::new(&executor, clock)
+            .run_with_container_hook(&specification, move |id| {
+                *observed.borrow_mut() = Some(id.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(report.status, RunStatus::TimedOut));
+        assert_eq!(report.container_id.as_deref(), Some("container-id-7"));
+        assert_eq!(report.cleanup, CleanupResult::Removed);
+        assert_eq!(registered.borrow().as_deref(), Some("container-id-7"));
+        let calls = executor.invocations();
+        assert_eq!(calls[2].args[1], "inspect");
+        assert_eq!(calls[3].args[1], "rm");
+    }
+
+    #[test]
+    fn interrupted_create_never_removes_a_name_with_mismatched_labels() {
+        let clock = FakeClock(Rc::new(Cell::new(0)));
+        let executor = FakeExecutor::new(
+            &clock,
+            vec![
+                output(0, "", ""),
+                timed_out(),
+                output(0, "foreign|other-task|sha256:foreign", ""),
+            ],
+        );
+        let report = DockerRunner::new(&executor, clock)
+            .run(&spec(true))
+            .unwrap();
+        assert_eq!(report.cleanup, CleanupResult::Failed);
+        assert!(
+            report
+                .cleanup_error
+                .as_deref()
+                .unwrap()
+                .contains("ownership labels")
+        );
+        assert_eq!(executor.invocations().len(), 3);
     }
 
     #[test]

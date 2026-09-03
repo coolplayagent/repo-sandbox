@@ -15,11 +15,13 @@ use repo_sandbox_core::AppError;
 use repo_sandbox_core::application::{
     CleanCandidate, CleanPlan, CleanPort, CleanRequest, CleanResult, ExecutionPlan, ResourceKind,
     ResourceState, WorkflowFailureReport, WorkflowFailureStatus, WorkflowMode, WorkflowPort,
-    WorkflowResult, write_failure_report,
+    WorkflowResult, configuration_source_digest, write_failure_report,
 };
 use repo_sandbox_core::build::{BuiltImage, ImageRef};
 use repo_sandbox_core::config::{Platform, RemoteAuthentication};
-use repo_sandbox_core::registry::{PublishRequest, RegistryRepository, RegistryTag};
+use repo_sandbox_core::registry::{
+    PublishRequest, PublishedImage, RegistryRepository, RegistryTag,
+};
 use repo_sandbox_core::runner::{
     ConfigSummary, RunResources, RunSpec, RunStatus, SecretMount, StepPhase, write_report_json,
 };
@@ -61,6 +63,7 @@ impl WorkflowPort for SystemWorkflow {
             .report
             .clone()
             .unwrap_or_else(|| state.join("reports").join(format!("{task_id}.json")));
+        validate_output_path_overlap(plan)?;
         validate_state_outputs(&state, &report_path, plan.request.oci_layout.as_deref())?;
         let _report_reservation = OutputReservation::report(&report_path)?;
         let mut completed_report = None;
@@ -117,6 +120,7 @@ impl WorkflowPort for SystemWorkflow {
                 )
                 .map_err(|error| AppError::Environment(format!("snapshot: {error}")))?;
             preserve_requested_ref(&mut materialized.snapshot.origin, &plan.request);
+            verify_materialized_configuration(plan, materialized.path())?;
             let trusted_catalog = trusted_catalog()?;
             let catalog_root = trusted_catalog.path().to_path_buf();
             let cache_import = cache_io.join("environment");
@@ -125,6 +129,7 @@ impl WorkflowPort for SystemWorkflow {
                 fs::remove_dir_all(&cache_export)
                     .map_err(environment("remove stale owned cache export"))?;
             }
+            let cache_import_lease = CacheLease::shared(&cache_io, &cancellation)?;
             let cache_options = CacheConfig {
                 imports: cache_import
                     .join("index.json")
@@ -173,6 +178,7 @@ impl WorkflowPort for SystemWorkflow {
                     return Err(clean_failed_cache_export(&cache_export, primary));
                 }
             };
+            drop(cache_import_lease);
             if cache_export.exists() {
                 rotate_cache_export(&cache_io, &cache_export, &cache_import, &cancellation)?;
             }
@@ -204,12 +210,23 @@ impl WorkflowPort for SystemWorkflow {
                 )
                 .map_err(|error| bounded_error("task image", error, &cancellation))?;
             let execution_image = resolve_local_image_id(&task_image.image, &cancellation)?;
-            journal.append(&[owned_task_image_candidate(
+            if let Err(primary) = journal.append(&[owned_task_image_candidate(
                 &task_id,
                 &repository_id,
                 &execution_image,
                 task_image.identity.oci_value(),
-            )])?;
+            )]) {
+                let cleanup_cancellation =
+                    DeadlineCancellation::new(std::time::Duration::from_secs(30));
+                let cleanup =
+                    remove_unregistered_task_image(&execution_image, &cleanup_cancellation);
+                return Err(match cleanup {
+                    Ok(()) => primary,
+                    Err(cleanup) => AppError::Environment(format!(
+                        "{primary}; remove unregistered task image {execution_image}: {cleanup}"
+                    )),
+                });
+            }
 
             let execution = &plan.template.execution;
             let secret_root = tempfile::Builder::new()
@@ -416,6 +433,13 @@ impl WorkflowPort for SystemWorkflow {
                 };
                 let local_seed =
                     (plan.request.platforms.len() == 1).then(|| published_task.0.clone());
+                if plan.request.platforms.len() == 1 {
+                    // The seed push is already an irreversible remote fact. Record it
+                    // before alias publication/verification so a later failure report
+                    // never denies that the immutable content tag exists.
+                    report.published = Some(seeded_publication(&published_task));
+                    completed_report = Some(report.clone());
+                }
                 let publication = DockerRegistry::new(SystemRegistryExecutor)
                     .publish(
                         &PublishRequest {
@@ -511,7 +535,11 @@ impl WorkflowPort for SystemWorkflow {
                 if let Some(state) = &bound_state {
                     state.ensure()?;
                 }
-                let report_io = bound_state_path(&bound_state, &state, &report_path)?;
+                let Some(report_io) =
+                    optional_failure_report_path(&bound_state, &state, &report_path)?
+                else {
+                    return result;
+                };
                 write_report_json(&report, &report_io).map_err(|write| {
                     AppError::Environment(format!(
                         "write failure report: {write}; primary: {error}"
@@ -549,13 +577,41 @@ impl WorkflowPort for SystemWorkflow {
             if let Some(state) = &bound_state {
                 state.ensure()?;
             }
-            let report_io = bound_state_path(&bound_state, &state, &report_path)?;
+            let Some(report_io) = optional_failure_report_path(&bound_state, &state, &report_path)?
+            else {
+                return result;
+            };
             write_failure_report(&failure, &report_io).map_err(|write| {
                 AppError::Environment(format!("write failure report: {write}; primary: {error}"))
             })?;
         }
         result
     }
+}
+
+fn optional_failure_report_path(
+    bound_state: &Option<StateLayoutGuard>,
+    state: &Path,
+    report: &Path,
+) -> Result<Option<PathBuf>, AppError> {
+    if bound_state.is_none() && report.starts_with(state) {
+        return Ok(None);
+    }
+    bound_state_path(bound_state, state, report).map(Some)
+}
+
+fn verify_materialized_configuration(plan: &ExecutionPlan, root: &Path) -> Result<(), AppError> {
+    let Some(expected) = plan.request.repository_config_digest.as_deref() else {
+        return Ok(());
+    };
+    let source = fs::read(root.join(".repo-sandbox.yaml"))
+        .map_err(environment("read materialized repository configuration"))?;
+    if configuration_source_digest(&source) != expected {
+        return Err(AppError::Configuration(
+            "materialized .repo-sandbox.yaml differs from the configuration used to create the execution plan".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl CleanPort for SystemWorkflow {
@@ -990,9 +1046,13 @@ fn validate_outputs(plan: &ExecutionPlan) -> Result<(), AppError> {
             "multiple --platform values require --push or --oci-layout".into(),
         ));
     }
+    validate_output_path_overlap(plan)
+}
+
+fn validate_output_path_overlap(plan: &ExecutionPlan) -> Result<(), AppError> {
     if let (Some(oci), Some(report)) = (&plan.request.oci_layout, &plan.request.report) {
-        let oci = normalized_output_path(oci)?;
-        let report = normalized_output_path(report)?;
+        let oci = resolved_future_path(oci)?;
+        let report = resolved_future_path(report)?;
         if oci == report || oci.starts_with(&report) || report.starts_with(&oci) {
             return Err(AppError::Configuration(
                 "--oci-layout and --report-path must not overlap".into(),
@@ -1941,26 +2001,7 @@ fn rotate_cache_export(
     current: &Path,
     cancellation: &DeadlineCancellation,
 ) -> Result<(), AppError> {
-    let lock_path = cache.join(".rotation.lock");
-    let file = WorkflowLease::open(&lock_path)?;
-    loop {
-        match file.try_lock() {
-            Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) if !cancellation.is_cancelled() => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(AppError::Environment(
-                    "workflow cancelled while waiting to rotate cache".into(),
-                ));
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(AppError::Environment(format!(
-                    "lock cache rotation: {error}"
-                )));
-            }
-        }
-    }
+    let _lease = CacheLease::exclusive(cache, cancellation)?;
     let backup = cache.join(format!("environment-previous-{}", task_id()));
     if current.exists() {
         fs::rename(current, &backup).map_err(environment("preserve current cache"))?;
@@ -1977,6 +2018,76 @@ fn rotate_cache_export(
         fs::remove_dir_all(backup).map_err(environment("remove previous cache"))?;
     }
     Ok(())
+}
+
+struct CacheLease {
+    _file: fs::File,
+}
+
+impl CacheLease {
+    fn shared(cache: &Path, cancellation: &dyn Cancellation) -> Result<Self, AppError> {
+        Self::acquire(cache, cancellation, true)
+    }
+
+    fn exclusive(cache: &Path, cancellation: &dyn Cancellation) -> Result<Self, AppError> {
+        Self::acquire(cache, cancellation, false)
+    }
+
+    fn acquire(
+        cache: &Path,
+        cancellation: &dyn Cancellation,
+        shared: bool,
+    ) -> Result<Self, AppError> {
+        let path = cache.join(".rotation.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            const O_NOFOLLOW: i32 = 0x0002_0000;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            const O_NOFOLLOW: i32 = 0x0000_0100;
+            options.custom_flags(O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        }
+        let file = options
+            .open(path)
+            .map_err(environment("open cache lease"))?;
+        let metadata = file
+            .metadata()
+            .map_err(environment("inspect cache lease"))?;
+        if !metadata.is_file() || !state_file_has_single_link(&file, &metadata) {
+            return Err(AppError::Environment(
+                "cache lease control path must be a single-link regular file".into(),
+            ));
+        }
+        loop {
+            let locked = if shared {
+                file.try_lock_shared()
+            } else {
+                file.try_lock()
+            };
+            match locked {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) if !cancellation.is_cancelled() => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(AppError::Environment(
+                        "workflow cancelled while waiting for cache lease".into(),
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(AppError::Environment(format!("lock cache lease: {error}")));
+                }
+            }
+        }
+    }
 }
 
 fn multi_environment_ref(
@@ -2936,11 +3047,55 @@ fn registry_content_ref(
     repository.tagged(&RegistryTag::for_digest(digest))
 }
 
+fn seeded_publication(seed: &(ImageRef, BuiltImage)) -> PublishedImage {
+    PublishedImage {
+        immutable: seed.0.clone(),
+        aliases: Vec::new(),
+        digest: seed.1.digest.clone(),
+        platform_digests: seed.1.platform_digests.clone(),
+    }
+}
+
 fn remove_local_registry_tag(
     reference: &ImageRef,
     cancellation: &dyn Cancellation,
 ) -> Result<(), AppError> {
     remove_local_registry_tag_with(&SystemProcessExecutor, reference, cancellation)
+}
+
+fn remove_unregistered_task_image(
+    image_id: &ImageRef,
+    cancellation: &dyn Cancellation,
+) -> Result<(), AppError> {
+    remove_unregistered_task_image_with(&SystemProcessExecutor, image_id, cancellation)
+}
+
+fn remove_unregistered_task_image_with(
+    executor: &impl ProcessExecutor,
+    image_id: &ImageRef,
+    cancellation: &dyn Cancellation,
+) -> Result<(), AppError> {
+    let invocation = ProcessInvocation {
+        program: "docker".into(),
+        args: vec![
+            "image".into(),
+            "rm".into(),
+            "--force".into(),
+            image_id.to_string(),
+        ],
+        current_dir: None,
+    };
+    let output = executor
+        .execute(&invocation, cancellation)
+        .map_err(environment("remove unregistered task image"))?;
+    if output.exit_code == Some(0) || docker_object_absent(&output.stderr) {
+        Ok(())
+    } else {
+        Err(AppError::Environment(format!(
+            "remove unregistered task image: {}",
+            output.stderr.trim()
+        )))
+    }
 }
 
 fn apply_publication_cleanup(
@@ -3348,6 +3503,20 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn cache_rotation_cannot_replace_an_export_while_it_is_being_imported() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cancellation = DeadlineCancellation::new(std::time::Duration::from_secs(1));
+        let import = CacheLease::shared(temporary.path(), &cancellation).unwrap();
+        let contender = WorkflowLease::open(&temporary.path().join(".rotation.lock")).unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(import);
+        contender.try_lock().unwrap();
     }
 
     #[test]
@@ -3885,6 +4054,25 @@ mod tests {
     }
 
     #[test]
+    fn seeded_publication_records_the_irreversible_remote_fact_without_aliases() {
+        let digest =
+            repo_sandbox_core::build::ImageDigest::new(format!("sha256:{}", "a".repeat(64)))
+                .unwrap();
+        let seed = (
+            ImageRef::new("registry.test/team/task:sha256-content").unwrap(),
+            BuiltImage {
+                image: ImageRef::new("repo-sandbox-task:local").unwrap(),
+                digest: digest.clone(),
+                platform_digests: Vec::new(),
+            },
+        );
+        let publication = seeded_publication(&seed);
+        assert_eq!(publication.immutable, seed.0);
+        assert_eq!(publication.digest, digest);
+        assert!(publication.aliases.is_empty());
+    }
+
+    #[test]
     fn successful_single_publication_removes_its_local_content_tag() {
         let executor = InspectExecutor {
             calls: std::sync::Mutex::new(Vec::new()),
@@ -3910,6 +4098,20 @@ mod tests {
         });
         let reference = ImageRef::new("registry.test/team/task:content").unwrap();
         remove_local_registry_tag_with(&executor, &reference, &NeverCancelled).unwrap();
+    }
+
+    #[test]
+    fn unregistered_task_image_cleanup_targets_only_the_resolved_immutable_id() {
+        let executor = InspectExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            image_id: String::new(),
+        };
+        let image_id = ImageRef::new(format!("sha256:{}", "d".repeat(64))).unwrap();
+        remove_unregistered_task_image_with(&executor, &image_id, &NeverCancelled).unwrap();
+        assert_eq!(
+            executor.calls.lock().unwrap()[0].args,
+            ["image", "rm", "--force", image_id.as_str()].map(str::to_owned)
+        );
     }
 
     #[test]
@@ -4029,6 +4231,99 @@ mod tests {
                     .contains("overlap")
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_aliased_report_and_oci_outputs_are_rejected() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let mut plan = default_execution_plan();
+        plan.request.report = Some(real.join("result"));
+        plan.request.oci_layout = Some(alias.join("result"));
+        assert!(
+            validate_outputs(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("overlap")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_aliased_report_and_oci_outputs_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = root.path().join("alias");
+        assert!(
+            std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &alias.to_string_lossy(),
+                    &real.to_string_lossy()
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut plan = default_execution_plan();
+        plan.request.report = Some(real.join("result"));
+        plan.request.oci_layout = Some(alias.join("result"));
+        assert!(
+            validate_outputs(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("overlap")
+        );
+        fs::remove_dir(alias).unwrap();
+    }
+
+    #[test]
+    fn state_local_failure_report_is_skipped_until_state_is_bound() {
+        let repository = tempfile::tempdir().unwrap();
+        let state = repository.path().join(".repo-sandbox");
+        let report = state.join("reports/task.json");
+        assert_eq!(
+            optional_failure_report_path(&None, &state, &report).unwrap(),
+            None
+        );
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn default_report_does_not_mask_a_pre_state_configuration_failure() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut plan = default_execution_plan();
+        plan.request.repository = Some(repository.path().to_string_lossy().into_owned());
+        plan.request.push = true;
+        let plan = ExecutionPlan::new(plan.template, plan.request);
+        let error = WorkflowPort::execute(&SystemWorkflow, WorkflowMode::Build, &plan).unwrap_err();
+        assert!(error.to_string().contains("--push requires"));
+        assert!(!repository.path().join(".repo-sandbox").exists());
+    }
+
+    #[test]
+    fn materialized_configuration_must_match_the_planned_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = b"version: 1\n";
+        fs::write(root.path().join(".repo-sandbox.yaml"), source).unwrap();
+        let mut plan = default_execution_plan();
+        plan.request.repository_config_digest = Some(configuration_source_digest(source));
+        verify_materialized_configuration(&plan, root.path()).unwrap();
+        fs::write(root.path().join(".repo-sandbox.yaml"), b"version: 2\n").unwrap();
+        assert!(
+            verify_materialized_configuration(&plan, root.path())
+                .unwrap_err()
+                .to_string()
+                .contains("differs")
+        );
     }
 
     #[test]

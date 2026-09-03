@@ -321,11 +321,17 @@ fn collect_repository(
             SnapshotError::Unsupported("non-UTF-8 Git paths are not supported in v1".into())
         })?;
         let relative = safe_relative_path(value)?;
-        if relative
-            .components()
-            .next()
-            .is_some_and(|part| part.as_os_str() == ".repo-sandbox")
-        {
+        if relative.components().next().is_some_and(|part| {
+            let name = part.as_os_str();
+            #[cfg(windows)]
+            {
+                name.to_string_lossy().eq_ignore_ascii_case(".repo-sandbox")
+            }
+            #[cfg(not(windows))]
+            {
+                name == ".repo-sandbox"
+            }
+        }) {
             continue;
         }
         if relative.components().any(|part| part.as_os_str() == ".git") {
@@ -1599,6 +1605,19 @@ mod tests {
         )
         .unwrap();
         let snapshot = create_local(repo.path());
+        assert!(!snapshot.path().join(".repo-sandbox").exists());
+        assert_eq!(snapshot.snapshot.file_count, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_snapshot_excludes_case_aliased_repo_sandbox_state_on_windows() {
+        let repo = repository();
+        let owned = repo.path().join(".Repo-Sandbox/tasks");
+        fs::create_dir_all(&owned).unwrap();
+        fs::write(owned.join("host-secret"), "must-not-enter-snapshot").unwrap();
+        let snapshot = create_local(repo.path());
+        assert!(!snapshot.path().join(".Repo-Sandbox").exists());
         assert!(!snapshot.path().join(".repo-sandbox").exists());
         assert_eq!(snapshot.snapshot.file_count, 1);
     }

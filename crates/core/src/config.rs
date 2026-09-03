@@ -131,6 +131,8 @@ pub struct CliOverrides {
     pub keep_on_failure: bool,
     pub recurse_submodules: bool,
     pub remote_auth: RemoteAuthentication,
+    /// Digest of the exact repository configuration bytes used for planning.
+    pub repository_config_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -156,6 +158,7 @@ pub struct ExecutionRequest {
     pub keep_on_failure: bool,
     pub recurse_submodules: bool,
     pub remote_auth: RemoteAuthentication,
+    pub repository_config_digest: Option<String>,
 }
 
 impl ExecutionRequest {
@@ -185,6 +188,7 @@ impl ExecutionRequest {
             keep_on_failure: cli.keep_on_failure,
             recurse_submodules: cli.recurse_submodules,
             remote_auth: cli.remote_auth,
+            repository_config_digest: cli.repository_config_digest,
         }
     }
 }

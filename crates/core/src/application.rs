@@ -62,6 +62,10 @@ impl ExecutionPlan {
         hash(&mut hasher, request.git_ref.as_deref().unwrap_or(""));
         hash(
             &mut hasher,
+            request.repository_config_digest.as_deref().unwrap_or(""),
+        );
+        hash(
+            &mut hasher,
             request
                 .report
                 .as_ref()
@@ -141,6 +145,11 @@ impl ExecutionPlan {
             deadline: None,
         }
     }
+}
+
+/// Stable identity of the exact repository configuration bytes used to plan.
+pub fn configuration_source_digest(source: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(source))
 }
 
 fn hash(hasher: &mut Sha256, value: &str) {

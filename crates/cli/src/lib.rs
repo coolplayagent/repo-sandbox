@@ -5,7 +5,7 @@ use repo_sandbox_adapters::workflow::SystemWorkflow;
 use repo_sandbox_core::AppError;
 use repo_sandbox_core::application::{
     BuildUseCase, CleanRequest, CleanUseCase, ExecutionPlan, VerifyUseCase, WorkflowFailureReport,
-    WorkflowFailureStatus, write_failure_report,
+    WorkflowFailureStatus, configuration_source_digest, write_failure_report,
 };
 use repo_sandbox_core::config::{
     CliOverrides, Config, ExecutionRequest, Platform, RemoteAuthentication,
@@ -160,6 +160,7 @@ impl From<RuntimeArgs> for CliOverrides {
                 ssh_known_hosts: value.git_ssh_known_hosts,
                 ssh_agent: value.git_ssh_agent,
             },
+            repository_config_digest: None,
         }
     }
 }
@@ -494,7 +495,9 @@ fn execution_plan_from_source(
             config.template.id
         )));
     }
-    let request = ExecutionRequest::resolve(&config, arguments.into());
+    let mut overrides: CliOverrides = arguments.into();
+    overrides.repository_config_digest = Some(configuration_source_digest(source.as_bytes()));
+    let request = ExecutionRequest::resolve(&config, overrides);
     let template = TemplateCatalog::builtin()
         .map_err(|error| AppError::Configuration(error.to_string()))?
         .plan(&config.template, request.platform)
