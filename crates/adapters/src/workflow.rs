@@ -63,6 +63,7 @@ impl WorkflowPort for SystemWorkflow {
             .unwrap_or_else(|| state.join("reports").join(format!("{task_id}.json")));
         let _report_reservation = OutputReservation::report(&report_path)?;
         let mut completed_report = None;
+        let mut bound_state = None;
         let result = (|| {
             validate_outputs(plan)?;
             let _oci_reservation = plan
@@ -71,8 +72,9 @@ impl WorkflowPort for SystemWorkflow {
                 .as_deref()
                 .map(OutputReservation::oci)
                 .transpose()?;
-            prepare_state_layout(&repository, &state)?;
-            let journal = ManifestJournal::create(&state, &task_id)?;
+            let state_guard = prepare_state_layout(&repository, &state)?;
+            bound_state = Some(state_guard.clone());
+            let journal = ManifestJournal::create(&state, &task_id, state_guard.clone())?;
             let registry = plan.template.execution.registry.as_ref();
             if plan.request.push && registry.is_none() {
                 return Err(AppError::Configuration(
@@ -80,11 +82,11 @@ impl WorkflowPort for SystemWorkflow {
                 ));
             }
             preflight(plan, &repository, &cancellation)?;
-            let _workflow_lease = WorkflowLease::shared(&repository.join(".repo-sandbox"))?;
+            let _workflow_lease =
+                WorkflowLease::shared(&state_guard.bound_path(&repository.join(".repo-sandbox"))?)?;
             let cache = state.join("cache");
-            fs::create_dir_all(&cache).map_err(environment("create owned cache"))?;
-            fs::write(cache.join(OWNER_MARKER), &repository_id)
-                .map_err(environment("mark owned cache"))?;
+            let cache_io = state_guard.bound_path(&cache)?;
+            write_state_file(&cache_io.join(OWNER_MARKER), repository_id.as_bytes())?;
             journal.append(&[CleanCandidate {
                 task_id: task_id.clone(),
                 repository_id: repository_id.clone(),
@@ -117,8 +119,8 @@ impl WorkflowPort for SystemWorkflow {
                 .map_err(|error| AppError::Environment(format!("snapshot: {error}")))?;
             let trusted_catalog = trusted_catalog()?;
             let catalog_root = trusted_catalog.path().to_path_buf();
-            let cache_import = cache.join("environment");
-            let cache_export = task_cache_export(&cache, &task_id);
+            let cache_import = cache_io.join("environment");
+            let cache_export = task_cache_export(&cache_io, &task_id);
             if cache_export.exists() {
                 fs::remove_dir_all(&cache_export)
                     .map_err(environment("remove stale owned cache export"))?;
@@ -166,7 +168,7 @@ impl WorkflowPort for SystemWorkflow {
                 )
                 .map_err(|error| bounded_error("environment image", error, &cancellation))?;
             if cache_export.exists() {
-                rotate_cache_export(&cache, &cache_export, &cache_import, &cancellation)?;
+                rotate_cache_export(&cache_io, &cache_export, &cache_import, &cancellation)?;
             }
 
             let configuration_digest =
@@ -245,7 +247,9 @@ impl WorkflowPort for SystemWorkflow {
             } else {
                 Vec::new()
             };
-            let artifact_root = state.join("artifacts").join(&task_id);
+            let artifact_root = state_guard
+                .bound_path(&state.join("artifacts"))?
+                .join(&task_id);
             let spec = RunSpec {
                 task_id: task_id.clone(),
                 repository_id: repository_id.clone(),
@@ -387,6 +391,7 @@ impl WorkflowPort for SystemWorkflow {
                         &catalog_root,
                         &materialized,
                         &environment_image,
+                        &environment_layout,
                         &task_image.image,
                         &configuration_digest,
                         &repository_id,
@@ -423,7 +428,12 @@ impl WorkflowPort for SystemWorkflow {
             annotate_report(&mut report);
             completed_report = Some(report.clone());
 
-            write_report_json(&report, &report_path).map_err(environment("write atomic report"))?;
+            let report_io = if report_path.starts_with(&state) {
+                state_guard.bound_path(&report_path)?
+            } else {
+                report_path.clone()
+            };
+            write_report_json(&report, &report_io).map_err(environment("write atomic report"))?;
             let result = WorkflowResult {
                 plan_digest: plan.digest.clone(),
                 report: report.clone(),
@@ -476,7 +486,11 @@ impl WorkflowPort for SystemWorkflow {
                         message: error.to_string(),
                     };
                 }
-                write_report_json(&report, &report_path).map_err(|write| {
+                if let Some(state) = &bound_state {
+                    state.ensure()?;
+                }
+                let report_io = bound_state_path(&bound_state, &state, &report_path)?;
+                write_report_json(&report, &report_io).map_err(|write| {
                     AppError::Environment(format!(
                         "write failure report: {write}; primary: {error}"
                     ))
@@ -510,7 +524,11 @@ impl WorkflowPort for SystemWorkflow {
                 artifact_error: None,
                 cleanup_error: None,
             };
-            write_failure_report(&failure, &report_path).map_err(|write| {
+            if let Some(state) = &bound_state {
+                state.ensure()?;
+            }
+            let report_io = bound_state_path(&bound_state, &state, &report_path)?;
+            write_failure_report(&failure, &report_io).map_err(|write| {
                 AppError::Environment(format!("write failure report: {write}; primary: {error}"))
             })?;
         }
@@ -880,13 +898,22 @@ fn annotate_report(report: &mut repo_sandbox_core::runner::RunReport) {
             3,
             format!("step `{step}` exceeded a resource limit"),
         ),
-        RunStatus::InfrastructureFailed { operation, message } => {
-            ("runner", 3, format!("{operation}: {message}"))
-        }
+        RunStatus::InfrastructureFailed { operation, message } => (
+            infrastructure_report_phase(operation),
+            3,
+            format!("{operation}: {message}"),
+        ),
     };
     report.phase = phase.into();
     report.exit_code = exit_code;
     report.message = message;
+}
+
+fn infrastructure_report_phase(operation: &str) -> &'static str {
+    match operation {
+        "create owned container" | "start owned container" => "environment",
+        _ => "runner",
+    }
 }
 
 fn apply_bookkeeping_errors(
@@ -961,6 +988,7 @@ fn build_multi_platform_task(
     catalog_root: &Path,
     materialized: &crate::snapshot::MaterializedSnapshot,
     primary_environment: &BuiltImage,
+    primary_environment_layout: &Path,
     verified_task: &BuiltImage,
     configuration_digest: &ConfigurationDigest,
     repository_id: &str,
@@ -1020,7 +1048,8 @@ fn build_multi_platform_task(
             .build(
                 TaskImageRequest {
                     environment: &platform_environment,
-                    environment_oci_layout: None,
+                    environment_oci_layout: (*platform == plan.request.platform)
+                        .then_some(primary_environment_layout),
                     identity_environment_digest: None,
                     materialized,
                     template_id: &plan.template.template_id,
@@ -1907,25 +1936,179 @@ fn validate_state_root(repository: &Path, state: &Path) -> Result<(), AppError> 
     Ok(())
 }
 
-fn prepare_state_layout(repository: &Path, state: &Path) -> Result<(), AppError> {
-    // Complete the read-only validation pass before creating any component.
-    validate_state_root(repository, state)?;
-    let base = repository.join(".repo-sandbox");
-    let mut paths = vec![base.clone()];
+#[derive(Clone)]
+struct StateLayoutGuard {
+    repository: PathBuf,
+    components: std::sync::Arc<Vec<BoundStateComponent>>,
+}
+
+struct BoundStateComponent {
+    path: PathBuf,
+    identity: StateIdentity,
+    _handle: fs::File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StateIdentity {
+    first: u64,
+    second: u64,
+}
+
+impl StateLayoutGuard {
+    fn capture(repository: &Path, components: &[PathBuf]) -> Result<Self, AppError> {
+        Ok(Self {
+            repository: repository.to_path_buf(),
+            components: std::sync::Arc::new(
+                components
+                    .iter()
+                    .map(|path| {
+                        Ok(BoundStateComponent {
+                            path: path.clone(),
+                            identity: state_identity(path)?,
+                            _handle: bind_state_directory(path)?,
+                        })
+                    })
+                    .collect::<Result<_, AppError>>()?,
+            ),
+        })
+    }
+
+    fn ensure(&self) -> Result<(), AppError> {
+        for component in self.components.iter() {
+            validate_state_component(&self.repository, &component.path)?;
+            if state_identity(&component.path)? != component.identity {
+                return Err(AppError::Environment(format!(
+                    "workflow state component changed during execution: {}",
+                    component.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn bound_path(&self, path: &Path) -> Result<PathBuf, AppError> {
+        #[cfg(windows)]
+        {
+            self.ensure()?;
+            Ok(path.to_path_buf())
+        }
+        #[cfg(unix)]
+        {
+            let component = self
+                .components
+                .iter()
+                .filter_map(|component| {
+                    path.strip_prefix(&component.path)
+                        .ok()
+                        .map(|relative| (component, relative))
+                })
+                .max_by_key(|(component, _)| component.path.components().count())
+                .ok_or_else(|| {
+                    AppError::Environment(format!(
+                        "path is outside the bound workflow state: {}",
+                        path.display()
+                    ))
+                })?;
+            bound_directory_path(&component.0._handle).map(|root| root.join(component.1))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bound_directory_path(handle: &fs::File) -> Result<PathBuf, AppError> {
+    use std::os::fd::AsRawFd;
+    Ok(PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        handle.as_raw_fd()
+    )))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bound_directory_path(handle: &fs::File) -> Result<PathBuf, AppError> {
+    use std::os::fd::AsRawFd;
+    Ok(PathBuf::from(format!("/dev/fd/{}", handle.as_raw_fd())))
+}
+
+#[cfg(unix)]
+fn bind_state_directory(path: &Path) -> Result<fs::File, AppError> {
+    fs::File::open(path).map_err(environment("open bound workflow state directory"))
+}
+
+#[cfg(windows)]
+fn bind_state_directory(path: &Path) -> Result<fs::File, AppError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    OpenOptions::new()
+        .read(true)
+        // Excluding FILE_SHARE_DELETE binds the pathname for the guard lifetime:
+        // Windows cannot rename or replace a component behind an open handle.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(environment("open bound workflow state directory"))
+}
+
+#[cfg(unix)]
+fn state_identity(path: &Path) -> Result<StateIdentity, AppError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path).map_err(environment("bind workflow state"))?;
+    Ok(StateIdentity {
+        first: metadata.dev(),
+        second: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn state_identity(path: &Path) -> Result<StateIdentity, AppError> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path).map_err(environment("bind workflow state"))?;
+    Ok(StateIdentity {
+        // Creation time is stable across writes and changes when a path is replaced;
+        // reparse points are independently rejected above.
+        first: metadata.creation_time(),
+        second: u64::from(metadata.file_attributes()),
+    })
+}
+
+fn state_component_paths(state: &Path, base: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![base.to_path_buf(), base.join("remotes")];
     if state != base {
-        paths.push(base.join("remotes"));
         paths.push(state.to_path_buf());
     }
     for leaf in ["tasks", "cache", "reports", "artifacts"] {
         paths.push(state.join(leaf));
     }
-    for path in paths {
+    paths
+}
+
+fn prepare_state_layout(repository: &Path, state: &Path) -> Result<StateLayoutGuard, AppError> {
+    prepare_state_layout_with_hook(repository, state, || {})
+}
+
+fn prepare_state_layout_with_hook(
+    repository: &Path,
+    state: &Path,
+    after_validation: impl FnOnce(),
+) -> Result<StateLayoutGuard, AppError> {
+    // Complete the read-only validation pass before creating any component.
+    validate_state_root(repository, state)?;
+    after_validation();
+    // Bind the exact components again at the write boundary. The retained
+    // identities are checked before every later cache, journal, and report I/O.
+    validate_state_root(repository, state)?;
+    let base = repository.join(".repo-sandbox");
+    let paths = state_component_paths(state, &base);
+    for path in &paths {
         if !path.exists() {
-            fs::create_dir(&path).map_err(environment("create workflow state component"))?;
+            fs::create_dir(path).map_err(environment("create workflow state component"))?;
         }
-        validate_state_component(repository, &path)?;
+        validate_state_component(repository, path)?;
     }
-    Ok(())
+    StateLayoutGuard::capture(repository, &paths)
 }
 
 fn validate_state_component(repository: &Path, path: &Path) -> Result<(), AppError> {
@@ -1953,6 +2136,54 @@ fn validate_state_component(repository: &Path, path: &Path) -> Result<(), AppErr
         )));
     }
     Ok(())
+}
+
+fn bound_state_path(
+    guard: &Option<StateLayoutGuard>,
+    state: &Path,
+    path: &Path,
+) -> Result<PathBuf, AppError> {
+    if path.starts_with(state) {
+        guard
+            .as_ref()
+            .ok_or_else(|| AppError::Environment("workflow state is not bound".into()))?
+            .bound_path(path)
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
+fn write_state_file(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NOFOLLOW: i32 = 0x0002_0000;
+        options.custom_flags(O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(environment("open bound workflow state file"))?;
+    if is_link_or_reparse(
+        &file
+            .metadata()
+            .map_err(environment("inspect bound workflow state file"))?,
+    ) {
+        return Err(AppError::Environment(
+            "workflow state file must not be a symlink or reparse point".into(),
+        ));
+    }
+    file.write_all(bytes)
+        .map_err(environment("write bound workflow state file"))?;
+    file.sync_all()
+        .map_err(environment("sync bound workflow state file"))
 }
 
 #[cfg(windows)]
@@ -2043,6 +2274,7 @@ impl OutputReservation {
 struct ManifestJournal {
     root: PathBuf,
     task_id: String,
+    state: StateLayoutGuard,
 }
 
 fn append_cleanup_state(root: &Path, candidate: &CleanCandidate) -> Result<(), AppError> {
@@ -2070,18 +2302,20 @@ fn append_cleanup_state(root: &Path, candidate: &CleanCandidate) -> Result<(), A
 }
 
 impl ManifestJournal {
-    fn create(state: &Path, task_id: &str) -> Result<Self, AppError> {
-        let root = state.join("tasks");
-        fs::create_dir_all(&root).map_err(environment("create task manifest directory"))?;
+    fn create(state: &Path, task_id: &str, guard: StateLayoutGuard) -> Result<Self, AppError> {
+        guard.ensure()?;
+        let root = guard.bound_path(&state.join("tasks"))?;
         let journal = Self {
             root,
             task_id: task_id.into(),
+            state: guard,
         };
         journal.append(&[])?;
         Ok(journal)
     }
 
     fn append(&self, candidates: &[CleanCandidate]) -> Result<(), AppError> {
+        self.state.ensure()?;
         let sequence = next_journal_sequence(&self.root)?;
         let final_path = self
             .root
@@ -2736,6 +2970,53 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn state_swap_after_validation_is_rejected_at_the_write_boundary() {
+        use std::os::unix::fs::symlink;
+        let repository = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, "unchanged").unwrap();
+        let state = repository.path().join(".repo-sandbox");
+        prepare_state_layout(repository.path(), &state).unwrap();
+        let cache = state.join("cache");
+        let saved = state.join("cache-saved");
+        let result = prepare_state_layout_with_hook(repository.path(), &state, || {
+            fs::rename(&cache, &saved).unwrap();
+            symlink(outside.path(), &cache).unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unchanged");
+        fs::remove_file(cache).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_directory_fd_closes_the_final_check_to_write_swap_window() {
+        use std::os::unix::fs::symlink;
+        let repository = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, "unchanged").unwrap();
+        let state = repository.path().join(".repo-sandbox");
+        let guard = prepare_state_layout(repository.path(), &state).unwrap();
+        let cache = state.join("cache");
+        let bound_marker = guard.bound_path(&cache.join(OWNER_MARKER)).unwrap();
+        let saved = state.join("cache-saved");
+        // The attacker swaps the pathname after the last validation. The write is
+        // still relative to the already-open cache fd, never the replacement link.
+        fs::rename(&cache, &saved).unwrap();
+        symlink(outside.path(), &cache).unwrap();
+        write_state_file(&bound_marker, b"owned").unwrap();
+        assert_eq!(
+            fs::read_to_string(saved.join(OWNER_MARKER)).unwrap(),
+            "owned"
+        );
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unchanged");
+        fs::remove_file(cache).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn junction_state_descendant_is_rejected_before_any_owned_write() {
@@ -2763,6 +3044,57 @@ mod tests {
             assert_eq!(fs::read_dir(&state).unwrap().count(), 1);
             fs::remove_dir(&junction).unwrap();
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_swap_after_validation_is_rejected_at_the_write_boundary() {
+        let repository = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, "unchanged").unwrap();
+        let state = repository.path().join(".repo-sandbox");
+        prepare_state_layout(repository.path(), &state).unwrap();
+        let cache = state.join("cache");
+        let saved = state.join("cache-saved");
+        let result = prepare_state_layout_with_hook(repository.path(), &state, || {
+            fs::rename(&cache, &saved).unwrap();
+            assert!(
+                std::process::Command::new("cmd")
+                    .args([
+                        "/c",
+                        "mklink",
+                        "/J",
+                        &cache.to_string_lossy(),
+                        &outside.path().to_string_lossy(),
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unchanged");
+        fs::remove_dir(cache).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bound_directory_handle_prevents_post_validation_replacement() {
+        let repository = tempfile::tempdir().unwrap();
+        let state = repository.path().join(".repo-sandbox");
+        let guard = prepare_state_layout(repository.path(), &state).unwrap();
+        let cache = state.join("cache");
+        assert!(fs::rename(&cache, state.join("cache-replaced")).is_err());
+        write_state_file(
+            &guard.bound_path(&cache.join(OWNER_MARKER)).unwrap(),
+            b"owned",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(cache.join(OWNER_MARKER)).unwrap(),
+            "owned"
+        );
     }
 
     #[test]
@@ -2989,6 +3321,19 @@ mod tests {
     }
 
     #[test]
+    fn container_platform_contract_failures_have_stable_environment_phase() {
+        assert_eq!(
+            infrastructure_report_phase("create owned container"),
+            "environment"
+        );
+        assert_eq!(
+            infrastructure_report_phase("start owned container"),
+            "environment"
+        );
+        assert_eq!(infrastructure_report_phase("execute job step"), "runner");
+    }
+
+    #[test]
     fn bookkeeping_or_cleanup_failure_disqualifies_all_outputs() {
         use repo_sandbox_core::runner::CleanupResult;
         assert!(outputs_allowed(
@@ -3208,12 +3553,13 @@ mod tests {
             owner: repository_id,
             state: ResourceState::Registered,
         };
-        let first = ManifestJournal::create(&state, "original").unwrap();
+        let guard = prepare_state_layout(&canonical, &state).unwrap();
+        let first = ManifestJournal::create(&state, "original", guard.clone()).unwrap();
         first.append(std::slice::from_ref(&candidate)).unwrap();
         append_cleanup_state(&state.join("tasks"), &candidate).unwrap();
         let mut rebuilt = candidate.clone();
         rebuilt.task_id = "rebuilt".into();
-        ManifestJournal::create(&state, "rebuilt")
+        ManifestJournal::create(&state, "rebuilt", guard)
             .unwrap()
             .append(std::slice::from_ref(&rebuilt))
             .unwrap();

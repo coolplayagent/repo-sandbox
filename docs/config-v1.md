@@ -104,6 +104,13 @@ successful result. An active workflow lease, operator cancellation, or an owned
 image that is still referenced is unfinished work and exits `3`; inspection or
 removal failures also exit `3`.
 
+Workflow state directories are bound before use. On Linux, state I/O is
+resolved relative to retained directory descriptors under `/proc/<pid>/fd`
+and state files use no-follow opens; on Windows, every directory is opened as
+a reparse-aware handle without delete sharing, preventing rename/replacement
+until the workflow ends. Existing links/junctions are rejected component by
+component before the first write.
+
 The selected central template has a mandatory versioned `execution` profile.
 It owns ordered build/test commands, fail-fast, CPU/memory/temporary-storage
 limits, timeout, allowlisted environment names, external Secret names, artifact

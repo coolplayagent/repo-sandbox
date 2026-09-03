@@ -78,8 +78,8 @@ scenarios:
     command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-registry-publish, "${RESULT_DIR}"] }
     expected:
       exit_code: 0
-      log_contains: ["registry_cli=published immutable=verified alias=verified pullback=verified failed_verify_publish=none", "cli-registry-publish=passed"]
-      artifacts: [cli-registry-publish.passed, immutable.json, alias.json]
+      log_contains: ["registry_cli=published immutable=verified multi_platform=verified primary_digest=runner-verified alias=verified pullback=verified failed_verify_publish=none", "cli-registry-publish=passed"]
+      artifacts: [cli-registry-publish.passed, immutable.json, alias.json, multi-manifest.json, multi-alias.json]
 
   - id: cli-public-file-remote
     description: Exercise the public remote CLI path against an offline local file bare repository pinned to an immutable commit.

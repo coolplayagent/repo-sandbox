@@ -108,6 +108,26 @@ assert_report_phase() {
   grep -Fq "\"exit_code\": $exit_code" "$report"
 }
 
+assert_environment_cache_hit() {
+  local log=$1
+  grep -Eq 'importing cache manifest from local' "$log"
+  awk '
+    /\[[^]]*environment [0-9]+\/[0-9]+\] RUN/ { vertex=$1 }
+    vertex != "" && $1 == vertex && /[[:space:]]CACHED$/ { found=1 }
+    END { exit !found }
+  ' "$log"
+}
+
+assert_task_source_rebuilt() {
+  local log=$1
+  awk '
+    /\[task [0-9]+\/[0-9]+\] COPY .*source/ { vertex=$1 }
+    vertex != "" && $1 == vertex && /[[:space:]]CACHED$/ { cached=1 }
+    vertex != "" && $1 == vertex && /[[:space:]]DONE/ { done=1 }
+    END { exit !done || cached }
+  ' "$log"
+}
+
 case "$scenario" in
   cli-build-success|cli-verify-success|cli-build-failure|cli-test-failure|cli-clean-owned-only|cli-interrupt-cleanup|cli-multi-platform-oci|cli-registry-publish)
     fixture=$(mktemp -d)
@@ -170,6 +190,9 @@ EOF
         [[ -f $cache_index ]]
         first_source=$(report_snapshot_id "$report")
         [[ -n $first_source ]]
+        # Remove the builder's internal cache: the warm run can now succeed as cached
+        # only by importing the repository-owned local cache exported above.
+        docker buildx prune --all --force >/dev/null
 
         warm_report="$fixture/report-warm.json"
         warm_log="$result_directory/cli-build-warm.log"
@@ -178,16 +201,19 @@ EOF
         assert_step "$warm_report" build bazel-build succeeded
         [[ $(report_snapshot_id "$warm_report") == "$first_source" ]]
         [[ -f $cache_index ]]
-        grep -Eq '#[0-9]+[[:space:]]+CACHED' "$warm_log"
+        assert_environment_cache_hit "$warm_log"
 
         printf '# source-change\n' >>"$fixture/BUILD.bazel"
         git -C "$fixture" add BUILD.bazel
         git -C "$fixture" commit -qm source-change
         changed_report="$fixture/report-changed.json"
-        "$cli" build --repository "$fixture" --report-path "$changed_report"
+        changed_log="$result_directory/cli-build-source-change.log"
+        "$cli" build --repository "$fixture" --report-path "$changed_report" 2>&1 | tee "$changed_log"
         assert_report_common "$changed_report" removed
         assert_step "$changed_report" build bazel-build succeeded
         [[ $(report_snapshot_id "$changed_report") != "$first_source" ]]
+        assert_environment_cache_hit "$changed_log"
+        assert_task_source_rebuilt "$changed_log"
         echo 'cache=cold_then_warm cache_hit=verified source_digest=changed'
         ;;
       cli-verify-success)
@@ -403,6 +429,29 @@ EOF
         docker pull --platform linux/amd64 "$immutable" >/dev/null
         docker image inspect --format '{{join .RepoDigests "\n"}}' "$immutable" | \
           grep -Fq "$registry_repository@$digest"
+
+        multi_report="$fixture/report-multi-push.json"
+        "$cli" verify --repository "$fixture" --report-path "$multi_report" \
+          --platform linux/amd64 --platform linux/arm64 --push
+        assert_report_common "$multi_report" removed
+        assert_step "$multi_report" build bazel-build succeeded
+        assert_step "$multi_report" test bazel-test succeeded
+        multi_immutable=$(sed -nE 's/^[[:space:]]*"immutable": "([^"]+)",?$/\1/p' \
+          "$multi_report")
+        [[ -n $multi_immutable ]]
+        multi_primary=$(sed -nE 's/^[[:space:]]*"image_digest": "(sha256:[0-9a-f]{64})",?$/\1/p' \
+          "$multi_report")
+        docker buildx imagetools inspect "$multi_immutable" --format '{{json .Manifest}}' \
+          >"$result_directory/multi-manifest.json"
+        grep -Fq "$multi_primary" "$result_directory/multi-manifest.json"
+        [[ $(grep -o '"architecture":"amd64"' "$result_directory/multi-manifest.json" | wc -l) -eq 1 ]]
+        [[ $(grep -o '"architecture":"arm64"' "$result_directory/multi-manifest.json" | wc -l) -eq 1 ]]
+        docker buildx imagetools inspect "$alias" --format '{{json .Manifest}}' \
+          >"$result_directory/multi-alias.json"
+        [[ $(sha256sum "$result_directory/multi-manifest.json" | awk '{print $1}') == \
+          $(sha256sum "$result_directory/multi-alias.json" | awk '{print $1}') ]]
+        docker pull --platform linux/amd64 "$multi_immutable" >/dev/null
+        docker pull --platform linux/arm64 "$multi_immutable" >/dev/null
         tags_before=$(curl --fail --silent \
           "http://127.0.0.1:$registry_port/v2/repo-sandbox/e2e/tags/list")
 
@@ -418,7 +467,7 @@ EOF
         tags_after=$(curl --fail --silent \
           "http://127.0.0.1:$registry_port/v2/repo-sandbox/e2e/tags/list")
         [[ $tags_after == "$tags_before" ]]
-        echo 'registry_cli=published immutable=verified alias=verified pullback=verified failed_verify_publish=none'
+        echo 'registry_cli=published immutable=verified multi_platform=verified primary_digest=runner-verified alias=verified pullback=verified failed_verify_publish=none'
         ;;
     esac
     echo "$scenario=passed"
