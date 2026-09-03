@@ -1941,8 +1941,8 @@ fn preflight_registry_with(
     .map_err(environment("write registry preflight Dockerfile"))?;
     let mut primary = None;
     let mut push_attempted = buildx_boundary;
+    let metadata = temporary.path().join("metadata.json");
     let push = if buildx_boundary {
-        let metadata = temporary.path().join("metadata.json");
         quota_command(
             executor,
             vec![
@@ -2029,10 +2029,16 @@ fn preflight_registry_with(
             observed
         }
         Err(error) => {
+            let observed = buildx_boundary
+                .then(|| registry_metadata_digest(&metadata))
+                .flatten();
+            if let Some(digest) = &observed {
+                on_publication(registry_preflight_fact(&probe, digest.clone(), false));
+            }
             if primary.is_none() {
                 add_primary_error(&mut primary, error);
             }
-            None
+            observed
         }
     };
     if push_attempted {
@@ -2047,12 +2053,13 @@ fn preflight_registry_with(
                         "registry preflight digest mismatch: reported {expected}, observed {observed}"
                     )),
                 ),
-                None => add_primary_error(
-                    &mut primary,
-                    AppError::Environment(format!(
-                        "registry preflight observed {observed} but cannot attribute it without the task's expected digest"
-                    )),
-                ),
+                None => {
+                    // The task-unique mutable tag is only discovery. Ownership is
+                    // established by the immutable tag@digest inspection and its
+                    // two task labels, so a lost executor result is still enough
+                    // to report the remote fact truthfully.
+                    on_publication(registry_preflight_fact(&probe, observed, true));
+                }
             },
             Ok(None) => {
                 if primary.is_none() {
@@ -2113,11 +2120,20 @@ fn reconcile_registry_manifest(
     task_id: &str,
     cancellation: &dyn Cancellation,
 ) -> Result<Option<repo_sandbox_core::build::ImageDigest>, AppError> {
+    reconcile_registry_manifest_with(executor, probe, task_id, cancellation, std::thread::sleep)
+}
+
+fn reconcile_registry_manifest_with(
+    executor: &impl ProcessExecutor,
+    probe: &ImageRef,
+    task_id: &str,
+    cancellation: &dyn Cancellation,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<Option<repo_sandbox_core::build::ImageDigest>, AppError> {
     let mut saw_only_absence = true;
     let mut last_error = String::new();
     let mut delay = registry_reconciliation_initial_delay();
-    let mut observed = None;
-    for _ in 0..10 {
+    let digest = loop {
         if cancellation.is_cancelled() {
             return if saw_only_absence {
                 Ok(None)
@@ -2138,12 +2154,11 @@ fn reconcile_registry_manifest(
             cancellation,
         ) {
             Ok(output) if output.exit_code == Some(0) => {
-                observed = Some(registry_push_digest(&output).ok_or_else(|| {
+                break registry_push_digest(&output).ok_or_else(|| {
                     AppError::Environment(
                         "registry preflight reconciliation omitted the immutable digest".into(),
                     )
-                })?);
-                break;
+                })?;
             }
             Ok(output) if registry_manifest_absent(&output.stderr) => {
                 last_error = output.stderr.trim().to_owned();
@@ -2157,17 +2172,8 @@ fn reconcile_registry_manifest(
                 last_error = error.to_string();
             }
         }
-        std::thread::sleep(delay);
+        sleep(delay);
         delay = (delay * 2).min(std::time::Duration::from_secs(1));
-    }
-    let Some(digest) = observed else {
-        return if saw_only_absence {
-            Ok(None)
-        } else {
-            Err(AppError::Environment(format!(
-                "registry preflight reconciliation did not stabilize: {last_error}"
-            )))
-        };
     };
     let identity = quota_command(
         executor,
@@ -2192,7 +2198,7 @@ fn reconcile_registry_manifest(
 fn registry_reconciliation_initial_delay() -> std::time::Duration {
     #[cfg(test)]
     {
-        std::time::Duration::ZERO
+        std::time::Duration::from_millis(1)
     }
     #[cfg(not(test))]
     {
@@ -4821,6 +4827,127 @@ mod tests {
         >,
     }
 
+    struct FailedSingleRegistryExecutor {
+        calls: std::sync::Mutex<Vec<ProcessInvocation>>,
+        image_id: String,
+    }
+
+    struct MetadataThenErrorExecutor {
+        calls: std::sync::Mutex<Vec<ProcessInvocation>>,
+        outputs: std::sync::Mutex<std::collections::VecDeque<crate::buildkit::ProcessOutput>>,
+        digest: String,
+    }
+
+    struct CountingAbsentExecutor {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProcessExecutor for CountingAbsentExecutor {
+        fn execute(
+            &self,
+            _invocation: &ProcessInvocation,
+            _cancellation: &dyn Cancellation,
+        ) -> std::io::Result<crate::buildkit::ProcessOutput> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::buildkit::ProcessOutput {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "manifest unknown".into(),
+                interrupted: false,
+            })
+        }
+    }
+
+    struct PollBudget {
+        remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Cancellation for PollBudget {
+        fn is_cancelled(&self) -> bool {
+            self.remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_err()
+        }
+    }
+
+    impl ProcessExecutor for MetadataThenErrorExecutor {
+        fn execute(
+            &self,
+            invocation: &ProcessInvocation,
+            _cancellation: &dyn Cancellation,
+        ) -> std::io::Result<crate::buildkit::ProcessOutput> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(invocation.clone());
+            if calls.len() == 1 {
+                let index = invocation
+                    .args
+                    .iter()
+                    .position(|arg| arg == "--metadata-file")
+                    .expect("metadata argument");
+                fs::write(
+                    &invocation.args[index + 1],
+                    serde_json::to_vec(&serde_json::json!({
+                        "containerimage.digest": self.digest
+                    }))
+                    .unwrap(),
+                )?;
+                return Err(std::io::Error::other("lost buildx result after commit"));
+            }
+            drop(calls);
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| std::io::Error::other("missing metadata executor output"))
+        }
+    }
+
+    impl ProcessExecutor for FailedSingleRegistryExecutor {
+        fn execute(
+            &self,
+            invocation: &ProcessInvocation,
+            _cancellation: &dyn Cancellation,
+        ) -> std::io::Result<crate::buildkit::ProcessOutput> {
+            self.calls.lock().unwrap().push(invocation.clone());
+            let ok = |stdout: String| crate::buildkit::ProcessOutput {
+                exit_code: Some(0),
+                stdout,
+                stderr: String::new(),
+                interrupted: false,
+            };
+            Ok(match invocation.args.as_slice() {
+                [operation, ..] if operation == "build" => ok(String::new()),
+                [operation, ..] if operation == "push" => crate::buildkit::ProcessOutput {
+                    exit_code: Some(1),
+                    stderr: "push failed".into(),
+                    ..ok(String::new())
+                },
+                [first, second, third, ..]
+                    if first == "buildx" && second == "imagetools" && third == "inspect" =>
+                {
+                    crate::buildkit::ProcessOutput {
+                        exit_code: Some(1),
+                        stderr: "manifest unknown".into(),
+                        ..ok(String::new())
+                    }
+                }
+                [first, second, ..] if first == "image" && second == "inspect" => {
+                    ok(format!("{}|registry-preflight|fixture", self.image_id))
+                }
+                [first, second, third, ..]
+                    if first == "image" && second == "rm" && third == "--force" =>
+                {
+                    ok(String::new())
+                }
+                other => panic!("unexpected registry probe invocation: {other:?}"),
+            })
+        }
+    }
+
     #[test]
     fn post_cancellation_budget_is_fresh_and_bounded() {
         let fresh = PostCancellationDeadline::new(std::time::Duration::from_secs(60));
@@ -5938,6 +6065,178 @@ mod tests {
     }
 
     #[test]
+    fn registry_preflight_attributes_owned_immutable_after_executor_error_without_digest() {
+        let digest = format!("sha256:{}", "7".repeat(64));
+        let output = |code, stdout: &str, stderr: &str| crate::buildkit::ProcessOutput {
+            exit_code: Some(code),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            interrupted: false,
+        };
+        let executor = FallibleSequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [
+                    Err(std::io::Error::other("lost buildx result")),
+                    Ok(output(1, "", "manifest unknown")),
+                    Ok(output(0, &format!("Digest: {digest}"), "")),
+                    Ok(output(
+                        0,
+                        r#"{"io.repo-sandbox.kind":"registry-preflight","io.repo-sandbox.task-id":"fixture"}"#,
+                        "",
+                    )),
+                ]
+                .into(),
+            ),
+        };
+        let deadline = DeadlineCancellation::new(std::time::Duration::from_secs(2));
+        let mut facts = Vec::new();
+        let error = preflight_registry_with(
+            &executor,
+            "localhost:5000/team/image",
+            "fixture",
+            true,
+            &deadline,
+            |fact| facts.push(fact),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("lost buildx result"));
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].verified);
+        assert_eq!(facts[0].digest.as_str(), digest);
+    }
+
+    #[test]
+    fn registry_preflight_never_attributes_foreign_immutable_after_executor_error() {
+        let digest = format!("sha256:{}", "5".repeat(64));
+        let success = |stdout: String| crate::buildkit::ProcessOutput {
+            exit_code: Some(0),
+            stdout,
+            stderr: String::new(),
+            interrupted: false,
+        };
+        let executor = FallibleSequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [
+                    Err(std::io::Error::other("lost buildx result")),
+                    Ok(success(format!("Digest: {digest}"))),
+                    Ok(success(
+                        r#"{"io.repo-sandbox.kind":"registry-preflight","io.repo-sandbox.task-id":"foreign"}"#
+                            .into(),
+                    )),
+                ]
+                .into(),
+            ),
+        };
+        let deadline = DeadlineCancellation::new(std::time::Duration::from_secs(2));
+        let mut facts = Vec::new();
+
+        let error = preflight_registry_with(
+            &executor,
+            "localhost:5000/team/image",
+            "fixture",
+            true,
+            &deadline,
+            |fact| facts.push(fact),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("foreign or unverifiable ownership")
+        );
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn registry_preflight_attributes_owned_immutable_after_nonzero_without_digest() {
+        let digest = format!("sha256:{}", "8".repeat(64));
+        let output = |code, stdout: &str, stderr: &str| crate::buildkit::ProcessOutput {
+            exit_code: Some(code),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            interrupted: false,
+        };
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [
+                    output(1, "", "upload committed but connection closed"),
+                    output(1, "", "manifest unknown"),
+                    output(0, &format!("Digest: {digest}"), ""),
+                    output(
+                        0,
+                        r#"{"io.repo-sandbox.kind":"registry-preflight","io.repo-sandbox.task-id":"fixture"}"#,
+                        "",
+                    ),
+                ]
+                .into(),
+            ),
+        };
+        let deadline = DeadlineCancellation::new(std::time::Duration::from_secs(2));
+        let mut facts = Vec::new();
+        let error = preflight_registry_with(
+            &executor,
+            "localhost:5000/team/image",
+            "fixture",
+            true,
+            &deadline,
+            |fact| facts.push(fact),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("push registry preflight image"));
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].verified);
+        assert_eq!(facts[0].digest.as_str(), digest);
+    }
+
+    #[test]
+    fn registry_preflight_preserves_metadata_fact_when_executor_result_is_lost() {
+        let digest = format!("sha256:{}", "9".repeat(64));
+        let success = |stdout: &str| crate::buildkit::ProcessOutput {
+            exit_code: Some(0),
+            stdout: stdout.into(),
+            stderr: String::new(),
+            interrupted: false,
+        };
+        let executor = MetadataThenErrorExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [
+                    success(&format!("Digest: {digest}")),
+                    success(
+                        r#"{"io.repo-sandbox.kind":"registry-preflight","io.repo-sandbox.task-id":"fixture"}"#,
+                    ),
+                ]
+                .into(),
+            ),
+            digest: digest.clone(),
+        };
+        let deadline = DeadlineCancellation::new(std::time::Duration::from_secs(2));
+        let mut facts = Vec::new();
+        let error = preflight_registry_with(
+            &executor,
+            "localhost:5000/team/image",
+            "fixture",
+            true,
+            &deadline,
+            |fact| facts.push(fact),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lost buildx result after commit")
+        );
+        assert_eq!(facts.len(), 2);
+        assert!(!facts[0].verified);
+        assert!(facts[1].verified);
+        assert_eq!(facts[1].digest.as_str(), digest);
+    }
+
+    #[test]
     fn registry_preflight_waits_for_delayed_visibility_and_rejects_foreign_labels() {
         let digest = format!("sha256:{}", "e".repeat(64));
         let output = |code, stdout: &str, stderr: &str| crate::buildkit::ProcessOutput {
@@ -5984,35 +6283,68 @@ mod tests {
     }
 
     #[test]
-    fn failed_single_registry_probe_still_removes_only_its_exact_owned_image_id() {
-        let image_id = format!("sha256:{}", "f".repeat(64));
-        let output = |code, stdout: &str, stderr: &str| crate::buildkit::ProcessOutput {
-            exit_code: Some(code),
-            stdout: stdout.into(),
-            stderr: stderr.into(),
+    fn registry_reconciliation_has_no_attempt_ceiling_before_its_budget() {
+        let digest = format!("sha256:{}", "6".repeat(64));
+        let absent = || crate::buildkit::ProcessOutput {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "manifest unknown".into(),
             interrupted: false,
         };
+        let success = |stdout: String| crate::buildkit::ProcessOutput {
+            exit_code: Some(0),
+            stdout,
+            stderr: String::new(),
+            interrupted: false,
+        };
+        let mut outputs = std::collections::VecDeque::from(vec![absent(); 12]);
+        outputs.push_back(success(format!("Digest: {digest}")));
+        outputs.push_back(success(
+            r#"{"io.repo-sandbox.kind":"registry-preflight","io.repo-sandbox.task-id":"fixture"}"#
+                .into(),
+        ));
         let executor = SequenceExecutor {
             calls: std::sync::Mutex::new(Vec::new()),
-            outputs: std::sync::Mutex::new(
-                [
-                    output(0, "", ""),
-                    output(1, "", "push failed"),
-                    output(1, "", "manifest unknown"),
-                    output(1, "", "manifest unknown"),
-                    output(1, "", "manifest unknown"),
-                    output(1, "", "manifest unknown"),
-                    output(1, "", "manifest unknown"),
-                    output(1, "", "manifest unknown"),
-                    output(1, "", "manifest unknown"),
-                    output(1, "", "manifest unknown"),
-                    output(1, "", "manifest unknown"),
-                    output(1, "", "manifest unknown"),
-                    output(0, &format!("{image_id}|registry-preflight|fixture"), ""),
-                    output(0, "", ""),
-                ]
-                .into(),
-            ),
+            outputs: std::sync::Mutex::new(outputs),
+        };
+        let budget = PollBudget {
+            remaining: std::sync::atomic::AtomicUsize::new(20),
+        };
+        let probe = ImageRef::new("localhost:5000/team/image:preflight-fixture").unwrap();
+
+        let observed =
+            reconcile_registry_manifest_with(&executor, &probe, "fixture", &budget, |_| {})
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(observed.as_str(), digest);
+        assert_eq!(executor.calls.lock().unwrap().len(), 14);
+    }
+
+    #[test]
+    fn registry_reconciliation_polls_until_the_entire_budget_is_consumed() {
+        let executor = CountingAbsentExecutor {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let budget = PollBudget {
+            remaining: std::sync::atomic::AtomicUsize::new(17),
+        };
+        let probe = ImageRef::new("localhost:5000/team/image:preflight-fixture").unwrap();
+
+        assert!(
+            reconcile_registry_manifest_with(&executor, &probe, "fixture", &budget, |_| {})
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 17);
+    }
+
+    #[test]
+    fn failed_single_registry_probe_still_removes_only_its_exact_owned_image_id() {
+        let image_id = format!("sha256:{}", "f".repeat(64));
+        let executor = FailedSingleRegistryExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            image_id: image_id.clone(),
         };
         let deadline = DeadlineCancellation::new(std::time::Duration::from_secs(2));
         let error = preflight_registry_with(
