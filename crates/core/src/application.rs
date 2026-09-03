@@ -288,6 +288,9 @@ pub struct CleanPlan {
     /// Advisory OS lock shared by workflows and held exclusively by cleanup.
     #[serde(skip)]
     pub lease_path: Option<PathBuf>,
+    /// Exact journal snapshot revalidated after acquiring the exclusive lease.
+    #[serde(skip)]
+    pub journal_revisions: BTreeMap<PathBuf, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]

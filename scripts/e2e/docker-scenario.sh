@@ -424,6 +424,7 @@ EOF
         [[ $(sha256sum "$result_directory/immutable.json" | awk '{print $1}') == \
           $(sha256sum "$result_directory/alias.json" | awk '{print $1}') ]]
         grep -Fq '"schemaVersion":2' "$result_directory/immutable.json"
+        ! docker image inspect "$immutable" >/dev/null 2>&1
         grep -Eq '"mediaType":"application/vnd\.(oci\.image\.manifest|docker\.distribution\.manifest)\.' \
           "$result_directory/immutable.json"
         docker pull --platform linux/amd64 "$immutable" >/dev/null
