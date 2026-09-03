@@ -45,6 +45,71 @@ scenarios:
     command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-clean-owned-only, "${RESULT_DIR}"] }
     expected: { exit_code: 0, log_contains: ["dry_run=unchanged owner_mismatch=refused foreign_resource=preserved cleanup=idempotent", "cli-clean-owned-only=passed"], artifacts: [cli-clean-owned-only.passed] }
 
+  - id: cli-interrupt-cleanup
+    description: Interrupt a live CLI test step and prove stable cancellation reporting, exact cleanup journaling and unrelated-resource safety.
+    tier: required
+    targets: [docker]
+    covers: [cli, ctrl_c, exit_code_3, cancelled_phase, cancelled_step, cleanup, journal_terminal_state, foreign_resource_safety]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-interrupt-cleanup, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["interrupt_exit=3 phase=test cleanup=removed journal_container=cleaned unrelated=unchanged", "cli-interrupt-cleanup=passed"]
+      artifacts: [cli-interrupt-cleanup.passed, ctrl-c-unrelated.keep]
+
+  - id: cli-multi-platform-oci
+    description: Verify on the primary platform, then export and inspect a two-platform OCI layout through the real CLI.
+    tier: required
+    targets: [docker]
+    covers: [cli, repeated_platform, amd64, arm64, primary_runner, oci_layout, manifest_digest]
+    timeout_seconds: 3300
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-multi-platform-oci, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["multi_platform=linux/amd64,linux/arm64 output=oci-layout runner=verified", "cli-multi-platform-oci=passed"]
+      artifacts: [cli-multi-platform-oci.passed]
+
+  - id: cli-public-file-remote
+    description: Exercise the public remote CLI path against an offline local file bare repository pinned to an immutable commit.
+    tier: required
+    targets: [docker]
+    covers: [cli, public_remote_git, file_transport, offline, fixed_commit, report]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-public-file-remote, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["remote_cli=file:// commit=pinned transport=offline"]
+      artifacts: [cli-public-file-remote.passed]
+
+  - id: cli-private-https-remote
+    description: Exercise the private HTTPS remote CLI path with externally supplied disposable credentials and prove they never persist.
+    tier: opt_in
+    targets: [docker, wsl, vm]
+    covers: [cli, private_https_git, fixed_commit, credential_redaction, credential_scan]
+    required_env: [REPO_SANDBOX_E2E_HTTPS_URL, REPO_SANDBOX_E2E_HTTPS_REF, REPO_SANDBOX_E2E_HTTPS_USER, REPO_SANDBOX_E2E_HTTPS_TOKEN]
+    redact_env: [REPO_SANDBOX_E2E_HTTPS_TOKEN]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-private-https-remote, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["private_remote=https-remote credential_scan=passed"]
+      log_not_contains: ["${ENV:REPO_SANDBOX_E2E_HTTPS_TOKEN}"]
+      artifacts: [cli-private-https-remote.passed]
+
+  - id: cli-private-ssh-remote
+    description: Exercise the private SSH remote CLI path with an external key and strict known-host checking, without persisting key material.
+    tier: opt_in
+    targets: [docker, wsl, vm]
+    covers: [cli, private_ssh_git, fixed_commit, external_key, strict_known_hosts, credential_scan]
+    required_env: [REPO_SANDBOX_E2E_SSH_URL, REPO_SANDBOX_E2E_SSH_REF, REPO_SANDBOX_E2E_SSH_KEY, REPO_SANDBOX_E2E_SSH_KNOWN_HOSTS]
+    redact_file_env: [REPO_SANDBOX_E2E_SSH_KEY]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-private-ssh-remote, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["private_remote=ssh-remote credential_scan=passed"]
+      artifacts: [cli-private-ssh-remote.passed]
+
   - id: public-git-snapshot
     description: Materialize a public remote through a task-owned localhost unauthenticated HTTP service.
     tier: required
