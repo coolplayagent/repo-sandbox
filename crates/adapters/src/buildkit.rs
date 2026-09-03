@@ -183,6 +183,8 @@ pub struct BuildOptions {
     pub platforms: Vec<Platform>,
     /// Additional non-template build arguments. Reserved adapter arguments cannot be replaced.
     pub build_args: BTreeMap<String, String>,
+    /// Named BuildKit contexts. Values are explicit immutable context descriptors.
+    pub named_contexts: BTreeMap<String, String>,
 }
 
 pub struct BuildRequest<'a> {
@@ -587,6 +589,12 @@ impl<E: ProcessExecutor> BuildKit<E> {
                 stderr: output.stderr,
             });
         }
+        if !output.stdout.is_empty() {
+            print!("{}", output.stdout);
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", output.stderr);
+        }
         Ok(())
     }
 
@@ -637,6 +645,19 @@ fn validate_request(request: &BuildRequest<'_>) -> Result<Vec<Platform>, BuildEr
         if name.trim().is_empty() || value.contains('\0') {
             return Err(BuildError::InvalidRequest(format!(
                 "invalid build argument `{name}`"
+            )));
+        }
+    }
+    for (name, value) in &options.named_contexts {
+        if name.trim().is_empty()
+            || name
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b'=')
+            || value.trim().is_empty()
+            || value.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(BuildError::InvalidRequest(format!(
+                "invalid named build context `{name}`"
             )));
         }
     }
@@ -701,6 +722,8 @@ fn build_invocation(
         join_platforms(platforms),
         "--progress".to_owned(),
         request.options.progress.as_str().to_owned(),
+        "--provenance".to_owned(),
+        "false".to_owned(),
         "--metadata-file".to_owned(),
         metadata_path.to_string_lossy().into_owned(),
         "--tag".to_owned(),
@@ -747,6 +770,9 @@ fn build_invocation(
     }
     for cache in &request.options.cache.exports {
         push_pair(&mut args, "--cache-to", cache.clone());
+    }
+    for (name, value) in &request.options.named_contexts {
+        push_pair(&mut args, "--build-context", format!("{name}={value}"));
     }
     args.push(context.to_string_lossy().into_owned());
     Ok(ProcessInvocation {

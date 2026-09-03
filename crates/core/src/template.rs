@@ -50,6 +50,9 @@ pub struct ExecutionDefinition {
     pub artifact_directories: Vec<PathBuf>,
     #[serde(default)]
     pub registry: Option<RegistryPolicy>,
+    /// Optional centrally-controlled runtime platform override for diagnostics.
+    #[serde(default)]
+    pub runner_platform: Option<Platform>,
 }
 
 impl Default for ExecutionDefinition {
@@ -75,6 +78,7 @@ impl Default for ExecutionDefinition {
             secret_environment: Vec::new(),
             artifact_directories: Vec::new(),
             registry: None,
+            runner_platform: None,
         }
     }
 }
@@ -405,6 +409,14 @@ impl TemplateCatalog {
                 &template.target_platforms,
             )?;
             validate_execution(&format!("{path}.execution"), &template.execution)?;
+            if let Some(platform) = template.execution.runner_platform
+                && !template.target_platforms.contains(&platform)
+            {
+                return Err(PlanError::new(
+                    format!("{path}.execution.runner_platform"),
+                    format!("runner platform {platform} is not supported by the template"),
+                ));
+            }
             let mut component_ids = BTreeSet::new();
             for (component_index, component) in template.components.iter().enumerate() {
                 require_non_empty(

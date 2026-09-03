@@ -99,6 +99,10 @@ the central image, component graph, or build contexts.
 | `11` | test failed |
 
 Build-step failures map to `10`; test-step failures map to `11`.
+For `clean`, dry-run, policy-excluded, and already-absent resources are a
+successful result. An active workflow lease, operator cancellation, or an owned
+image that is still referenced is unfinished work and exits `3`; inspection or
+removal failures also exit `3`.
 
 The selected central template has a mandatory versioned `execution` profile.
 It owns ordered build/test commands, fail-fast, CPU/memory/temporary-storage
@@ -113,5 +117,8 @@ architecture, Secret injection, and artifact export. They are never selected
 by default and execution requires the explicit process-local opt-in
 `REPO_SANDBOX_ENABLE_ACCEPTANCE_PROFILES=1`. Repositories can select only the
 published profile ID and platform; they cannot replace its commands or safety
-limits. These profiles run through the same unprivileged Docker runner and must
+limits. The architecture fixture uses a centrally fixed mismatched runtime
+platform so Docker itself rejects the image/platform contract as an environment
+error; it is not an ordinary test-command assertion. These profiles run through
+the same unprivileged Docker runner and must
 not be used as application build profiles.

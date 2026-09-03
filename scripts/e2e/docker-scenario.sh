@@ -114,6 +114,7 @@ case "$scenario" in
     registry_container=
     cleanup_cli_fixture() {
       [[ -z ${foreign:-} ]] || docker rm --force "$foreign" >/dev/null 2>&1 || true
+      [[ -z ${owned_image_reference:-} ]] || docker rm --force "$owned_image_reference" >/dev/null 2>&1 || true
       [[ -z ${registry_container:-} ]] || docker rm --force "$registry_container" >/dev/null 2>&1 || true
       rm -rf -- "$fixture"
     }
@@ -171,11 +172,13 @@ EOF
         [[ -n $first_source ]]
 
         warm_report="$fixture/report-warm.json"
-        "$cli" build --repository "$fixture" --report-path "$warm_report"
+        warm_log="$result_directory/cli-build-warm.log"
+        "$cli" build --repository "$fixture" --report-path "$warm_report" 2>&1 | tee "$warm_log"
         assert_report_common "$warm_report" removed
         assert_step "$warm_report" build bazel-build succeeded
         [[ $(report_snapshot_id "$warm_report") == "$first_source" ]]
         [[ -f $cache_index ]]
+        grep -Eq '#[0-9]+[[:space:]]+CACHED' "$warm_log"
 
         printf '# source-change\n' >>"$fixture/BUILD.bazel"
         git -C "$fixture" add BUILD.bazel
@@ -185,7 +188,7 @@ EOF
         assert_report_common "$changed_report" removed
         assert_step "$changed_report" build bazel-build succeeded
         [[ $(report_snapshot_id "$changed_report") != "$first_source" ]]
-        echo 'cache=cold_then_warm source_digest=changed'
+        echo 'cache=cold_then_warm cache_hit=verified source_digest=changed'
         ;;
       cli-verify-success)
         "$cli" verify --repository "$fixture" --report-path "$report"
@@ -264,6 +267,21 @@ EOF
         rm -rf -- "$fixture/.repo-sandbox/tasks"
         mv "$fixture/.repo-sandbox/tasks-owned" "$fixture/.repo-sandbox/tasks"
 
+        owned_image=$(awk '
+          /"kind": "image"/ { image=1 }
+          image && /"identifier":/ { value=$0; sub(/^.*"identifier": "/, "", value); sub(/".*$/, "", value); print value; exit }
+        ' "$fixture"/.repo-sandbox/tasks/*.json)
+        [[ $owned_image =~ ^sha256:[0-9a-f]{64}$ ]]
+        owned_image_reference=$(docker create "$owned_image" true)
+        referenced_output="$result_directory/clean-referenced.log"
+        run_expect_status 3 "$cli" clean --repository "$fixture" --yes \
+          --include-images --include-cache >"$referenced_output" 2>&1
+        grep -Fq 'unfinished' "$referenced_output"
+        grep -Fq 'still referenced' "$referenced_output"
+        docker image inspect "$owned_image" >/dev/null
+        docker rm "$owned_image_reference" >/dev/null
+        owned_image_reference=
+
         "$cli" clean --repository "$fixture" --yes --include-images --include-cache
         ! docker inspect "$retained" >/dev/null 2>&1
         [[ $(docker inspect --format '{{.Id}}' "$foreign") == "$before" ]]
@@ -273,7 +291,7 @@ EOF
         [[ $(docker inspect --format '{{.Id}}' "$foreign") == "$before" ]]
         docker rm "$foreign" >/dev/null
         foreign=
-        echo 'dry_run=unchanged owner_mismatch=refused foreign_resource=preserved cleanup=idempotent'
+        echo 'dry_run=unchanged owner_mismatch=refused referenced=exit3 foreign_resource=preserved cleanup=idempotent'
         ;;
       cli-interrupt-cleanup)
         foreign_labeled=
@@ -350,9 +368,18 @@ EOF
         assert_oci_manifest_platform "$layout" amd64
         assert_oci_manifest_platform "$layout" arm64
         assert_oci_blob_digests "$layout"
+        report_image_digest=$(sed -nE 's/^[[:space:]]*"image_digest": "(sha256:[0-9a-f]{64})",?$/\1/p' \
+          "$report" | head -n 1)
+        primary_descriptor=$(awk '
+          /"digest"[[:space:]]*:/ {
+            digest=$0; sub(/^.*"digest"[[:space:]]*:[[:space:]]*"/, "", digest); sub(/".*$/, "", digest)
+          }
+          /"architecture"[[:space:]]*:[[:space:]]*"amd64"/ { print digest; exit }
+        ' "$layout/index.json")
+        [[ $primary_descriptor == "$report_image_digest" ]]
         grep -Eq '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
           "$layout/index.json"
-        echo 'multi_platform=linux/amd64,linux/arm64 output=oci-layout runner=verified'
+        echo 'multi_platform=linux/amd64,linux/arm64 output=oci-layout primary_digest=runner-verified'
         ;;
       cli-registry-publish)
         "$cli" verify --repository "$fixture" --report-path "$report" --push
@@ -502,6 +529,7 @@ EOF
     for profile in timeout memory temporary-storage architecture; do
       repository="$profile_root/$profile"
       report="$result_directory/profile-$profile.json"
+      expected_cleanup=removed
       case "$profile" in
         timeout)
           expected_exit=3; expected_status=timed_out; expected_phase=runner
@@ -516,16 +544,19 @@ EOF
           expected_step_status=resource_exceeded
           ;;
         architecture)
-          expected_exit=11; expected_status=command_failed; expected_phase=test
-          expected_step_status=command_failed
+          expected_exit=3; expected_status=infrastructure_failed; expected_phase=environment
+          expected_step_status=
+          expected_cleanup=not_needed
           ;;
       esac
       run_expect_status "$expected_exit" "$cli" verify --repository "$repository" \
         --report-path "$report"
-      assert_report_common "$report" removed
+      assert_report_common "$report" "$expected_cleanup"
       grep -Fq "\"status\": \"$expected_status\"" "$report"
       assert_report_phase "$report" "$expected_phase" "$expected_exit"
-      assert_step "$report" test "acceptance-$profile" "$expected_step_status"
+      if [[ -n $expected_step_status ]]; then
+        assert_step "$report" test "acceptance-$profile" "$expected_step_status"
+      fi
       if [[ $profile == memory ]]; then
         grep -Fq '"limit": "memory"' "$report"
       elif [[ $profile == temporary-storage ]]; then

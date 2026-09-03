@@ -65,6 +65,8 @@ impl Default for TaskImageOptions {
 
 pub struct TaskImageRequest<'a> {
     pub environment: &'a BuiltImage,
+    /// Client-side OCI layout for an environment that is not registry-visible.
+    pub environment_oci_layout: Option<&'a Path>,
     /// Optional verified single-platform digest used to keep the primary task
     /// manifest byte-identical while a multi-platform environment index is used
     /// as the build source.
@@ -173,7 +175,7 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
         let plan = TemplatePlan {
             template_id: request.template_id.to_owned(),
             template_version: request.template_version.to_owned(),
-            base_image: environment,
+            base_image: environment.clone(),
             platform: request.platform,
             target_platforms: platforms.clone(),
             build_context: PathBuf::from("."),
@@ -185,6 +187,15 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
         for (name, value) in labels(&request, &identity) {
             build_args.insert(name.to_owned(), value);
         }
+        let environment_context = if let Some(layout) = request.environment_oci_layout {
+            format!(
+                "oci-layout://{}@{}",
+                docker_host_path(layout),
+                request.environment.digest
+            )
+        } else {
+            format!("docker-image://{environment}")
+        };
         let result = self
             .buildkit
             .build(
@@ -199,6 +210,9 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
                         builder: request.options.builder,
                         platforms,
                         build_args,
+                        named_contexts: [("environment".to_owned(), environment_context)]
+                            .into_iter()
+                            .collect(),
                         ..BuildOptions::default()
                     },
                 ),
@@ -271,6 +285,20 @@ fn immutable_environment_ref(environment: &BuiltImage) -> Result<String, TaskIma
     Ok(format!("{}@{}", environment.image, environment.digest))
 }
 
+fn docker_host_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    if cfg!(windows) {
+        let normalized = text.replace('\\', "/");
+        if normalized.as_bytes().get(1) == Some(&b':') {
+            return format!("/{normalized}");
+        }
+        normalized
+    } else {
+        text.to_owned()
+    }
+}
+
 fn write_context(
     root: &Path,
     request: &TaskImageRequest<'_>,
@@ -302,7 +330,6 @@ fn write_context(
 fn dockerfile() -> &'static str {
     r#"# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 ARG BASE_IMAGE
-FROM ${BASE_IMAGE} AS environment
 FROM environment AS task
 ARG TASK_CREATED
 ARG TASK_SOURCE_COMMIT
@@ -466,11 +493,19 @@ mod tests {
                 assert!(ignore.contains("source/**/.git"));
                 assert!(ignore.contains("source/**/.env.*"));
                 let dockerfile = fs::read_to_string(context.join("Dockerfile"))?;
-                assert!(dockerfile.contains("FROM ${BASE_IMAGE} AS environment"));
+                assert!(!dockerfile.contains("FROM ${BASE_IMAGE} AS environment"));
                 assert!(dockerfile.contains("FROM environment AS task"));
                 assert!(dockerfile.contains("COPY --link source/ /workspace/"));
                 assert!(dockerfile.contains("io.repo-sandbox.owner=\"${TASK_IDENTITY}\""));
                 assert!(!dockerfile.contains("ENTRYPOINT"));
+                let context = value_after(&invocation.args, "--build-context");
+                assert!(
+                    context.starts_with("environment=docker-image://")
+                        || context.starts_with("environment=oci-layout:///")
+                );
+                let digest = context.rsplit_once('@').unwrap().1;
+                assert!(digest.starts_with("sha256:"));
+                assert_eq!(digest.len(), 71);
                 let metadata = PathBuf::from(value_after(&invocation.args, "--metadata-file"));
                 fs::write(
                     metadata,
@@ -542,6 +577,7 @@ mod tests {
     ) -> TaskImageRequest<'a> {
         TaskImageRequest {
             environment,
+            environment_oci_layout: None,
             identity_environment_digest: None,
             materialized,
             template_id: "rust-bazel",
@@ -587,6 +623,25 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["--build-arg", "TASK_CONFIG_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]));
         assert!(args.windows(2).any(|pair| pair == ["--build-arg", "BASE_IMAGE=repo-sandbox/environment:stable@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]));
         assert_eq!(value_after(args, "--target"), "task");
+    }
+
+    #[test]
+    fn local_environment_is_transferred_as_digest_pinned_oci_context() {
+        let (_repository, materialized) = materialize(&[("source.rs", "safe")]);
+        let environment = environment();
+        let config = config();
+        let layout = tempfile::tempdir().unwrap();
+        let executor = InspectingExecutor::new();
+        let mut task = request(&environment, &materialized, &config);
+        task.environment_oci_layout = Some(layout.path());
+        TaskImageBuilder::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(task, &NeverCancelled)
+            .unwrap();
+        let calls = executor.invocations.lock().unwrap();
+        let context = value_after(&calls[0].args, "--build-context");
+        assert!(context.starts_with("environment=oci-layout:///"));
+        assert!(context.ends_with(environment.digest.as_str()));
     }
 
     #[test]

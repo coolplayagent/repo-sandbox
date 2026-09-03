@@ -295,12 +295,16 @@ pub struct CleanResult {
     pub dry_run: bool,
     pub succeeded: Vec<CleanCandidate>,
     pub skipped: Vec<String>,
+    /// Trusted resources that were already absent.
+    pub absent: Vec<String>,
+    /// Owned resources deliberately left in place (active, cancelled, or referenced).
+    pub unfinished: Vec<String>,
     pub failed: Vec<String>,
 }
 
 impl CleanResult {
     pub fn complete(&self) -> bool {
-        self.failed.is_empty()
+        self.failed.is_empty() && self.unfinished.is_empty()
     }
 }
 
@@ -321,5 +325,26 @@ impl<'a, P: CleanPort + ?Sized> CleanUseCase<'a, P> {
     }
     pub fn execute(&self, plan: &CleanPlan, dry_run: bool) -> Result<CleanResult, AppError> {
         self.port.execute(plan, dry_run)
+    }
+}
+
+#[cfg(test)]
+mod clean_result_tests {
+    use super::CleanResult;
+
+    #[test]
+    fn dry_run_absent_and_excluded_are_complete_but_unfinished_is_not() {
+        let complete = CleanResult {
+            dry_run: true,
+            skipped: vec!["dry-run or excluded".into()],
+            absent: vec!["already absent".into()],
+            ..CleanResult::default()
+        };
+        assert!(complete.complete());
+        let incomplete = CleanResult {
+            unfinished: vec!["active, cancelled, or referenced".into()],
+            ..CleanResult::default()
+        };
+        assert!(!incomplete.complete());
     }
 }

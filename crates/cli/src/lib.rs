@@ -261,9 +261,11 @@ fn render_clean_result(
     let mut lines = vec![
         render_clean_plan(plan),
         format!(
-            "clean: {} succeeded, {} skipped, {} failed{}",
+            "clean: {} succeeded, {} skipped, {} absent, {} unfinished, {} failed{}",
             result.succeeded.len(),
             result.skipped.len(),
+            result.absent.len(),
+            result.unfinished.len(),
             result.failed.len(),
             if result.dry_run { " (dry-run)" } else { "" }
         ),
@@ -273,6 +275,12 @@ fn render_clean_result(
     }
     for item in &result.skipped {
         lines.push(format!("  skipped {item}"));
+    }
+    for item in &result.absent {
+        lines.push(format!("  absent {item}"));
+    }
+    for item in &result.unfinished {
+        lines.push(format!("  unfinished {item}"));
     }
     for item in &result.failed {
         lines.push(format!("  failed {item}"));

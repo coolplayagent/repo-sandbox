@@ -7,8 +7,8 @@ build_context: templates/rust-bazel/context
 execution:
   version: 1
   build: [{ name: acceptance-build, command: "true" }]
-  test: [{ name: acceptance-architecture, command: "echo expected=impossible actual=$(uname -m); test $(uname -m) = impossible" }]
+  test: [{ name: acceptance-architecture, command: "uname -m" }]
   resources: { cpu: 1, memory_mb: 256, temporary_storage_mb: 64 }
   timeout_seconds: 120
   fail_fast: true
-
+  runner_platform: linux/arm64

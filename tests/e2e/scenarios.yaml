@@ -7,7 +7,7 @@ scenarios:
     covers: [cli, build, report, phase, step, digest, exact_cleanup, cold_cache, warm_cache, source_change]
     timeout_seconds: 900
     command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-build-success, "${RESULT_DIR}"] }
-    expected: { exit_code: 0, log_contains: ["cache=cold_then_warm source_digest=changed", "cli-build-success=passed"], artifacts: [cli-build-success.passed] }
+    expected: { exit_code: 0, log_contains: ["cache=cold_then_warm cache_hit=verified source_digest=changed", "cli-build-success=passed"], artifacts: [cli-build-success.passed] }
 
   - id: cli-verify-success
     description: Exercise build and test phases from the real CLI entry point.
@@ -40,10 +40,10 @@ scenarios:
     description: Retain a failed task, prove dry-run immutability, reject a forged owner, clean it, and preserve a foreign shared resource.
     tier: required
     targets: [docker]
-    covers: [cli, clean, dry_run_unchanged, owner_mismatch, foreign_shared_resource, exact_cleanup, idempotent]
+    covers: [cli, clean, dry_run_unchanged, owner_mismatch, referenced_exit, foreign_shared_resource, exact_cleanup, idempotent]
     timeout_seconds: 600
     command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-clean-owned-only, "${RESULT_DIR}"] }
-    expected: { exit_code: 0, log_contains: ["dry_run=unchanged owner_mismatch=refused foreign_resource=preserved cleanup=idempotent", "cli-clean-owned-only=passed"], artifacts: [cli-clean-owned-only.passed] }
+    expected: { exit_code: 0, log_contains: ["dry_run=unchanged owner_mismatch=refused referenced=exit3 foreign_resource=preserved cleanup=idempotent", "cli-clean-owned-only=passed"], artifacts: [cli-clean-owned-only.passed] }
 
   - id: cli-interrupt-cleanup
     description: Interrupt a live CLI test step and prove stable cancellation reporting, exact cleanup journaling and unrelated-resource safety.

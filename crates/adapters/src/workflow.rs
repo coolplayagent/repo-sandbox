@@ -71,6 +71,7 @@ impl WorkflowPort for SystemWorkflow {
                 .as_deref()
                 .map(OutputReservation::oci)
                 .transpose()?;
+            prepare_state_layout(&repository, &state)?;
             let journal = ManifestJournal::create(&state, &task_id)?;
             let registry = plan.template.execution.registry.as_ref();
             if plan.request.push && registry.is_none() {
@@ -137,6 +138,14 @@ impl WorkflowPort for SystemWorkflow {
             let environment_ref =
                 ImageRef::new(format!("repo-sandbox-env:{}", short_digest(&plan.digest)))
                     .map_err(AppError::Configuration)?;
+            // A docker-container builder cannot resolve images loaded only into the host
+            // daemon. Export the immutable environment through the client session and pass
+            // that OCI layout back as a named context to the same selected builder.
+            let environment_export = tempfile::Builder::new()
+                .prefix("repo-sandbox-environment-")
+                .tempdir()
+                .map_err(environment("create environment OCI staging"))?;
+            let environment_layout = environment_export.path().join("layout");
             let environment_image = BuildKit::new(SystemProcessExecutor)
                 .build(
                     BuildRequest::environment(
@@ -146,6 +155,7 @@ impl WorkflowPort for SystemWorkflow {
                         owned_environment_options(
                             BuildOptions {
                                 progress: Progress::Plain,
+                                output: ImageOutput::OciDirectory(environment_layout.clone()),
                                 cache: cache_options,
                                 ..BuildOptions::default()
                             },
@@ -155,14 +165,6 @@ impl WorkflowPort for SystemWorkflow {
                     &cancellation,
                 )
                 .map_err(|error| bounded_error("environment image", error, &cancellation))?;
-            let environment_execution_image =
-                resolve_local_image_id(&environment_image, &cancellation)?;
-            journal.append(&[owned_environment_image_candidate(
-                &task_id,
-                &repository_id,
-                &environment_execution_image,
-                &plan.digest,
-            )])?;
             if cache_export.exists() {
                 rotate_cache_export(&cache, &cache_export, &cache_import, &cancellation)?;
             }
@@ -174,6 +176,7 @@ impl WorkflowPort for SystemWorkflow {
                 .build(
                     TaskImageRequest {
                         environment: &environment_image,
+                        environment_oci_layout: Some(&environment_layout),
                         identity_environment_digest: None,
                         materialized: &materialized,
                         template_id: &plan.template.template_id,
@@ -269,7 +272,7 @@ impl WorkflowPort for SystemWorkflow {
                     },
                     artifact_directories: execution.artifact_directories.clone(),
                 },
-                platform: plan.request.platform,
+                platform: execution.runner_platform.unwrap_or(plan.request.platform),
                 build,
                 test,
                 resources: RunResources {
@@ -360,10 +363,10 @@ impl WorkflowPort for SystemWorkflow {
                     &catalog_root,
                     &materialized,
                     &environment_image,
+                    &environment_layout,
+                    &task_image.image,
                     &configuration_digest,
                     &repository_id,
-                    &task_id,
-                    &journal,
                     output,
                     &cancellation,
                 )?;
@@ -542,6 +545,7 @@ impl CleanPort for SystemWorkflow {
                     if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                         continue;
                     }
+                    validate_state_root(&repository, &remote)?;
                     stores.push((remote.join("tasks"), format!("sha256:{name}")));
                 }
             }
@@ -657,7 +661,7 @@ fn execute_clean(
             Some(lease) => Some(lease),
             None => {
                 result
-                    .skipped
+                    .unfinished
                     .extend(plan.candidates.iter().map(|candidate| {
                         format!(
                             "{}: active workflow holds the repository lease",
@@ -672,7 +676,7 @@ fn execute_clean(
     };
     for candidate in &plan.candidates {
         if cancellation.is_cancelled() {
-            result.skipped.push(format!(
+            result.unfinished.push(format!(
                 "{}: clean cancelled before candidate",
                 candidate.identifier
             ));
@@ -686,7 +690,7 @@ fn execute_clean(
             continue;
         }
         match remove_candidate(candidate, cancellation) {
-            Ok(true) => {
+            Ok(RemovalOutcome::Removed) => {
                 result.succeeded.push(candidate.clone());
                 let root = plan
                     .journal_roots
@@ -701,10 +705,10 @@ fn execute_clean(
                     ));
                 }
             }
-            Ok(false) => result.skipped.push(format!(
-                "{}: absent or still referenced",
-                candidate.identifier
-            )),
+            Ok(RemovalOutcome::Absent) => result.absent.push(candidate.identifier.clone()),
+            Ok(RemovalOutcome::Referenced) => result
+                .unfinished
+                .push(format!("{}: still referenced", candidate.identifier)),
             Err(error) => result
                 .failed
                 .push(format!("{}: {error}", candidate.identifier)),
@@ -1014,6 +1018,7 @@ fn build_multi_platform_task(
             .build(
                 TaskImageRequest {
                     environment: &platform_environment,
+                    environment_oci_layout: None,
                     identity_environment_digest: None,
                     materialized,
                     template_id: &plan.template.template_id,
@@ -1039,11 +1044,8 @@ fn build_multi_platform_task(
                     cancellation,
                 )
             })?;
-        if *platform == plan.request.platform && task.image.digest != verified_task.digest {
-            return Err(AppError::Environment(
-                "multi-platform task primary manifest differs from the image verified by the runner"
-                    .into(),
-            ));
+        if *platform == plan.request.platform {
+            verify_primary_digest(&task.image, verified_task, "multi-platform task")?;
         }
         sources.push(format!("{}@{}", task.image.image, task.image.digest));
         task_manifests.push(repo_sandbox_core::build::PlatformDigest {
@@ -1074,63 +1076,61 @@ fn export_verified_oci(
     catalog_root: &Path,
     materialized: &crate::snapshot::MaterializedSnapshot,
     primary_environment: &BuiltImage,
+    primary_environment_layout: &Path,
+    verified_task: &BuiltImage,
     configuration_digest: &ConfigurationDigest,
     repository_id: &str,
-    task_id: &str,
-    journal: &ManifestJournal,
     output: &Path,
     cancellation: &DeadlineCancellation,
 ) -> Result<(), AppError> {
     let temporary = create_oci_staging(output)?;
     let mut layouts = Vec::new();
     for (index, platform) in plan.request.platforms.iter().copied().enumerate() {
-        let environment = if platform == plan.request.platform {
-            primary_environment.clone()
+        let environment_layout;
+        let (environment, environment_context) = if platform == plan.request.platform {
+            (primary_environment.clone(), primary_environment_layout)
         } else {
+            environment_layout = temporary.path().join(format!("environment-{index}"));
             let image = ImageRef::new(format!(
                 "repo-sandbox-env:{}-{index}",
                 short_digest(&plan.digest)
             ))
             .map_err(AppError::Configuration)?;
-            BuildKit::new(SystemProcessExecutor)
-                .build(
-                    BuildRequest::environment(
-                        &plan.template,
-                        catalog_root,
-                        image,
-                        owned_environment_options(
-                            BuildOptions {
-                                progress: Progress::Plain,
-                                platforms: vec![platform],
-                                ..BuildOptions::default()
-                            },
-                            repository_id,
+            (
+                BuildKit::new(SystemProcessExecutor)
+                    .build(
+                        BuildRequest::environment(
+                            &plan.template,
+                            catalog_root,
+                            image,
+                            owned_environment_options(
+                                BuildOptions {
+                                    progress: Progress::Plain,
+                                    output: ImageOutput::OciDirectory(environment_layout.clone()),
+                                    platforms: vec![platform],
+                                    ..BuildOptions::default()
+                                },
+                                repository_id,
+                            ),
                         ),
-                    ),
-                    cancellation,
-                )
-                .map_err(|error| {
-                    bounded_error(
-                        &format!("OCI environment for {platform}"),
-                        error,
                         cancellation,
                     )
-                })?
+                    .map_err(|error| {
+                        bounded_error(
+                            &format!("OCI environment for {platform}"),
+                            error,
+                            cancellation,
+                        )
+                    })?,
+                environment_layout.as_path(),
+            )
         };
-        if platform != plan.request.platform {
-            let execution_image = resolve_local_image_id(&environment, cancellation)?;
-            journal.append(&[owned_environment_image_candidate(
-                task_id,
-                repository_id,
-                &execution_image,
-                &plan.digest,
-            )])?;
-        }
         let layout = temporary.path().join(format!("platform-{index}"));
-        TaskImageBuilder::new(SystemProcessExecutor)
+        let exported = TaskImageBuilder::new(SystemProcessExecutor)
             .build(
                 TaskImageRequest {
                     environment: &environment,
+                    environment_oci_layout: Some(environment_context),
                     identity_environment_digest: None,
                     materialized,
                     template_id: &plan.template.template_id,
@@ -1152,9 +1152,26 @@ fn export_verified_oci(
             .map_err(|error| {
                 bounded_error(&format!("OCI task for {platform}"), error, cancellation)
             })?;
+        if platform == plan.request.platform {
+            verify_primary_digest(&exported.image, verified_task, "OCI task")?;
+        }
         layouts.push((platform, layout));
     }
     merge_oci_layouts(&layouts, output, temporary.path())
+}
+
+fn verify_primary_digest(
+    exported: &BuiltImage,
+    verified: &BuiltImage,
+    operation: &str,
+) -> Result<(), AppError> {
+    if exported.digest != verified.digest {
+        Err(AppError::Environment(format!(
+            "{operation} primary manifest differs from the image verified by the runner"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn merge_oci_layouts(
@@ -1548,6 +1565,7 @@ fn owned_task_image_candidate(
     }
 }
 
+#[cfg(test)]
 fn owned_environment_image_candidate(
     task_id: &str,
     repository_id: &str,
@@ -1854,38 +1872,69 @@ fn state_root(plan: &ExecutionPlan, local_root: &Path, repository_id: &str) -> P
 
 fn validate_state_root(repository: &Path, state: &Path) -> Result<(), AppError> {
     let base = repository.join(".repo-sandbox");
-    if let Ok(metadata) = fs::symlink_metadata(&base) {
-        if is_link_or_reparse(&metadata) {
-            return Err(AppError::Environment(
-                "workflow state root must not be a symlink or reparse point".into(),
-            ));
-        }
-        let canonical = base
-            .canonicalize()
-            .map_err(environment("resolve workflow state root"))?;
-        if !canonical.starts_with(repository) {
-            return Err(AppError::Environment(
-                "workflow state root escapes the repository".into(),
-            ));
-        }
-    }
     if !state.starts_with(&base) {
         return Err(AppError::Environment(
             "workflow state store escapes the trusted state root".into(),
         ));
     }
-    if state.exists() {
-        let canonical_base = base
-            .canonicalize()
-            .map_err(environment("resolve workflow state root"))?;
-        let canonical_state = state
-            .canonicalize()
-            .map_err(environment("resolve workflow state store"))?;
-        if !canonical_state.starts_with(&canonical_base) {
-            return Err(AppError::Environment(
-                "workflow state store escapes the trusted state root".into(),
-            ));
+    let mut paths = vec![base.clone(), base.join("remotes")];
+    if state != base {
+        paths.push(base.join("remotes"));
+        paths.push(state.to_path_buf());
+    }
+    for leaf in ["tasks", "cache", "reports", "artifacts"] {
+        paths.push(state.join(leaf));
+    }
+    for path in paths {
+        validate_state_component(repository, &path)?;
+    }
+    Ok(())
+}
+
+fn prepare_state_layout(repository: &Path, state: &Path) -> Result<(), AppError> {
+    // Complete the read-only validation pass before creating any component.
+    validate_state_root(repository, state)?;
+    let base = repository.join(".repo-sandbox");
+    let mut paths = vec![base.clone()];
+    if state != base {
+        paths.push(base.join("remotes"));
+        paths.push(state.to_path_buf());
+    }
+    for leaf in ["tasks", "cache", "reports", "artifacts"] {
+        paths.push(state.join(leaf));
+    }
+    for path in paths {
+        if !path.exists() {
+            fs::create_dir(&path).map_err(environment("create workflow state component"))?;
         }
+        validate_state_component(repository, &path)?;
+    }
+    Ok(())
+}
+
+fn validate_state_component(repository: &Path, path: &Path) -> Result<(), AppError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(environment("inspect workflow state component")(error)),
+    };
+    if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(AppError::Environment(format!(
+            "workflow state component must be a real directory: {}",
+            path.display()
+        )));
+    }
+    let canonical_repository = repository
+        .canonicalize()
+        .map_err(environment("resolve repository state boundary"))?;
+    let canonical = path
+        .canonicalize()
+        .map_err(environment("resolve workflow state component"))?;
+    if !canonical.starts_with(canonical_repository) {
+        return Err(AppError::Environment(format!(
+            "workflow state component escapes the repository: {}",
+            path.display()
+        )));
     }
     Ok(())
 }
@@ -2160,10 +2209,17 @@ fn registry_content_ref(
     repository.tagged(&RegistryTag::for_digest(digest))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemovalOutcome {
+    Removed,
+    Absent,
+    Referenced,
+}
+
 fn remove_candidate(
     candidate: &CleanCandidate,
     cancellation: &dyn Cancellation,
-) -> Result<bool, String> {
+) -> Result<RemovalOutcome, String> {
     match candidate.kind {
         ResourceKind::Container => {
             let inspected = docker_output(
@@ -2176,6 +2232,16 @@ fn remove_candidate(
                 ],
                 cancellation,
             )?;
+            if inspected.exit_code != Some(0) {
+                return if docker_object_absent(&inspected.stderr) {
+                    Ok(RemovalOutcome::Absent)
+                } else {
+                    Err(format!(
+                        "inspect owned container: {}",
+                        inspected.stderr.trim()
+                    ))
+                };
+            }
             let repository = docker_output(
                 &[
                     "container",
@@ -2186,8 +2252,11 @@ fn remove_candidate(
                 ],
                 cancellation,
             )?;
-            if inspected.exit_code != Some(0) {
-                return Ok(false);
+            if repository.exit_code != Some(0) {
+                return Err(format!(
+                    "inspect container repository owner: {}",
+                    repository.stderr.trim()
+                ));
             }
             if inspected.stdout.trim() != candidate.owner
                 || repository.stdout.trim() != candidate.repository_id
@@ -2199,7 +2268,7 @@ fn remove_candidate(
                 cancellation,
             )?;
             if removed.exit_code == Some(0) {
-                Ok(true)
+                Ok(RemovalOutcome::Removed)
             } else {
                 Err(removed.stderr)
             }
@@ -2215,6 +2284,13 @@ fn remove_candidate(
                 ],
                 cancellation,
             )?;
+            if inspected.exit_code != Some(0) {
+                return if docker_object_absent(&inspected.stderr) {
+                    Ok(RemovalOutcome::Absent)
+                } else {
+                    Err(format!("inspect owned image: {}", inspected.stderr.trim()))
+                };
+            }
             let repository = docker_output(
                 &[
                     "image",
@@ -2225,8 +2301,11 @@ fn remove_candidate(
                 ],
                 cancellation,
             )?;
-            if inspected.exit_code != Some(0) {
-                return Ok(false);
+            if repository.exit_code != Some(0) {
+                return Err(format!(
+                    "inspect image repository owner: {}",
+                    repository.stderr.trim()
+                ));
             }
             if inspected.stdout.trim() != candidate.owner
                 || repository.stdout.trim() != candidate.repository_id
@@ -2244,40 +2323,56 @@ fn remove_candidate(
                 ],
                 cancellation,
             )?;
+            if references.exit_code != Some(0) {
+                return Err(format!(
+                    "inspect image references: {}",
+                    references.stderr.trim()
+                ));
+            }
             if !references.stdout.trim().is_empty() {
-                return Ok(false);
+                return Ok(RemovalOutcome::Referenced);
             }
             let removed = docker_output(&["image", "rm", &candidate.identifier], cancellation)?;
             if removed.exit_code == Some(0) {
-                Ok(true)
+                Ok(RemovalOutcome::Removed)
             } else {
                 Err(removed.stderr)
             }
         }
         ResourceKind::Source => {
             let path = PathBuf::from(&candidate.identifier);
+            if !path.exists() {
+                return Ok(RemovalOutcome::Absent);
+            }
             let parent = path.parent().ok_or("source has no parent")?;
             cleanup_owned_temp_source(parent, &path, &candidate.owner)
-                .map(|_| true)
+                .map(|_| RemovalOutcome::Removed)
                 .map_err(|e| e.to_string())
         }
         ResourceKind::Cache => {
             let path = PathBuf::from(&candidate.identifier);
             if !path.exists() {
-                return Ok(false);
+                return Ok(RemovalOutcome::Absent);
             }
             let owner = fs::read_to_string(path.join(OWNER_MARKER)).map_err(|e| e.to_string())?;
             if owner != candidate.owner {
                 return Err("cache owner marker mismatch".into());
             }
             fs::remove_dir_all(path)
-                .map(|_| true)
+                .map(|_| RemovalOutcome::Removed)
                 .map_err(|e| e.to_string())
         }
         ResourceKind::Builder => {
             Err("builder cleanup requires an exact adapter ownership record".into())
         }
     }
+}
+
+fn docker_object_absent(stderr: &str) -> bool {
+    let message = stderr.to_ascii_lowercase();
+    message.contains("no such container")
+        || message.contains("no such image")
+        || message.contains("no such object")
 }
 
 fn trusted_source_path(identifier: &str) -> bool {
@@ -2362,6 +2457,22 @@ mod tests {
         assert_eq!(descriptors[1]["platform"]["architecture"], "arm64");
         assert!(output.join("blobs/sha256").join("a".repeat(64)).is_file());
         assert!(output.join("blobs/sha256").join("b".repeat(64)).is_file());
+    }
+
+    #[test]
+    fn oci_primary_must_equal_the_runner_verified_manifest() {
+        let image = |value: char| BuiltImage {
+            image: ImageRef::new("repo-sandbox-task:test").unwrap(),
+            digest: repo_sandbox_core::build::ImageDigest::new(format!(
+                "sha256:{}",
+                value.to_string().repeat(64)
+            ))
+            .unwrap(),
+            platform_digests: Vec::new(),
+        };
+        assert!(verify_primary_digest(&image('a'), &image('a'), "OCI task").is_ok());
+        let error = verify_primary_digest(&image('b'), &image('a'), "OCI task").unwrap_err();
+        assert!(error.to_string().contains("runner"));
     }
 
     #[test]
@@ -2566,7 +2677,18 @@ mod tests {
         )
         .unwrap();
         assert!(result.succeeded.is_empty());
-        assert!(result.skipped[0].contains("cancelled"));
+        assert!(result.unfinished[0].contains("cancelled"));
+        assert!(!result.complete());
+    }
+
+    #[test]
+    fn clean_distinguishes_absent_objects_from_docker_failures() {
+        assert!(docker_object_absent("Error: No such image: sha256:abc"));
+        assert!(docker_object_absent("Error: No such container: task"));
+        assert!(!docker_object_absent(
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+        ));
+        assert!(!docker_object_absent("permission denied"));
     }
 
     #[cfg(unix)]
@@ -2578,6 +2700,53 @@ mod tests {
         symlink(outside.path(), repository.path().join(".repo-sandbox")).unwrap();
         let state = repository.path().join(".repo-sandbox");
         assert!(validate_state_root(repository.path(), &state).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_state_descendant_is_rejected_before_any_owned_write() {
+        use std::os::unix::fs::symlink;
+        for leaf in ["cache", "reports", "artifacts", "tasks"] {
+            let repository = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let sentinel = outside.path().join("sentinel");
+            fs::write(&sentinel, "unchanged").unwrap();
+            let state = repository.path().join(".repo-sandbox");
+            fs::create_dir(&state).unwrap();
+            symlink(outside.path(), state.join(leaf)).unwrap();
+            assert!(prepare_state_layout(repository.path(), &state).is_err());
+            assert_eq!(fs::read_to_string(sentinel).unwrap(), "unchanged");
+            assert_eq!(fs::read_dir(&state).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_state_descendant_is_rejected_before_any_owned_write() {
+        for leaf in ["cache", "reports", "artifacts", "tasks"] {
+            let repository = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let sentinel = outside.path().join("sentinel");
+            fs::write(&sentinel, "unchanged").unwrap();
+            let state = repository.path().join(".repo-sandbox");
+            fs::create_dir(&state).unwrap();
+            let junction = state.join(leaf);
+            let status = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &junction.to_string_lossy(),
+                    &outside.path().to_string_lossy(),
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert!(prepare_state_layout(repository.path(), &state).is_err());
+            assert_eq!(fs::read_to_string(sentinel).unwrap(), "unchanged");
+            assert_eq!(fs::read_dir(&state).unwrap().count(), 1);
+            fs::remove_dir(&junction).unwrap();
+        }
     }
 
     #[test]
@@ -3082,7 +3251,8 @@ mod tests {
             ..CleanPlan::default()
         };
         let blocked = CleanPort::execute(&SystemWorkflow, &blocked, false).unwrap();
-        assert!(blocked.skipped[0].contains("active workflow"));
+        assert!(blocked.unfinished[0].contains("active workflow"));
+        assert!(!blocked.complete());
         let independent = CleanPort::execute(&SystemWorkflow, &independent, true).unwrap();
         assert!(independent.skipped[0].contains("dry-run"));
         assert!(!second_state.exists());

@@ -7,8 +7,7 @@ build_context: templates/rust-bazel/context
 execution:
   version: 1
   build: [{ name: acceptance-build, command: "true" }]
-  test: [{ name: acceptance-timeout, command: "sleep 30" }]
+  test: [{ name: acceptance-timeout, command: "sleep 600" }]
   resources: { cpu: 1, memory_mb: 256, temporary_storage_mb: 64 }
-  timeout_seconds: 5
+  timeout_seconds: 180
   fail_fast: true
-
