@@ -1254,6 +1254,11 @@ where
     let mut child = command
         .spawn()
         .map_err(|error| SnapshotError::Git(format!("could not execute Git: {error}")))?;
+    let process_tree = ProcessTree::attach(&mut child).map_err(|error| {
+        let _ = child.kill();
+        let _ = child.wait();
+        SnapshotError::Git(format!("could not bind Git process tree: {error}"))
+    })?;
     let stdout = child.stdout.take().expect("Git stdout is piped");
     let stderr = child.stderr.take().expect("Git stderr is piped");
     let stdout_reader = thread::spawn(move || {
@@ -1268,7 +1273,7 @@ where
     });
     let status = loop {
         if cancellation.is_cancelled() {
-            terminate_process_tree(&mut child);
+            process_tree.terminate();
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
@@ -1284,6 +1289,9 @@ where
         }
         thread::sleep(Duration::from_millis(20));
     };
+    // A helper may outlive Git while retaining its output pipe. Terminating the
+    // now-childless process group/job bounds reader joins on every exit path.
+    process_tree.terminate();
     let stdout = stdout_reader
         .join()
         .map_err(|_| SnapshotError::Git("Git stdout reader panicked".into()))?
@@ -1306,28 +1314,168 @@ fn configure_process_tree(command: &mut Command) {
 }
 
 #[cfg(windows)]
-fn configure_process_tree(_command: &mut Command) {}
+fn configure_process_tree(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    command.creation_flags(CREATE_SUSPENDED);
+}
 
 #[cfg(unix)]
-fn terminate_process_tree(child: &mut std::process::Child) {
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
+struct ProcessTree {
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl ProcessTree {
+    fn attach(child: &mut std::process::Child) -> std::io::Result<Self> {
+        Ok(Self { pid: child.id() })
     }
-    const SIGKILL: i32 = 9;
-    let process_group = -(child.id() as i32);
-    // SAFETY: the child was placed in a distinct process group whose id is its
-    // pid; a negative pid targets only that group.
-    let _ = unsafe { kill(process_group, SIGKILL) };
+
+    fn terminate(&self) {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        // SAFETY: configure_process_tree made the child's pid the distinct
+        // process-group id, retained even after the group leader exits.
+        let _ = unsafe { kill(-(self.pid as i32), SIGKILL) };
+    }
 }
 
 #[cfg(windows)]
-fn terminate_process_tree(child: &mut std::process::Child) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &child.id().to_string(), "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = child.kill();
+struct ProcessTree {
+    job: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    fn attach(child: &mut std::process::Child) -> std::io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        unsafe extern "system" {
+            fn CreateJobObjectW(
+                attributes: *const std::ffi::c_void,
+                name: *const u16,
+            ) -> *mut std::ffi::c_void;
+            fn AssignProcessToJobObject(
+                job: *mut std::ffi::c_void,
+                process: *mut std::ffi::c_void,
+            ) -> i32;
+        }
+        // SAFETY: null attributes/name request a private unnamed Job Object.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // The process was created suspended, so it cannot create an untracked
+        // descendant before assignment to the Job Object.
+        if unsafe { AssignProcessToJobObject(job, child.as_raw_handle()) } == 0 {
+            close_windows_handle(job);
+            return Err(std::io::Error::last_os_error());
+        }
+        if let Err(error) = resume_windows_process_threads(child.id()) {
+            unsafe extern "system" {
+                fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
+            }
+            let _ = unsafe { TerminateJobObject(job, 1) };
+            close_windows_handle(job);
+            return Err(error);
+        }
+        Ok(Self { job })
+    }
+
+    fn terminate(&self) {
+        unsafe extern "system" {
+            fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
+        }
+        // SAFETY: self.job is a live Job Object handle owned by this value.
+        let _ = unsafe { TerminateJobObject(self.job, 1) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        close_windows_handle(self.job);
+    }
+}
+
+#[cfg(windows)]
+fn resume_windows_process_threads(process_id: u32) -> std::io::Result<()> {
+    #[repr(C)]
+    struct ThreadEntry32 {
+        size: u32,
+        usage: u32,
+        thread_id: u32,
+        owner_process_id: u32,
+        base_priority: i32,
+        delta_priority: i32,
+        flags: u32,
+    }
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut std::ffi::c_void;
+        fn Thread32First(snapshot: *mut std::ffi::c_void, entry: *mut ThreadEntry32) -> i32;
+        fn Thread32Next(snapshot: *mut std::ffi::c_void, entry: *mut ThreadEntry32) -> i32;
+        fn OpenThread(access: u32, inherit: i32, thread_id: u32) -> *mut std::ffi::c_void;
+        fn ResumeThread(thread: *mut std::ffi::c_void) -> u32;
+    }
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+    let invalid_handle = -1_isize as *mut std::ffi::c_void;
+    // SAFETY: the returned snapshot is checked and closed below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == invalid_handle {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut entry = ThreadEntry32 {
+        size: std::mem::size_of::<ThreadEntry32>() as u32,
+        usage: 0,
+        thread_id: 0,
+        owner_process_id: 0,
+        base_priority: 0,
+        delta_priority: 0,
+        flags: 0,
+    };
+    let mut found = false;
+    // SAFETY: entry has the documented size/layout and snapshot is live.
+    let mut available = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while available {
+        if entry.owner_process_id == process_id {
+            // SAFETY: OpenThread returns an independently owned handle.
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.thread_id) };
+            if thread.is_null() {
+                close_windows_handle(snapshot);
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: thread is a valid handle with suspend/resume access.
+            let resumed = unsafe { ResumeThread(thread) };
+            close_windows_handle(thread);
+            if resumed == u32::MAX {
+                close_windows_handle(snapshot);
+                return Err(std::io::Error::last_os_error());
+            }
+            found = true;
+        }
+        // SAFETY: entry and snapshot remain valid for enumeration.
+        available = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    close_windows_handle(snapshot);
+    if found {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "suspended Git process thread was not found",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn close_windows_handle(handle: *mut std::ffi::c_void) {
+    unsafe extern "system" {
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+    // SAFETY: callers pass an owned, non-null kernel handle exactly once.
+    let _ = unsafe { CloseHandle(handle) };
 }
 
 fn io_error(operation: &'static str) -> impl FnOnce(std::io::Error) -> SnapshotError {
@@ -1706,13 +1854,43 @@ mod tests {
             .stderr(Stdio::piped());
         let started = std::time::Instant::now();
         let mut child = command.spawn().unwrap();
+        let process_tree = ProcessTree::attach(&mut child).unwrap();
         let stdout = child.stdout.take().unwrap();
         let reader = thread::spawn(move || {
             let mut output = Vec::new();
             let mut stdout = stdout;
             stdout.read_to_end(&mut output).unwrap();
         });
-        terminate_process_tree(&mut child);
+        process_tree.terminate();
+        child.wait().unwrap();
+        reader.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_termination_bounds_descendants_that_hold_output_pipes_without_taskkill() {
+        let mut command = Command::new("cmd");
+        command
+            .args([
+                "/d",
+                "/s",
+                "/c",
+                "start \"\" /b cmd /d /s /c \"ping -n 30 127.0.0.1 >NUL\"",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        let started = std::time::Instant::now();
+        let mut child = command.spawn().unwrap();
+        let process_tree = ProcessTree::attach(&mut child).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let reader = thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut stdout = stdout;
+            stdout.read_to_end(&mut output).unwrap();
+        });
+        process_tree.terminate();
         child.wait().unwrap();
         reader.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));

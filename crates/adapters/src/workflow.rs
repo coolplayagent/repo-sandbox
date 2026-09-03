@@ -67,14 +67,15 @@ impl WorkflowPort for SystemWorkflow {
         )?;
         validate_output_path_overlap(plan)?;
         validate_state_outputs(&state, &report_path, plan.request.oci_layout.as_deref())?;
-        if plan.request.report.is_some() && !path_is_within_state(&state, &report_path)? {
-            validate_report_destination(&report_path)?;
-        }
+        // Finish every pure plan validation before creating an explicit report
+        // parent or any reservation/state file.
+        validate_outputs(plan)?;
+        let report_destination =
+            ReportDestination::prepare(classify_report_destination(&state, &report_path)?)?;
         let _report_reservation = OutputReservation::report(&report_path)?;
         let mut completed_report = None;
         let mut bound_state = None;
         let result = (|| {
-            validate_outputs(plan)?;
             let _oci_reservation = plan
                 .request
                 .oci_layout
@@ -85,11 +86,6 @@ impl WorkflowPort for SystemWorkflow {
                 prepare_leased_workflow_state(&repository, &state, &task_id)?;
             bound_state = Some(state_guard.clone());
             let registry = plan.template.execution.registry.as_ref();
-            if plan.request.push && registry.is_none() {
-                return Err(AppError::Configuration(
-                    "--push requires execution.registry.repository in the central profile".into(),
-                ));
-            }
             preflight(plan, &repository, &cancellation)?;
             let cache = state.join("cache");
             let cache_io = state_guard.bound_path(&cache)?;
@@ -474,7 +470,7 @@ impl WorkflowPort for SystemWorkflow {
             annotate_report(&mut report);
             completed_report = Some(report.clone());
 
-            let report_io = bound_state_path(&bound_state, &state, &report_path)?;
+            let report_io = report_destination.bound_path(bound_state.as_ref())?;
             write_report_json(&report, &report_io).map_err(environment("write atomic report"))?;
             let result = WorkflowResult {
                 plan_digest: plan.digest.clone(),
@@ -518,7 +514,7 @@ impl WorkflowPort for SystemWorkflow {
             }
         })();
         if let Err(error) = &result
-            && !report_path.exists()
+            && !report_destination.exists(bound_state.as_ref())?
         {
             if let Some(mut report) = completed_report {
                 if matches!(report.status, RunStatus::Succeeded) {
@@ -535,7 +531,7 @@ impl WorkflowPort for SystemWorkflow {
                     state.ensure()?;
                 }
                 let Some(report_io) =
-                    optional_failure_report_path(&bound_state, &state, &report_path)?
+                    optional_failure_report_path(&bound_state, &report_destination)?
                 else {
                     return result;
                 };
@@ -576,7 +572,7 @@ impl WorkflowPort for SystemWorkflow {
             if let Some(state) = &bound_state {
                 state.ensure()?;
             }
-            let Some(report_io) = optional_failure_report_path(&bound_state, &state, &report_path)?
+            let Some(report_io) = optional_failure_report_path(&bound_state, &report_destination)?
             else {
                 return result;
             };
@@ -590,13 +586,12 @@ impl WorkflowPort for SystemWorkflow {
 
 fn optional_failure_report_path(
     bound_state: &Option<StateLayoutGuard>,
-    state: &Path,
-    report: &Path,
+    destination: &ReportDestination,
 ) -> Result<Option<PathBuf>, AppError> {
-    if bound_state.is_none() && path_is_within_state(state, report)? {
+    if bound_state.is_none() && matches!(destination, ReportDestination::State { .. }) {
         return Ok(None);
     }
-    bound_state_path(bound_state, state, report).map(Some)
+    destination.bound_path(bound_state.as_ref()).map(Some)
 }
 
 fn verify_materialized_configuration(plan: &ExecutionPlan, root: &Path) -> Result<(), AppError> {
@@ -2739,52 +2734,243 @@ fn validate_state_component(repository: &Path, path: &Path) -> Result<(), AppErr
     Ok(())
 }
 
-fn bound_state_path(
-    guard: &Option<StateLayoutGuard>,
-    state: &Path,
-    path: &Path,
-) -> Result<PathBuf, AppError> {
-    let resolved_state = resolved_future_path(state)?;
-    let resolved_path = resolved_future_path(path)?;
-    if let Ok(relative) = resolved_path.strip_prefix(&resolved_state) {
-        guard
-            .as_ref()
-            .ok_or_else(|| AppError::Environment("workflow state is not bound".into()))?
-            .bound_path(&state.join(relative))
-    } else {
-        Ok(path.to_path_buf())
+enum ReportDestinationPlan {
+    State { path: PathBuf },
+    External { path: PathBuf },
+}
+
+enum ReportDestination {
+    State { path: PathBuf },
+    External(ExternalReportGuard),
+}
+
+impl ReportDestination {
+    fn prepare(plan: ReportDestinationPlan) -> Result<Self, AppError> {
+        match plan {
+            ReportDestinationPlan::State { path } => Ok(Self::State { path }),
+            ReportDestinationPlan::External { path } => {
+                ExternalReportGuard::prepare(&path).map(Self::External)
+            }
+        }
+    }
+
+    fn bound_path(&self, state: Option<&StateLayoutGuard>) -> Result<PathBuf, AppError> {
+        match self {
+            Self::State { path } => state
+                .ok_or_else(|| AppError::Environment("workflow state is not bound".into()))?
+                .bound_path(path),
+            Self::External(guard) => guard.bound_path(),
+        }
+    }
+
+    fn exists(&self, state: Option<&StateLayoutGuard>) -> Result<bool, AppError> {
+        match self.bound_path(state) {
+            Ok(path) => Ok(path.exists()),
+            Err(_) if matches!(self, Self::State { .. }) && state.is_none() => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }
 
+fn classify_report_destination(
+    state: &Path,
+    path: &Path,
+) -> Result<ReportDestinationPlan, AppError> {
+    let resolved_state = resolved_future_path(state)?;
+    let resolved_path = resolved_future_path(path)?;
+    if let Ok(relative) = resolved_path.strip_prefix(&resolved_state) {
+        Ok(ReportDestinationPlan::State {
+            path: state.join(relative),
+        })
+    } else {
+        Ok(ReportDestinationPlan::External {
+            path: resolved_path,
+        })
+    }
+}
+
+#[cfg(test)]
 fn path_is_within_state(state: &Path, path: &Path) -> Result<bool, AppError> {
     Ok(resolved_future_path(path)?.starts_with(resolved_future_path(state)?))
 }
 
-fn validate_report_destination(report: &Path) -> Result<(), AppError> {
-    let parent = report.parent().ok_or_else(|| {
-        AppError::Configuration(format!("report path has no parent: {}", report.display()))
-    })?;
-    fs::create_dir_all(parent).map_err(|error| {
-        AppError::Configuration(format!(
-            "cannot prepare report destination {}: {error}",
-            parent.display()
-        ))
-    })?;
-    let probe = tempfile::Builder::new()
-        .prefix(".repo-sandbox-report-probe-")
-        .tempfile_in(parent)
-        .map_err(|error| {
+#[derive(Debug)]
+struct ExternalReportGuard {
+    path: PathBuf,
+    _parent: PathBuf,
+    _handle: Option<fs::File>,
+    created: Vec<PathBuf>,
+    _parent_reservation: OutputReservation,
+}
+
+impl ExternalReportGuard {
+    fn prepare(report: &Path) -> Result<Self, AppError> {
+        let report = resolved_future_path(report)?;
+        let report = report.as_path();
+        let parent = report.parent().ok_or_else(|| {
+            AppError::Configuration(format!("report path has no parent: {}", report.display()))
+        })?;
+        // Keep parent creation/rollback exclusive across processes, including
+        // workflows targeting different filenames in the same new directory.
+        let parent_reservation = OutputReservation::create(parent, "report parent")?;
+        let created = create_report_parent(parent)?;
+        let handle = match bind_report_parent(parent) {
+            Ok(handle) => handle,
+            Err(error) => {
+                rollback_created_directories(&created);
+                return Err(error);
+            }
+        };
+        let validation = (|| {
+            let current_parent = resolved_future_path(parent)?;
+            let bound_identity = state_identity_from_handle(&handle)?;
+            let current_identity = state_identity(parent)?;
+            if current_parent != parent || bound_identity != current_identity {
+                return Err(AppError::Configuration(format!(
+                    "report destination changed while it was being bound: {}",
+                    parent.display()
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            drop(handle);
+            rollback_created_directories(&created);
+            return Err(error);
+        }
+        Ok(Self {
+            path: report.to_path_buf(),
+            _parent: parent.to_path_buf(),
+            _handle: Some(handle),
+            created,
+            _parent_reservation: parent_reservation,
+        })
+    }
+
+    fn bound_path(&self) -> Result<PathBuf, AppError> {
+        let name = self.path.file_name().ok_or_else(|| {
             AppError::Configuration(format!(
-                "report destination is not writable {}: {error}",
+                "report path has no file name: {}",
+                self.path.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            bound_directory_path(self._handle.as_ref().expect("report guard handle is live"))
+                .map(|parent| parent.join(name))
+        }
+        #[cfg(windows)]
+        {
+            // The retained parent handle excludes FILE_SHARE_DELETE, so the
+            // pathname cannot be renamed or replaced until this guard drops.
+            Ok(self._parent.join(name))
+        }
+    }
+}
+
+impl Drop for ExternalReportGuard {
+    fn drop(&mut self) {
+        drop(self._handle.take());
+        rollback_created_directories(&self.created);
+    }
+}
+
+fn create_report_parent(parent: &Path) -> Result<Vec<PathBuf>, AppError> {
+    let mut missing = Vec::new();
+    let mut cursor = parent;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor.parent().ok_or_else(|| {
+            AppError::Configuration(format!(
+                "report path has no existing ancestor: {}",
                 parent.display()
             ))
         })?;
-    probe.as_file().sync_all().map_err(|error| {
+    }
+    let mut created = Vec::new();
+    for path in missing.iter().rev() {
+        match fs::create_dir(path) {
+            Ok(()) => created.push(path.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                rollback_created_directories(&created);
+                return Err(AppError::Configuration(format!(
+                    "cannot prepare report destination {}: {error}",
+                    parent.display()
+                )));
+            }
+        }
+    }
+    Ok(created)
+}
+
+fn rollback_created_directories(created: &[PathBuf]) {
+    for path in created.iter().rev() {
+        // remove_dir is deliberately non-recursive: concurrent/user content
+        // makes rollback retain the directory instead of deleting that data.
+        let _ = fs::remove_dir(path);
+    }
+}
+
+#[cfg(unix)]
+fn bind_report_parent(parent: &Path) -> Result<fs::File, AppError> {
+    use std::os::fd::AsRawFd;
+    let handle = bind_state_directory(parent).map_err(|error| {
         AppError::Configuration(format!(
-            "report destination cannot persist files {}: {error}",
+            "cannot bind report destination {}: {error}",
             parent.display()
         ))
-    })
+    })?;
+    unsafe extern "C" {
+        fn faccessat(dirfd: i32, path: *const std::ffi::c_char, mode: i32, flags: i32) -> i32;
+    }
+    const W_OK: i32 = 2;
+    let current = c".";
+    // SAFETY: current is a static NUL-terminated string and the directory file
+    // descriptor remains open for this call and the guard lifetime.
+    if unsafe { faccessat(handle.as_raw_fd(), current.as_ptr(), W_OK, 0) } != 0 {
+        return Err(AppError::Configuration(format!(
+            "report destination is not writable {}: {}",
+            parent.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(handle)
+}
+
+#[cfg(windows)]
+fn bind_report_parent(parent: &Path) -> Result<fs::File, AppError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_LIST_DIRECTORY: u32 = 0x0001;
+    const FILE_ADD_FILE: u32 = 0x0002;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let handle = OpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY | FILE_ADD_FILE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)
+        .map_err(|error| {
+            AppError::Configuration(format!(
+                "cannot bind writable report destination {}: {error}",
+                parent.display()
+            ))
+        })?;
+    let metadata = handle.metadata().map_err(|error| {
+        AppError::Configuration(format!(
+            "cannot inspect report destination {}: {error}",
+            parent.display()
+        ))
+    })?;
+    if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(AppError::Configuration(format!(
+            "report destination parent must be a real directory: {}",
+            parent.display()
+        )));
+    }
+    Ok(handle)
 }
 
 fn write_state_file(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
@@ -4788,8 +4974,11 @@ mod tests {
         let repository = tempfile::tempdir().unwrap();
         let state = repository.path().join(".repo-sandbox");
         let report = state.join("reports/task.json");
+        let destination =
+            ReportDestination::prepare(classify_report_destination(&state, &report).unwrap())
+                .unwrap();
         assert_eq!(
-            optional_failure_report_path(&None, &state, &report).unwrap(),
+            optional_failure_report_path(&None, &destination).unwrap(),
             None
         );
         assert!(!state.exists());
@@ -4810,13 +4999,99 @@ mod tests {
         let file_parent = root.path().join("Cargo.toml");
         fs::write(&file_parent, "not a directory").unwrap();
         let report = file_parent.join("result.json");
-        let error = validate_report_destination(&report).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("cannot prepare report destination")
-        );
+        let error = ExternalReportGuard::prepare(&report).unwrap_err();
+        assert!(error.to_string().contains("report destination parent"));
         assert_eq!(fs::read_to_string(file_parent).unwrap(), "not a directory");
+    }
+
+    #[test]
+    fn invalid_push_is_rejected_before_an_explicit_report_parent_is_created() {
+        let repository = tempfile::tempdir().unwrap();
+        let report_parent = repository.path().join("new-report-parent");
+        let mut plan = default_execution_plan();
+        plan.request.repository = Some(repository.path().to_string_lossy().into_owned());
+        plan.request.report = Some(report_parent.join("result.json"));
+        plan.request.push = true;
+        let plan = ExecutionPlan::new(plan.template, plan.request);
+        let error = WorkflowPort::execute(&SystemWorkflow, WorkflowMode::Build, &plan).unwrap_err();
+        assert!(error.to_string().contains("--push requires"));
+        assert!(!report_parent.exists());
+        assert!(!repository.path().join(".repo-sandbox").exists());
+    }
+
+    #[test]
+    fn external_report_preflight_creates_no_named_probe_and_rolls_back_empty_parents() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("created").join("nested");
+        let guard = ExternalReportGuard::prepare(&parent.join("result.json")).unwrap();
+        assert!(parent.read_dir().unwrap().next().is_none());
+        drop(guard);
+        assert!(!root.path().join("created").exists());
+    }
+
+    #[test]
+    fn external_report_rollback_never_removes_concurrent_content() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("created").join("nested");
+        let guard = ExternalReportGuard::prepare(&parent.join("result.json")).unwrap();
+        fs::write(parent.join("user-content"), "preserved").unwrap();
+        drop(guard);
+        assert_eq!(
+            fs::read_to_string(parent.join("user-content")).unwrap(),
+            "preserved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_report_remains_bound_after_reports_directory_is_replaced() {
+        use std::os::unix::fs::symlink;
+        let repository = tempfile::tempdir().unwrap();
+        let state = repository.path().join(".repo-sandbox");
+        let report = state.join("reports/result.json");
+        let destination =
+            ReportDestination::prepare(classify_report_destination(&state, &report).unwrap())
+                .unwrap();
+        let guard = prepare_state_layout(repository.path(), &state).unwrap();
+        let original = state.join("reports-original");
+        fs::rename(state.join("reports"), &original).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("sentinel"), "unchanged").unwrap();
+        symlink(outside.path(), state.join("reports")).unwrap();
+        fs::write(destination.bound_path(Some(&guard)).unwrap(), "report").unwrap();
+        assert_eq!(
+            fs::read_to_string(original.join("result.json")).unwrap(),
+            "report"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("sentinel")).unwrap(),
+            "unchanged"
+        );
+        assert!(!outside.path().join("result.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_report_parent_handle_survives_path_replacement() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("reports");
+        fs::create_dir(&parent).unwrap();
+        let guard = ExternalReportGuard::prepare(&parent.join("result.json")).unwrap();
+        let original = root.path().join("reports-original");
+        fs::rename(&parent, &original).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("sentinel"), "unchanged").unwrap();
+        symlink(outside.path(), &parent).unwrap();
+        fs::write(guard.bound_path().unwrap(), "report").unwrap();
+        assert_eq!(
+            fs::read_to_string(original.join("result.json")).unwrap(),
+            "report"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("sentinel")).unwrap(),
+            "unchanged"
+        );
     }
 
     #[test]

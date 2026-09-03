@@ -326,6 +326,7 @@ fn run_runtime(
         Err(error) => {
             if let Some(path) = requested_report.as_deref()
                 && !path.exists()
+                && report_parent_exists(path)
             {
                 write_cli_failure_report(path, "unavailable", preparation_phase(&error), &error)?;
             }
@@ -348,6 +349,7 @@ fn run_runtime(
         Err(error) => {
             if let Some(path) = &execution.request.report
                 && !path.exists()
+                && report_parent_exists(path)
             {
                 write_cli_failure_report(path, &execution.digest, "orchestration", &error)?;
             }
@@ -474,6 +476,12 @@ fn write_cli_failure_report(
     write_failure_report(&report, path).map_err(|write| {
         AppError::Environment(format!("write failure report: {write}; primary: {error}"))
     })
+}
+
+fn report_parent_exists(path: &std::path::Path) -> bool {
+    path.parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .is_dir()
 }
 
 fn execution_plan_from_source(
@@ -886,6 +894,39 @@ test: [{ name: test, run: cargo test }]
         }
         assert!(json.contains("\"phase\": \"configuration\""));
         assert!(json.contains("\"exit_code\": 2"));
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn configuration_failure_does_not_create_a_missing_report_parent() {
+        let temporary = std::env::temp_dir().join(format!(
+            "repo-sandbox-cli-no-parent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&temporary).unwrap();
+        fs::write(
+            temporary.join(".repo-sandbox.yaml"),
+            "version: 1\ntemplate: definitely-not-valid\n",
+        )
+        .unwrap();
+        let parent = temporary.join("not-created");
+        let report = parent.join("failure.json");
+        let cli = Cli::try_parse_from([
+            "repo-sandbox",
+            "build",
+            "--repository",
+            temporary.to_str().unwrap(),
+            "--report-path",
+            report.to_str().unwrap(),
+        ])
+        .unwrap();
+        let error = run(cli).unwrap_err();
+        assert_eq!(error.exit_code(), ExitCode::Configuration);
+        assert!(!parent.exists());
         fs::remove_dir_all(temporary).unwrap();
     }
 
