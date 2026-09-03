@@ -43,6 +43,7 @@ success. `clean` removes only manifest-recorded, owner-verified resources:
 ```bash
 repo-sandbox build --repository . --report-path .reports/build.json
 repo-sandbox verify --repository . --report-path .reports/verify.json
+repo-sandbox verify --repository . --platform linux/amd64 --platform linux/arm64 --oci-layout .reports/task-oci
 repo-sandbox clean --repository . --dry-run --include-images --include-cache
 repo-sandbox clean --repository . --yes --include-images --include-cache
 ```

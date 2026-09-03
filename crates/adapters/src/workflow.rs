@@ -14,7 +14,8 @@ use crate::task_image::{TaskImageBuilder, TaskImageOptions, TaskImageRequest};
 use repo_sandbox_core::AppError;
 use repo_sandbox_core::application::{
     CleanCandidate, CleanPlan, CleanPort, CleanRequest, CleanResult, ExecutionPlan, ResourceKind,
-    ResourceState, WorkflowMode, WorkflowPort, WorkflowResult,
+    ResourceState, WorkflowFailureReport, WorkflowFailureStatus, WorkflowMode, WorkflowPort,
+    WorkflowResult, write_failure_report,
 };
 use repo_sandbox_core::build::{BuiltImage, ImageRef};
 use repo_sandbox_core::config::Platform;
@@ -54,359 +55,403 @@ impl WorkflowPort for SystemWorkflow {
             .clone()
             .unwrap_or_else(|| state.join("reports").join(format!("{task_id}.json")));
         let _report_reservation = ReportReservation::create(&report_path)?;
-        validate_outputs(plan)?;
-        let _oci_reservation = plan
-            .request
-            .oci_layout
-            .as_deref()
-            .map(OciReservation::create)
-            .transpose()?;
-        let journal = ManifestJournal::create(&state, &task_id)?;
-        let registry = plan.template.execution.registry.as_ref();
-        if plan.request.push && registry.is_none() {
-            return Err(AppError::Configuration(
-                "--push requires execution.registry.repository in the central profile".into(),
-            ));
-        }
-        preflight(plan, &repository)?;
-        let cache = state.join("cache");
-        fs::create_dir_all(&cache).map_err(environment("create owned cache"))?;
-        fs::write(cache.join(OWNER_MARKER), &repository_id)
-            .map_err(environment("mark owned cache"))?;
-        journal.append(&[CleanCandidate {
-            task_id: task_id.clone(),
-            repository_id: repository_id.clone(),
-            kind: ResourceKind::Cache,
-            identifier: cache.display().to_string(),
-            owner: repository_id.clone(),
-            state: ResourceState::Registered,
-        }])?;
-
-        let source = match (&plan.request.repository, &plan.request.git_ref) {
-            (Some(value), reference) if is_remote(value) => SourceSpec::RemoteGit {
-                repository: value.clone(),
-                git_ref: reference.clone().unwrap_or_else(|| "HEAD".into()),
-            },
-            _ => SourceSpec::LocalDirectory(repository.clone()),
-        };
-        let mut materialized = GitSnapshotter::default()
-            .with_authentication(environment_git_authentication(source_repository(&source)))
-            .create(
-                &source,
-                SnapshotOptions {
-                    recurse_submodules: plan.request.recurse_submodules,
-                    cleanup: CleanupPolicy::Delete,
-                },
-            )
-            .map_err(|error| AppError::Environment(format!("snapshot: {error}")))?;
-        let catalog_root = catalog_root(&repository)?;
-        let cache_import = cache.join("environment");
-        let cache_export = cache.join("environment-next");
-        if cache_export.exists() {
-            fs::remove_dir_all(&cache_export)
-                .map_err(environment("remove stale owned cache export"))?;
-        }
-        let cache_options = CacheConfig {
-            imports: cache_import
-                .join("index.json")
-                .exists()
-                .then(|| format!("type=local,src={}", docker_host_path(&cache_import)))
-                .into_iter()
-                .collect(),
-            exports: vec![format!(
-                "type=local,dest={},mode=max",
-                docker_host_path(&cache_export)
-            )],
-        };
-        let environment_ref =
-            ImageRef::new(format!("repo-sandbox-env:{}", short_digest(&plan.digest)))
-                .map_err(AppError::Configuration)?;
-        let environment_image = BuildKit::new(SystemProcessExecutor)
-            .build(
-                BuildRequest::environment(
-                    &plan.template,
-                    &catalog_root,
-                    environment_ref,
-                    BuildOptions {
-                        progress: Progress::Plain,
-                        cache: cache_options,
-                        ..BuildOptions::default()
-                    },
-                ),
-                &cancellation,
-            )
-            .map_err(|error| AppError::Environment(format!("environment image: {error}")))?;
-        if cache_export.exists() {
-            if cache_import.exists() {
-                let _ = fs::remove_dir_all(&cache_import);
+        let result = (|| {
+            validate_outputs(plan)?;
+            let _oci_reservation = plan
+                .request
+                .oci_layout
+                .as_deref()
+                .map(OciReservation::create)
+                .transpose()?;
+            let journal = ManifestJournal::create(&state, &task_id)?;
+            let registry = plan.template.execution.registry.as_ref();
+            if plan.request.push && registry.is_none() {
+                return Err(AppError::Configuration(
+                    "--push requires execution.registry.repository in the central profile".into(),
+                ));
             }
-            let _ = fs::rename(&cache_export, &cache_import);
-        }
+            preflight(plan, &repository, &cancellation)?;
+            let cache = state.join("cache");
+            fs::create_dir_all(&cache).map_err(environment("create owned cache"))?;
+            fs::write(cache.join(OWNER_MARKER), &repository_id)
+                .map_err(environment("mark owned cache"))?;
+            journal.append(&[CleanCandidate {
+                task_id: task_id.clone(),
+                repository_id: repository_id.clone(),
+                kind: ResourceKind::Cache,
+                identifier: cache.display().to_string(),
+                owner: repository_id.clone(),
+                state: ResourceState::Registered,
+            }])?;
 
-        let configuration_digest =
-            ConfigurationDigest::parse(&plan.digest).map_err(AppError::Configuration)?;
-        let image_repository = "repo-sandbox-task";
-        let task_image = TaskImageBuilder::new(SystemProcessExecutor)
-            .build(
-                TaskImageRequest {
-                    environment: &environment_image,
-                    materialized: &materialized,
-                    template_id: &plan.template.template_id,
-                    template_version: &plan.template.template_version,
-                    platform: plan.request.platform,
-                    configuration_digest: &configuration_digest,
-                    created: "1970-01-01T00:00:00Z",
-                    repository: image_repository,
-                    options: TaskImageOptions {
-                        progress: Progress::Plain,
-                        output: ImageOutput::Load,
-                        ..TaskImageOptions::default()
-                    },
+            let source = match (&plan.request.repository, &plan.request.git_ref) {
+                (Some(value), reference) if is_remote(value) => SourceSpec::RemoteGit {
+                    repository: value.clone(),
+                    git_ref: reference.clone().unwrap_or_else(|| "HEAD".into()),
                 },
-                &cancellation,
-            )
-            .map_err(|error| AppError::Environment(format!("task image: {error}")))?;
-        journal.append(&[CleanCandidate {
-            task_id: task_id.clone(),
-            repository_id: repository_id.clone(),
-            kind: ResourceKind::Image,
-            identifier: task_image.image.digest.to_string(),
-            owner: task_image.identity.oci_value(),
-            state: ResourceState::Registered,
-        }])?;
+                _ => SourceSpec::LocalDirectory(repository.clone()),
+            };
+            let mut materialized = GitSnapshotter::default()
+                .with_authentication(environment_git_authentication(source_repository(&source)))
+                .create(
+                    &source,
+                    SnapshotOptions {
+                        recurse_submodules: plan.request.recurse_submodules,
+                        cleanup: CleanupPolicy::Delete,
+                    },
+                )
+                .map_err(|error| AppError::Environment(format!("snapshot: {error}")))?;
+            let catalog_root = catalog_root(&repository)?;
+            let cache_import = cache.join("environment");
+            let cache_export = cache.join("environment-next");
+            if cache_export.exists() {
+                fs::remove_dir_all(&cache_export)
+                    .map_err(environment("remove stale owned cache export"))?;
+            }
+            let cache_options = CacheConfig {
+                imports: cache_import
+                    .join("index.json")
+                    .exists()
+                    .then(|| format!("type=local,src={}", docker_host_path(&cache_import)))
+                    .into_iter()
+                    .collect(),
+                exports: vec![format!(
+                    "type=local,dest={},mode=max",
+                    docker_host_path(&cache_export)
+                )],
+            };
+            let environment_ref =
+                ImageRef::new(format!("repo-sandbox-env:{}", short_digest(&plan.digest)))
+                    .map_err(AppError::Configuration)?;
+            let environment_image = BuildKit::new(SystemProcessExecutor)
+                .build(
+                    BuildRequest::environment(
+                        &plan.template,
+                        &catalog_root,
+                        environment_ref,
+                        BuildOptions {
+                            progress: Progress::Plain,
+                            cache: cache_options,
+                            ..BuildOptions::default()
+                        },
+                    ),
+                    &cancellation,
+                )
+                .map_err(|error| AppError::Environment(format!("environment image: {error}")))?;
+            if cache_export.exists() {
+                if cache_import.exists() {
+                    let _ = fs::remove_dir_all(&cache_import);
+                }
+                let _ = fs::rename(&cache_export, &cache_import);
+            }
 
-        let execution = &plan.template.execution;
-        let secret_root = tempfile::Builder::new()
-            .prefix("repo-sandbox-secrets-")
-            .tempdir()
-            .map_err(environment("create runtime secret directory"))?;
-        let mut secret_mounts = Vec::new();
-        for name in &execution.secret_environment {
-            let value = std::env::var_os(name).ok_or_else(|| {
-                AppError::Configuration(format!("required secret environment `{name}` is not set"))
-            })?;
-            let path = secret_root.path().join(name);
-            fs::write(&path, value.to_string_lossy().as_bytes())
-                .map_err(environment("materialize runtime secret"))?;
-            secret_mounts.push(SecretMount {
-                environment: name.clone(),
-                source: path,
-            });
-        }
-        let build = execution
-            .build
-            .iter()
-            .map(|step| repo_sandbox_core::runner::RunStep {
-                name: step.name.clone(),
-                command: step.command.clone(),
-            })
-            .collect();
-        let test = if mode == WorkflowMode::Verify {
-            execution
-                .test
+            let configuration_digest =
+                ConfigurationDigest::parse(&plan.digest).map_err(AppError::Configuration)?;
+            let image_repository = "repo-sandbox-task";
+            let task_image = TaskImageBuilder::new(SystemProcessExecutor)
+                .build(
+                    TaskImageRequest {
+                        environment: &environment_image,
+                        materialized: &materialized,
+                        template_id: &plan.template.template_id,
+                        template_version: &plan.template.template_version,
+                        platform: plan.request.platform,
+                        configuration_digest: &configuration_digest,
+                        repository_id: &repository_id,
+                        created: "1970-01-01T00:00:00Z",
+                        repository: image_repository,
+                        options: TaskImageOptions {
+                            progress: Progress::Plain,
+                            output: ImageOutput::Load,
+                            ..TaskImageOptions::default()
+                        },
+                    },
+                    &cancellation,
+                )
+                .map_err(|error| AppError::Environment(format!("task image: {error}")))?;
+            journal.append(&[CleanCandidate {
+                task_id: task_id.clone(),
+                repository_id: repository_id.clone(),
+                kind: ResourceKind::Image,
+                identifier: task_image.image.digest.to_string(),
+                owner: task_image.identity.oci_value(),
+                state: ResourceState::Registered,
+            }])?;
+
+            let execution = &plan.template.execution;
+            let secret_root = tempfile::Builder::new()
+                .prefix("repo-sandbox-secrets-")
+                .tempdir()
+                .map_err(environment("create runtime secret directory"))?;
+            let mut secret_mounts = Vec::new();
+            for name in &execution.secret_environment {
+                let value = std::env::var_os(name).ok_or_else(|| {
+                    AppError::Configuration(format!(
+                        "required secret environment `{name}` is not set"
+                    ))
+                })?;
+                let path = secret_root.path().join(name);
+                fs::write(&path, value.to_string_lossy().as_bytes())
+                    .map_err(environment("materialize runtime secret"))?;
+                secret_mounts.push(SecretMount {
+                    environment: name.clone(),
+                    source: path,
+                });
+            }
+            let build = execution
+                .build
                 .iter()
                 .map(|step| repo_sandbox_core::runner::RunStep {
                     name: step.name.clone(),
                     command: step.command.clone(),
                 })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let artifact_root = state.join("artifacts").join(&task_id);
-        let spec = RunSpec {
-            task_id: task_id.clone(),
-            image: task_image.image.image.clone(),
-            image_digest: task_image.image.digest.clone(),
-            source_snapshot: materialized.snapshot.clone(),
-            config_summary: ConfigSummary {
-                template_id: plan.template.template_id.clone(),
-                plan_digest: plan.digest.clone(),
-                platform: plan.request.platform,
-                build_steps: execution
-                    .build
+                .collect();
+            let test = if mode == WorkflowMode::Verify {
+                execution
+                    .test
                     .iter()
-                    .map(|step| step.name.clone())
-                    .collect(),
-                test_steps: if mode == WorkflowMode::Verify {
-                    execution
-                        .test
+                    .map(|step| repo_sandbox_core::runner::RunStep {
+                        name: step.name.clone(),
+                        command: step.command.clone(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let artifact_root = state.join("artifacts").join(&task_id);
+            let spec = RunSpec {
+                task_id: task_id.clone(),
+                repository_id: repository_id.clone(),
+                image: task_image.image.image.clone(),
+                image_digest: task_image.image.digest.clone(),
+                source_snapshot: materialized.snapshot.clone(),
+                config_summary: ConfigSummary {
+                    template_id: plan.template.template_id.clone(),
+                    plan_digest: plan.digest.clone(),
+                    platform: plan.request.platform,
+                    build_steps: execution
+                        .build
                         .iter()
                         .map(|step| step.name.clone())
-                        .collect()
-                } else {
-                    Vec::new()
+                        .collect(),
+                    test_steps: if mode == WorkflowMode::Verify {
+                        execution
+                            .test
+                            .iter()
+                            .map(|step| step.name.clone())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                    artifact_directories: execution.artifact_directories.clone(),
                 },
-                artifact_directories: execution.artifact_directories.clone(),
-            },
-            platform: plan.request.platform,
-            build,
-            test,
-            resources: RunResources {
-                cpu_count: execution.resources.cpu,
-                memory_mb: execution.resources.memory_mb,
-                temporary_storage_mb: execution.resources.temporary_storage_mb,
-            },
-            timeout_ms: u64::from(execution.timeout_seconds) * 1000,
-            fail_fast: execution.fail_fast,
-            environment_names: execution.environment_allow.clone(),
-            secret_mounts,
-            artifact_export_root: (!execution.artifact_directories.is_empty())
-                .then_some(artifact_root),
-            // A retained bind mount could keep the deleted secret inode readable.
-            // Security therefore wins over diagnostics for secret-bearing jobs.
-            keep_on_failure: plan.request.keep_on_failure
-                && secret_root
-                    .path()
-                    .read_dir()
-                    .map(|mut entries| entries.next().is_none())
-                    .unwrap_or(false),
-        };
-        let mut report = DockerRunner::new(SystemDockerExecutor, SystemClock::default())
-            .run_with_container_hook(&spec, |container| {
-                journal
-                    .append(&[CleanCandidate {
+                platform: plan.request.platform,
+                build,
+                test,
+                resources: RunResources {
+                    cpu_count: execution.resources.cpu,
+                    memory_mb: execution.resources.memory_mb,
+                    temporary_storage_mb: execution.resources.temporary_storage_mb,
+                },
+                timeout_ms: u64::from(execution.timeout_seconds) * 1000,
+                fail_fast: execution.fail_fast,
+                environment_names: execution.environment_allow.clone(),
+                secret_mounts,
+                artifact_export_root: (!execution.artifact_directories.is_empty())
+                    .then_some(artifact_root),
+                // A retained bind mount could keep the deleted secret inode readable.
+                // Security therefore wins over diagnostics for secret-bearing jobs.
+                keep_on_failure: plan.request.keep_on_failure
+                    && secret_root
+                        .path()
+                        .read_dir()
+                        .map(|mut entries| entries.next().is_none())
+                        .unwrap_or(false),
+            };
+            let mut report = DockerRunner::new(SystemDockerExecutor, SystemClock::default())
+                .run_with_container_hook(&spec, |container| {
+                    journal
+                        .append(&[CleanCandidate {
+                            task_id: task_id.clone(),
+                            repository_id: repository_id.clone(),
+                            kind: ResourceKind::Container,
+                            identifier: container.to_owned(),
+                            owner: task_id.clone(),
+                            state: ResourceState::Registered,
+                        }])
+                        .map_err(|error| error.to_string())
+                })
+                .map_err(|error| AppError::Configuration(error.to_string()))?;
+
+            let failed = report.status != RunStatus::Succeeded;
+            if report.cleanup == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure {
+                materialized.retain_on_failure();
+                if !materialized.is_automatically_cleaned()
+                    && is_remote(plan.request.repository.as_deref().unwrap_or(""))
+                {
+                    fs::write(materialized.path().join(OWNER_MARKER), &task_id)
+                        .map_err(environment("mark retained source"))?;
+                    journal.append(&[CleanCandidate {
                         task_id: task_id.clone(),
                         repository_id: repository_id.clone(),
-                        kind: ResourceKind::Container,
-                        identifier: container.to_owned(),
+                        kind: ResourceKind::Source,
+                        identifier: materialized.path().display().to_string(),
                         owner: task_id.clone(),
-                        state: ResourceState::Registered,
-                    }])
-                    .map_err(|error| error.to_string())
-            })
-            .map_err(|error| AppError::Configuration(error.to_string()))?;
-
-        let failed = report.status != RunStatus::Succeeded;
-        if report.cleanup == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure {
-            materialized.retain_on_failure();
-            if !materialized.is_automatically_cleaned()
-                && is_remote(plan.request.repository.as_deref().unwrap_or(""))
-            {
-                fs::write(materialized.path().join(OWNER_MARKER), &task_id)
-                    .map_err(environment("mark retained source"))?;
+                        state: ResourceState::Retained,
+                    }])?;
+                }
+            }
+            if let Some(container) = &report.container_id {
                 journal.append(&[CleanCandidate {
                     task_id: task_id.clone(),
                     repository_id: repository_id.clone(),
-                    kind: ResourceKind::Source,
-                    identifier: materialized.path().display().to_string(),
+                    kind: ResourceKind::Container,
+                    identifier: container.clone(),
                     owner: task_id.clone(),
-                    state: ResourceState::Retained,
+                    state: if report.cleanup
+                        == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure
+                    {
+                        ResourceState::Retained
+                    } else {
+                        ResourceState::Cleaned
+                    },
                 }])?;
             }
-        }
-        if let Some(container) = &report.container_id {
-            journal.append(&[CleanCandidate {
-                task_id: task_id.clone(),
-                repository_id: repository_id.clone(),
-                kind: ResourceKind::Container,
-                identifier: container.clone(),
-                owner: task_id.clone(),
-                state: if report.cleanup
-                    == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure
-                {
-                    ResourceState::Retained
-                } else {
-                    ResourceState::Cleaned
-                },
-            }])?;
-        }
 
-        if !failed && let Some(output) = &plan.request.oci_layout {
-            export_verified_oci(
-                plan,
-                &catalog_root,
-                &materialized,
-                &environment_image,
-                &configuration_digest,
-                output,
-                &cancellation,
-            )?;
-        }
-
-        let published = if plan.request.push && !failed {
-            let policy = registry.expect("checked registry");
-            let repository =
-                RegistryRepository::new(&policy.repository).map_err(AppError::Configuration)?;
-            let aliases = policy
-                .aliases
-                .iter()
-                .map(|value| RegistryTag::new(value).map_err(AppError::Configuration))
-                .collect::<Result<Vec<_>, _>>()?;
-            let published_task = if plan.request.platforms.len() > 1 {
-                build_multi_platform_task(
+            if !failed && let Some(output) = &plan.request.oci_layout {
+                export_verified_oci(
                     plan,
                     &catalog_root,
                     &materialized,
+                    &environment_image,
                     &configuration_digest,
-                    &repository,
+                    &repository_id,
+                    output,
                     &cancellation,
-                )?
-            } else {
-                let seeded = seed_registry(
-                    &task_image.image.image,
-                    &repository,
-                    task_image.identity.as_str(),
                 )?;
-                (seeded, task_image.image.clone())
-            };
-            Some(
-                DockerRegistry::new(SystemRegistryExecutor)
-                    .publish(
-                        &PublishRequest {
-                            source: published_task.0,
-                            repository,
-                            digest: published_task.1.digest,
-                            platform_digests: published_task.1.platform_digests,
-                            aliases,
-                        },
-                        &cancellation,
-                    )
-                    .map_err(|error| AppError::Environment(error.to_string()))?,
-            )
-        } else {
-            None
-        };
-        report.published = published.clone();
-
-        write_report_json(&report, &report_path).map_err(environment("write atomic report"))?;
-        let result = WorkflowResult {
-            plan_digest: plan.digest.clone(),
-            report: report.clone(),
-            published,
-        };
-        match &report.status {
-            RunStatus::Succeeded
-                if report.cleanup != repo_sandbox_core::runner::CleanupResult::Failed =>
-            {
-                Ok(result)
             }
-            RunStatus::CommandFailed {
-                phase: StepPhase::Build,
-                ..
-            } => Err(AppError::BuildFailed(format!(
-                "task {task_id}; report {}",
-                report_path.display()
-            ))),
-            RunStatus::CommandFailed {
-                phase: StepPhase::Test,
-                ..
-            } => Err(AppError::TestFailed(format!(
-                "task {task_id}; report {}",
-                report_path.display()
-            ))),
-            RunStatus::TimedOut
-            | RunStatus::Cancelled { .. }
-            | RunStatus::ResourceExceeded { .. }
-            | RunStatus::InfrastructureFailed { .. } => Err(AppError::Environment(format!(
-                "task {task_id} failed; report {}",
-                report_path.display()
-            ))),
-            RunStatus::Succeeded => Err(AppError::Environment(format!(
-                "task cleanup failed; report {}",
-                report_path.display()
-            ))),
+
+            let published = if plan.request.push && !failed {
+                let policy = registry.expect("checked registry");
+                let repository =
+                    RegistryRepository::new(&policy.repository).map_err(AppError::Configuration)?;
+                let aliases = policy
+                    .aliases
+                    .iter()
+                    .map(|value| RegistryTag::new(value).map_err(AppError::Configuration))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let published_task = if plan.request.platforms.len() > 1 {
+                    build_multi_platform_task(
+                        plan,
+                        &catalog_root,
+                        &materialized,
+                        &configuration_digest,
+                        &repository_id,
+                        &repository,
+                        &cancellation,
+                    )?
+                } else {
+                    let seeded = seed_registry(
+                        &task_image.image.image,
+                        &repository,
+                        task_image.identity.as_str(),
+                    )?;
+                    (seeded, task_image.image.clone())
+                };
+                Some(
+                    DockerRegistry::new(SystemRegistryExecutor)
+                        .publish(
+                            &PublishRequest {
+                                source: published_task.0,
+                                repository,
+                                digest: published_task.1.digest,
+                                platform_digests: published_task.1.platform_digests,
+                                aliases,
+                            },
+                            &cancellation,
+                        )
+                        .map_err(|error| AppError::Environment(error.to_string()))?,
+                )
+            } else {
+                None
+            };
+            report.published = published.clone();
+            annotate_report(&mut report);
+
+            write_report_json(&report, &report_path).map_err(environment("write atomic report"))?;
+            let result = WorkflowResult {
+                plan_digest: plan.digest.clone(),
+                report: report.clone(),
+                published,
+            };
+            match &report.status {
+                RunStatus::Succeeded
+                    if report.cleanup != repo_sandbox_core::runner::CleanupResult::Failed =>
+                {
+                    Ok(result)
+                }
+                RunStatus::CommandFailed {
+                    phase: StepPhase::Build,
+                    ..
+                } => Err(AppError::BuildFailed(format!(
+                    "task {task_id}; report {}",
+                    report_path.display()
+                ))),
+                RunStatus::CommandFailed {
+                    phase: StepPhase::Test,
+                    ..
+                } => Err(AppError::TestFailed(format!(
+                    "task {task_id}; report {}",
+                    report_path.display()
+                ))),
+                RunStatus::TimedOut
+                | RunStatus::Cancelled { .. }
+                | RunStatus::ResourceExceeded { .. }
+                | RunStatus::InfrastructureFailed { .. } => Err(AppError::Environment(format!(
+                    "task {task_id} failed; report {}",
+                    report_path.display()
+                ))),
+                RunStatus::Succeeded => Err(AppError::Environment(format!(
+                    "task cleanup failed; report {}",
+                    report_path.display()
+                ))),
+            }
+        })();
+        if let Err(error) = &result
+            && !report_path.exists()
+        {
+            let failure = WorkflowFailureReport {
+                schema_version: 1,
+                task_id: task_id.clone(),
+                plan_digest: plan.digest.clone(),
+                phase: failure_phase(error).into(),
+                exit_code: error.exit_code().as_i32(),
+                message: error.to_string(),
+                cleanup: repo_sandbox_core::runner::CleanupResult::NotNeeded,
+                published: None,
+                container_id: None,
+                source_snapshot: None,
+                config: None,
+                image: None,
+                image_digest: None,
+                started_at_unix_ms: 0,
+                ended_at_unix_ms: 0,
+                duration_ms: 0,
+                status: WorkflowFailureStatus {
+                    status: "infrastructure_failed",
+                    operation: failure_phase(error).into(),
+                    message: error.to_string(),
+                },
+                steps: Vec::new(),
+                exported_artifacts: Vec::new(),
+                artifact_error: None,
+                cleanup_error: None,
+            };
+            write_failure_report(&failure, &report_path).map_err(|write| {
+                AppError::Environment(format!("write failure report: {write}; primary: {error}"))
+            })?;
         }
+        result
     }
 }
 
@@ -517,6 +562,14 @@ impl CleanPort for SystemWorkflow {
 }
 
 fn validate_outputs(plan: &ExecutionPlan) -> Result<(), AppError> {
+    if plan.request.push {
+        let policy = plan.template.execution.registry.as_ref().ok_or_else(|| {
+            AppError::Configuration(
+                "--push requires execution.registry.repository in the central profile".into(),
+            )
+        })?;
+        RegistryRepository::new(&policy.repository).map_err(AppError::Configuration)?;
+    }
     let mut seen = std::collections::BTreeSet::new();
     for platform in &plan.request.platforms {
         if !seen.insert(*platform) {
@@ -544,11 +597,80 @@ fn validate_outputs(plan: &ExecutionPlan) -> Result<(), AppError> {
     Ok(())
 }
 
+fn annotate_report(report: &mut repo_sandbox_core::runner::RunReport) {
+    let (phase, exit_code, message) = match &report.status {
+        RunStatus::Succeeded
+            if report.cleanup != repo_sandbox_core::runner::CleanupResult::Failed =>
+        {
+            ("complete", 0, "workflow succeeded".to_owned())
+        }
+        RunStatus::Succeeded => ("cleanup", 3, "task cleanup failed".to_owned()),
+        RunStatus::CommandFailed {
+            phase: StepPhase::Build,
+            step,
+            ..
+        } => ("build", 10, format!("build step `{step}` failed")),
+        RunStatus::CommandFailed {
+            phase: StepPhase::Test,
+            step,
+            ..
+        } => ("test", 11, format!("test step `{step}` failed")),
+        RunStatus::Cancelled { phase, step } => (
+            match phase {
+                Some(StepPhase::Build) => "build",
+                Some(StepPhase::Test) => "test",
+                None => "runner",
+            },
+            3,
+            step.as_ref()
+                .map(|step| format!("step `{step}` cancelled"))
+                .unwrap_or_else(|| "workflow cancelled".into()),
+        ),
+        RunStatus::TimedOut => ("runner", 3, "workflow timed out".to_owned()),
+        RunStatus::ResourceExceeded { phase, step, .. } => (
+            match phase {
+                StepPhase::Build => "build",
+                StepPhase::Test => "test",
+            },
+            3,
+            format!("step `{step}` exceeded a resource limit"),
+        ),
+        RunStatus::InfrastructureFailed { operation, message } => {
+            ("runner", 3, format!("{operation}: {message}"))
+        }
+    };
+    report.phase = phase.into();
+    report.exit_code = exit_code;
+    report.message = message;
+}
+
+fn failure_phase(error: &AppError) -> &'static str {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("preflight") {
+        "preflight"
+    } else if message.contains("snapshot") || message.contains("git ") {
+        "snapshot"
+    } else if message.contains("environment image") || message.contains("environment:") {
+        "environment_image"
+    } else if message.contains("task image") || message.contains("oci task") {
+        "task_image"
+    } else if message.contains("registry") || message.contains("publish") {
+        "publish"
+    } else if matches!(error, AppError::BuildFailed(_)) {
+        "build"
+    } else if matches!(error, AppError::TestFailed(_)) {
+        "test"
+    } else {
+        "orchestration"
+    }
+}
+
 fn build_multi_platform_task(
     plan: &ExecutionPlan,
     catalog_root: &Path,
     materialized: &crate::snapshot::MaterializedSnapshot,
     configuration_digest: &ConfigurationDigest,
+    repository_id: &str,
     repository: &RegistryRepository,
     cancellation: &ProcessCancellation,
 ) -> Result<(ImageRef, BuiltImage), AppError> {
@@ -584,6 +706,7 @@ fn build_multi_platform_task(
                 template_version: &plan.template.template_version,
                 platform: plan.request.platform,
                 configuration_digest,
+                repository_id,
                 created: "1970-01-01T00:00:00Z",
                 repository: repository.as_str(),
                 options: TaskImageOptions {
@@ -599,12 +722,14 @@ fn build_multi_platform_task(
     Ok((task.image.image.clone(), task.image))
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps every immutable export input explicit at the port boundary.
 fn export_verified_oci(
     plan: &ExecutionPlan,
     catalog_root: &Path,
     materialized: &crate::snapshot::MaterializedSnapshot,
     primary_environment: &BuiltImage,
     configuration_digest: &ConfigurationDigest,
+    repository_id: &str,
     output: &Path,
     cancellation: &ProcessCancellation,
 ) -> Result<(), AppError> {
@@ -651,6 +776,7 @@ fn export_verified_oci(
                     template_version: &plan.template.template_version,
                     platform,
                     configuration_digest,
+                    repository_id,
                     created: "1970-01-01T00:00:00Z",
                     repository: "repo-sandbox-task-oci",
                     options: TaskImageOptions {
@@ -749,15 +875,23 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn preflight(plan: &ExecutionPlan, repository: &Path) -> Result<(), AppError> {
-    for args in [["info"].as_slice(), ["buildx", "inspect"].as_slice()] {
+fn preflight(
+    plan: &ExecutionPlan,
+    repository: &Path,
+    cancellation: &ProcessCancellation,
+) -> Result<(), AppError> {
+    let mut outputs = Vec::new();
+    for args in [
+        ["info", "--format", "{{.Architecture}}"].as_slice(),
+        ["buildx", "inspect"].as_slice(),
+    ] {
         let invocation = ProcessInvocation {
             program: "docker".into(),
             args: args.iter().map(|v| (*v).into()).collect(),
             current_dir: None,
         };
         let output = SystemProcessExecutor
-            .execute(&invocation, &NeverCancelled)
+            .execute(&invocation, cancellation)
             .map_err(environment("Docker preflight"))?;
         if output.exit_code != Some(0) {
             return Err(AppError::Environment(format!(
@@ -765,13 +899,29 @@ fn preflight(plan: &ExecutionPlan, repository: &Path) -> Result<(), AppError> {
                 output.stderr.trim()
             )));
         }
+        outputs.push(output.stdout);
+    }
+    if !matches!(outputs[0].trim(), "amd64" | "x86_64" | "arm64" | "aarch64") {
+        return Err(AppError::Environment(format!(
+            "Docker preflight reported unsupported host architecture `{}`",
+            outputs[0].trim()
+        )));
+    }
+    for platform in &plan.request.platforms {
+        if !outputs[1].contains(platform.as_str()) {
+            return Err(AppError::Environment(format!(
+                "Docker preflight builder does not advertise requested platform {platform}"
+            )));
+        }
     }
     let free = SystemDoctorProbe
         .available_space(repository)
         .map_err(environment("disk preflight"))?;
-    if free < 1024 * 1024 * 1024 {
+    let required = (1024_u64 * 1024 * 1024)
+        .max(u64::from(plan.template.execution.resources.temporary_storage_mb) * 2 * 1024 * 1024);
+    if free < required {
         return Err(AppError::Environment(format!(
-            "disk preflight requires 1 GiB free, found {free} bytes"
+            "disk preflight requires {required} bytes free, found {free} bytes"
         )));
     }
     if plan.request.push {
@@ -789,6 +939,29 @@ fn preflight(plan: &ExecutionPlan, repository: &Path) -> Result<(), AppError> {
         SystemDoctorProbe
             .connect_registry(host, port, std::time::Duration::from_secs(3))
             .map_err(environment("registry preflight"))?;
+        let probe_ref = format!(
+            "{}:repo-sandbox-preflight-{}",
+            policy.repository,
+            std::process::id()
+        );
+        let invocation = ProcessInvocation {
+            program: "docker".into(),
+            args: vec!["manifest".into(), "inspect".into(), probe_ref],
+            current_dir: None,
+        };
+        let output = SystemProcessExecutor
+            .execute(&invocation, cancellation)
+            .map_err(environment("registry /v2/ preflight"))?;
+        let stderr = output.stderr.to_ascii_lowercase();
+        let authenticated_missing = ["manifest unknown", "no such manifest", "not found"]
+            .iter()
+            .any(|marker| stderr.contains(marker));
+        if output.exit_code != Some(0) && !authenticated_missing {
+            return Err(AppError::Environment(format!(
+                "registry /v2/ preflight authentication or reachability failed: {}",
+                output.stderr.trim()
+            )));
+        }
     }
     Ok(())
 }
@@ -1086,10 +1259,19 @@ fn remove_candidate(candidate: &CleanCandidate) -> Result<bool, String> {
                 "{{ index .Config.Labels \"io.repo-sandbox.task-id\" }}",
                 &candidate.identifier,
             ])?;
+            let repository = docker_output(&[
+                "container",
+                "inspect",
+                "--format",
+                "{{ index .Config.Labels \"io.repo-sandbox.repository-id\" }}",
+                &candidate.identifier,
+            ])?;
             if inspected.exit_code != Some(0) {
                 return Ok(false);
             }
-            if inspected.stdout.trim() != candidate.owner {
+            if inspected.stdout.trim() != candidate.owner
+                || repository.stdout.trim() != candidate.repository_id
+            {
                 return Err("owner label mismatch".into());
             }
             let removed = docker_output(&["container", "rm", "--force", &candidate.identifier])?;
@@ -1107,10 +1289,19 @@ fn remove_candidate(candidate: &CleanCandidate) -> Result<bool, String> {
                 "{{ index .Config.Labels \"io.repo-sandbox.task.identity\" }}",
                 &candidate.identifier,
             ])?;
+            let repository = docker_output(&[
+                "image",
+                "inspect",
+                "--format",
+                "{{ index .Config.Labels \"io.repo-sandbox.repository-id\" }}",
+                &candidate.identifier,
+            ])?;
             if inspected.exit_code != Some(0) {
                 return Ok(false);
             }
-            if inspected.stdout.trim() != candidate.owner {
+            if inspected.stdout.trim() != candidate.owner
+                || repository.stdout.trim() != candidate.repository_id
+            {
                 return Err("image owner label mismatch".into());
             }
             let references = docker_output(&[

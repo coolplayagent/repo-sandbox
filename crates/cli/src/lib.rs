@@ -5,7 +5,7 @@ use repo_sandbox_adapters::workflow::SystemWorkflow;
 use repo_sandbox_core::AppError;
 use repo_sandbox_core::application::{
     BuildUseCase, CleanRequest, CleanUseCase, ExecutionPlan, VerifyUseCase, WorkflowFailureReport,
-    write_failure_report,
+    WorkflowFailureStatus, write_failure_report,
 };
 use repo_sandbox_core::config::{CliOverrides, Config, ExecutionRequest, Platform};
 use repo_sandbox_core::doctor::{CapabilityKind, CapabilityStatus, DoctorReport, DoctorStatus};
@@ -292,10 +292,30 @@ fn run_runtime(
             {
                 let report = WorkflowFailureReport {
                     schema_version: 1,
+                    task_id: "unassigned".into(),
                     plan_digest: execution.digest.clone(),
                     phase: "orchestration".into(),
                     exit_code: error.exit_code().as_i32(),
                     message: error.to_string(),
+                    cleanup: repo_sandbox_core::runner::CleanupResult::NotNeeded,
+                    published: None,
+                    container_id: None,
+                    source_snapshot: None,
+                    config: None,
+                    image: None,
+                    image_digest: None,
+                    started_at_unix_ms: 0,
+                    ended_at_unix_ms: 0,
+                    duration_ms: 0,
+                    status: WorkflowFailureStatus {
+                        status: "infrastructure_failed",
+                        operation: "orchestration".into(),
+                        message: error.to_string(),
+                    },
+                    steps: Vec::new(),
+                    exported_artifacts: Vec::new(),
+                    artifact_error: None,
+                    cleanup_error: None,
                 };
                 write_failure_report(&report, path).map_err(|write| {
                     AppError::Environment(format!(

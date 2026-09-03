@@ -70,6 +70,7 @@ pub struct TaskImageRequest<'a> {
     pub template_version: &'a str,
     pub platform: Platform,
     pub configuration_digest: &'a ConfigurationDigest,
+    pub repository_id: &'a str,
     /// OCI `org.opencontainers.image.created`, supplied by the orchestration clock.
     pub created: &'a str,
     /// Repository without a tag; the adapter appends the immutable content tag.
@@ -216,6 +217,16 @@ fn validate_request(request: &TaskImageRequest<'_>) -> Result<(), TaskImageError
         ));
     }
     validate_repository(request.repository)?;
+    if !request.repository_id.starts_with("sha256:")
+        || request.repository_id.len() != 71
+        || !request.repository_id[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(TaskImageError::InvalidRequest(
+            "repository ID must be a normalized sha256 digest".to_owned(),
+        ));
+    }
     let metadata = fs::symlink_metadata(request.materialized.path())
         .map_err(context_error("inspect source snapshot"))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -294,6 +305,7 @@ ARG TASK_TEMPLATE_VERSION
 ARG TASK_CONFIG_DIGEST
 ARG TASK_ENVIRONMENT_DIGEST
 ARG TASK_IDENTITY
+ARG TASK_REPOSITORY_ID
 COPY --link source/ /workspace/
 WORKDIR /workspace
 LABEL org.opencontainers.image.created="${TASK_CREATED}" \
@@ -305,7 +317,8 @@ LABEL org.opencontainers.image.created="${TASK_CREATED}" \
       io.repo-sandbox.template.version="${TASK_TEMPLATE_VERSION}" \
       io.repo-sandbox.config.digest="${TASK_CONFIG_DIGEST}" \
       io.repo-sandbox.environment.digest="${TASK_ENVIRONMENT_DIGEST}" \
-      io.repo-sandbox.task.identity="${TASK_IDENTITY}"
+      io.repo-sandbox.task.identity="${TASK_IDENTITY}" \
+      io.repo-sandbox.repository-id="${TASK_REPOSITORY_ID}"
 "#
 }
 
@@ -336,6 +349,7 @@ fn labels(
             request.environment.digest.to_string(),
         ),
         ("TASK_IDENTITY", identity.oci_value()),
+        ("TASK_REPOSITORY_ID", request.repository_id.to_owned()),
     ]
 }
 
@@ -521,6 +535,7 @@ mod tests {
             template_version: "1.0.0",
             platform: Platform::LinuxAmd64,
             configuration_digest: config,
+            repository_id: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             created: "2026-09-01T00:00:00Z",
             repository: "repo-sandbox/task",
             options: TaskImageOptions::default(),

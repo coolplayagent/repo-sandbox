@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct RunSpec {
     /// Caller-generated identifier. The Docker adapter uses it as an ownership label.
     pub task_id: String,
+    /// Stable repository ownership boundary, also applied as a Docker label.
+    pub repository_id: String,
     pub image: ImageRef,
     pub image_digest: ImageDigest,
     pub source_snapshot: SourceSnapshot,
@@ -154,6 +156,11 @@ pub enum RunStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RunReport {
+    pub schema_version: u8,
+    pub plan_digest: String,
+    pub phase: String,
+    pub exit_code: i32,
+    pub message: String,
     pub task_id: String,
     pub container_id: Option<String>,
     pub source_snapshot: SourceSnapshot,

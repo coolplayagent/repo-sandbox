@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const TASK_LABEL: &str = "io.repo-sandbox.task-id";
+pub const REPOSITORY_LABEL: &str = "io.repo-sandbox.repository-id";
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -260,6 +261,7 @@ impl Error for PlanError {}
 pub fn plan(spec: &RunSpec) -> Result<DockerRunPlan, PlanError> {
     validate_spec(spec)?;
     let label = format!("{TASK_LABEL}={}", spec.task_id);
+    let repository_label = format!("{REPOSITORY_LABEL}={}", spec.repository_id);
     let name = format!("repo-sandbox-{}", spec.task_id);
     let ownership_check = docker(vec![
         "container",
@@ -283,6 +285,8 @@ pub fn plan(spec: &RunSpec) -> Result<DockerRunPlan, PlanError> {
         &name,
         "--label",
         &label,
+        "--label",
+        &repository_label,
         "--network",
         "bridge",
         "--cpus",
@@ -376,6 +380,16 @@ fn validate_spec(spec: &RunSpec) -> Result<(), PlanError> {
     if !valid_task {
         return Err(PlanError(
             "task_id must be 1..=48 lowercase ASCII letters, digits, '-' or '_'".to_owned(),
+        ));
+    }
+    if !spec.repository_id.starts_with("sha256:")
+        || spec.repository_id.len() != 71
+        || !spec.repository_id[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(PlanError(
+            "repository_id must be a normalized sha256 digest".to_owned(),
         ));
     }
     if spec.timeout_ms == 0 {
@@ -473,6 +487,11 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
         let run_plan = plan(spec)?;
         let started = self.clock.now();
         let mut report = RunReport {
+            schema_version: 1,
+            plan_digest: spec.config_summary.plan_digest.clone(),
+            phase: "runner".into(),
+            exit_code: 0,
+            message: String::new(),
             task_id: spec.task_id.clone(),
             container_id: None,
             source_snapshot: spec.source_snapshot.clone(),
@@ -1027,6 +1046,7 @@ mod tests {
     fn spec(fail_fast: bool) -> RunSpec {
         RunSpec {
             task_id: "task-7".to_owned(),
+            repository_id: format!("sha256:{}", "a".repeat(64)),
             image: ImageRef::new("repo-sandbox/task@sha256:abc").unwrap(),
             image_digest: ImageDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
             source_snapshot: SourceSnapshot {

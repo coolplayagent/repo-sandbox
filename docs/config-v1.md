@@ -68,14 +68,17 @@ The `plan`, `build`, and `verify` routes accept only these runtime options:
 | --- | --- |
 | `--repository PATH_OR_URL` | repository source |
 | `--git-ref REF` | Git ref to check out |
-| `--platform PLATFORM` | target platform; overrides `template.parameters.platform` |
+| `--platform PLATFORM` | target platform; repeat for multi-platform output; the first platform is verified locally |
+| `--oci-layout DIRECTORY` | atomically export a verified OCI layout; required for multi-platform output without `--push` |
 | `--push` | publish a successful/verified task image using the central Registry policy |
 | `--report-path PATH` | atomic, no-overwrite JSON report destination |
 | `--keep-on-failure` | retain a failed sandbox |
 | `--recurse-submodules` | recursively materialize Git submodules in the source snapshot |
 
-When `--platform` is absent, the configured platform parameter is used. No CLI
-option can replace the central image, component graph, or build contexts.
+When `--platform` is absent, the configured platform parameter is used. Multiple
+platforms require `--push` or `--oci-layout`; publication/export happens only
+after the primary platform passes the central runner. No CLI option can replace
+the central image, component graph, or build contexts.
 
 ## Exit codes
 
@@ -87,7 +90,6 @@ option can replace the central image, component graph, or build contexts.
 | `10` | build failed |
 | `11` | test failed |
 
-Build and test execution is outside v1's implementation scope; codes `10` and
 Build-step failures map to `10`; test-step failures map to `11`.
 
 The selected central template has a mandatory versioned `execution` profile.

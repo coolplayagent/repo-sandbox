@@ -12,7 +12,8 @@ and `/tmp` tmpfs limits. It starts no TTY or interactive session. A small non-in
 process exists only for the lifetime of the job so ordered build and test steps
 share `/workspace`; it is removed after the last step or any terminal failure.
 
-Every task has a validated unique `io.repo-sandbox.task-id` label. The runner
+Every task has a validated unique `io.repo-sandbox.task-id` label and a stable
+`io.repo-sandbox.repository-id` digest label. The runner
 rejects a pre-existing matching label before creation. Ownership begins only
 when `docker container create` succeeds and returns an ID; cleanup then uses
 that exact ID. The runner never removes by a caller-supplied name, never prunes
@@ -31,6 +32,9 @@ failure remains the job status. Total timeout, resource exhaustion, and
 infrastructure errors always stop execution. Memory OOM and temporary-storage
 exhaustion are distinct from ordinary command failures.
 
+Every success, command failure, cancellation, cleanup failure, and early
+preflight/snapshot/image/publication failure uses schema version 1 with the same
+top-level fields. Fields unavailable before runner creation are `null` or empty.
 `RunReport` also records the source snapshot identity and origin, a secret-free
 configuration summary, the image reference and content digest, total timing,
 cleanup disposition, and cleanup errors. `write_report_json` writes both success

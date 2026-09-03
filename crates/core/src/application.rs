@@ -1,9 +1,11 @@
 //! Application use cases and injectable orchestration ports.
 
 use crate::AppError;
+use crate::build::{ImageDigest, ImageRef};
 use crate::config::ExecutionRequest;
 use crate::registry::PublishedImage;
-use crate::runner::RunReport;
+use crate::runner::{CleanupResult, ConfigSummary, RunReport, StepResult};
+use crate::snapshot::SourceSnapshot;
 use crate::template::TemplatePlan;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -101,9 +103,32 @@ pub struct WorkflowResult {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorkflowFailureReport {
     pub schema_version: u8,
+    pub task_id: String,
     pub plan_digest: String,
     pub phase: String,
     pub exit_code: i32,
+    pub message: String,
+    pub cleanup: CleanupResult,
+    pub published: Option<PublishedImage>,
+    pub container_id: Option<String>,
+    pub source_snapshot: Option<SourceSnapshot>,
+    pub config: Option<ConfigSummary>,
+    pub image: Option<ImageRef>,
+    pub image_digest: Option<ImageDigest>,
+    pub started_at_unix_ms: u64,
+    pub ended_at_unix_ms: u64,
+    pub duration_ms: u64,
+    pub status: WorkflowFailureStatus,
+    pub steps: Vec<StepResult>,
+    pub exported_artifacts: Vec<PathBuf>,
+    pub artifact_error: Option<String>,
+    pub cleanup_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkflowFailureStatus {
+    pub status: &'static str,
+    pub operation: String,
     pub message: String,
 }
 
