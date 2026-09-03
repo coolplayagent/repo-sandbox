@@ -3338,12 +3338,16 @@ struct ExternalOciGuard {
 
 impl ExternalOciGuard {
     fn prepare(output: &Path) -> Result<Self, AppError> {
-        let output = resolved_future_path(output).map_err(|error| {
+        Self::prepare_inner(output).map_err(|error| {
             AppError::Configuration(format!(
                 "invalid OCI layout destination parent for {}: {error}",
                 output.display()
             ))
-        })?;
+        })
+    }
+
+    fn prepare_inner(output: &Path) -> Result<Self, AppError> {
+        let output = resolved_future_path(output)?;
         if output.exists() {
             return Err(AppError::Configuration(format!(
                 "OCI layout already exists: {}",
@@ -3359,12 +3363,7 @@ impl ExternalOciGuard {
                 ))
             })?
             .to_path_buf();
-        let output_reservation = OutputReservation::oci(&output).map_err(|error| {
-            AppError::Configuration(format!(
-                "invalid OCI layout destination parent for {}: {error}",
-                output.display()
-            ))
-        })?;
+        let output_reservation = OutputReservation::oci(&output)?;
         let parent_reservation = OutputReservation::create(&parent, "OCI layout parent")?;
         let created = create_report_parent(&parent)?;
         let handle = match bind_report_parent(&parent).map_err(|error| {
@@ -6177,7 +6176,10 @@ mod tests {
         plan.request.oci_layout = Some(file_parent.join("layout"));
         let plan = ExecutionPlan::new(plan.template, plan.request);
         let error = WorkflowPort::execute(&SystemWorkflow, WorkflowMode::Build, &plan).unwrap_err();
-        assert!(error.to_string().contains("OCI layout destination parent"));
+        assert!(
+            error.to_string().contains("OCI layout destination parent"),
+            "unexpected error category: {error}"
+        );
         assert_eq!(fs::read_to_string(file_parent).unwrap(), "preserved");
         assert!(!repository.path().join(".repo-sandbox").exists());
     }
