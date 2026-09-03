@@ -2,6 +2,7 @@
 
 use crate::build::{ImageDigest, ImageRef};
 use crate::config::{Config, Platform};
+use crate::registry::PublishedImage;
 use crate::snapshot::SourceSnapshot;
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
@@ -23,15 +24,28 @@ pub struct RunSpec {
     pub resources: RunResources,
     pub timeout_ms: u64,
     pub fail_fast: bool,
+    /// Names only. Docker inherits values from the host, so secret values never
+    /// enter argv, reports, or image history.
+    pub environment_names: Vec<String>,
+    /// Host files containing secret values. Only their validated names and
+    /// paths enter Docker argv; values are injected inside the running exec.
+    pub secret_mounts: Vec<SecretMount>,
     /// When set, export every declared artifact directory beneath this root.
     pub artifact_export_root: Option<PathBuf>,
     /// Retain only task-owned diagnostics when the job fails.
     pub keep_on_failure: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretMount {
+    pub environment: String,
+    pub source: PathBuf,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ConfigSummary {
     pub template_id: String,
+    pub plan_digest: String,
     pub platform: Platform,
     pub build_steps: Vec<String>,
     pub test_steps: Vec<String>,
@@ -43,6 +57,7 @@ impl ConfigSummary {
     pub fn from_config(config: &Config, platform: Platform) -> Self {
         Self {
             template_id: config.template.id.clone(),
+            plan_digest: String::new(),
             platform,
             build_steps: config.build.iter().map(|step| step.name.clone()).collect(),
             test_steps: config.test.iter().map(|step| step.name.clone()).collect(),
@@ -148,6 +163,8 @@ pub struct RunReport {
     pub cleanup: CleanupResult,
     /// Cleanup errors are reported without hiding the primary job outcome.
     pub cleanup_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published: Option<PublishedImage>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

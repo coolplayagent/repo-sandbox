@@ -1,5 +1,50 @@
 version: 1
 scenarios:
+  - id: cli-build-success
+    description: Exercise the real CLI build path through BuildKit, runner, report, artifacts and cleanup.
+    tier: required
+    targets: [docker]
+    covers: [cli, build, report, exact_cleanup]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-build-success, "${RESULT_DIR}"] }
+    expected: { exit_code: 0, log_contains: ["cli-build-success=passed"], artifacts: [cli-build-success.passed] }
+
+  - id: cli-verify-success
+    description: Exercise build and test phases from the real CLI entry point.
+    tier: required
+    targets: [docker]
+    covers: [cli, verify, build_phase, test_phase]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-verify-success, "${RESULT_DIR}"] }
+    expected: { exit_code: 0, log_contains: ["cli-verify-success=passed"], artifacts: [cli-verify-success.passed] }
+
+  - id: cli-build-failure
+    description: Verify a real CLI build failure is reported with exit code 10.
+    tier: required
+    targets: [docker]
+    covers: [cli, build_failure, exit_code_10, failure_report]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-build-failure, "${RESULT_DIR}"] }
+    expected: { exit_code: 0, log_contains: ["cli-build-failure=passed"], artifacts: [cli-build-failure.passed] }
+
+  - id: cli-test-failure
+    description: Verify a real CLI test failure is reported with exit code 11 and is not published.
+    tier: required
+    targets: [docker]
+    covers: [cli, test_failure, exit_code_11, no_publish]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-test-failure, "${RESULT_DIR}"] }
+    expected: { exit_code: 0, log_contains: ["cli-test-failure=passed"], artifacts: [cli-test-failure.passed] }
+
+  - id: cli-clean-owned-only
+    description: Retain a failed task, dry-run the exact plan, clean it, and prove idempotence and foreign-resource safety.
+    tier: required
+    targets: [docker]
+    covers: [cli, clean, dry_run, owner_boundary, idempotent]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-clean-owned-only, "${RESULT_DIR}"] }
+    expected: { exit_code: 0, log_contains: ["cli-clean-owned-only=passed"], artifacts: [cli-clean-owned-only.passed] }
+
   - id: public-git-snapshot
     description: Materialize a public remote through a task-owned localhost unauthenticated HTTP service.
     tier: required

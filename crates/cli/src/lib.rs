@@ -1,12 +1,19 @@
 use clap::{Args, Parser, Subcommand};
 use repo_sandbox_adapters::doctor::{DoctorOptions, DoctorProbe, SystemDoctorProbe, inspect};
+use repo_sandbox_adapters::snapshot::GitSnapshotter;
+use repo_sandbox_adapters::workflow::SystemWorkflow;
+use repo_sandbox_core::AppError;
+use repo_sandbox_core::application::{
+    BuildUseCase, CleanRequest, CleanUseCase, ExecutionPlan, VerifyUseCase,
+};
 use repo_sandbox_core::config::{CliOverrides, Config, ExecutionRequest, Platform};
 use repo_sandbox_core::doctor::{CapabilityKind, CapabilityStatus, DoctorReport, DoctorStatus};
 use repo_sandbox_core::exit_code::ExitCode;
+use repo_sandbox_core::snapshot::{CleanupPolicy, SnapshotOptions, SnapshotOrigin, SourceSpec};
 use repo_sandbox_core::template::{TemplateCatalog, TemplatePlan};
-use repo_sandbox_core::{AppError, Command, route};
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{self, Write as IoWrite};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -26,12 +33,12 @@ enum Commands {
     Doctor(DoctorArgs),
     /// Resolve the selected central template and display its dependency graph.
     Plan(RuntimeArgs),
-    /// Build sandbox artifacts (reserved).
+    /// Build in a bounded one-shot sandbox and export declared artifacts.
     Build(RuntimeArgs),
-    /// Verify sandbox artifacts (reserved).
+    /// Build and test in a bounded one-shot sandbox.
     Verify(RuntimeArgs),
-    /// Remove generated sandbox artifacts (reserved).
-    Clean,
+    /// Remove only resources proven to be owned by repo-sandbox.
+    Clean(CleanArgs),
 }
 
 #[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
@@ -53,10 +60,10 @@ pub struct RuntimeArgs {
     /// Override the repository-declared target platform.
     #[arg(long, value_name = "PLATFORM")]
     pub platform: Option<Platform>,
-    /// Push produced images after a future successful build.
+    /// Push the verified task image using the central registry policy.
     #[arg(long)]
     pub push: bool,
-    /// Write the future machine-readable report to this path.
+    /// Atomically write the machine-readable report; never overwrites.
     #[arg(long = "report-path", value_name = "PATH")]
     pub report: Option<PathBuf>,
     /// Preserve a failed sandbox for diagnosis.
@@ -65,6 +72,28 @@ pub struct RuntimeArgs {
     /// Recursively materialize Git submodules in the source snapshot.
     #[arg(long)]
     pub recurse_submodules: bool,
+}
+
+#[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
+pub struct CleanArgs {
+    /// Repository whose task manifest establishes the ownership boundary.
+    #[arg(long, value_name = "PATH", default_value = ".")]
+    pub repository: PathBuf,
+    /// Show the exact cleanup plan without modifying Docker or files.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Include every repo-sandbox-owned entry in this manifest store.
+    #[arg(long)]
+    pub all: bool,
+    /// Also remove task images after label and reference checks.
+    #[arg(long)]
+    pub include_images: bool,
+    /// Also remove the repository-owned local cache directory.
+    #[arg(long)]
+    pub include_cache: bool,
+    /// Confirm non-interactively (required unless --dry-run).
+    #[arg(long)]
+    pub yes: bool,
 }
 
 impl From<RuntimeArgs> for CliOverrides {
@@ -77,18 +106,6 @@ impl From<RuntimeArgs> for CliOverrides {
             report: value.report,
             keep_on_failure: value.keep_on_failure,
             recurse_submodules: value.recurse_submodules,
-        }
-    }
-}
-
-impl From<Commands> for Command {
-    fn from(value: Commands) -> Self {
-        match value {
-            Commands::Doctor(_) => Self::Doctor,
-            Commands::Plan(_) => Self::Plan,
-            Commands::Build(_) => Self::Build,
-            Commands::Verify(_) => Self::Verify,
-            Commands::Clean => Self::Clean,
         }
     }
 }
@@ -130,10 +147,172 @@ pub fn run_with_probe(cli: Cli, probe: &impl DoctorProbe) -> Result<RunOutput, A
         let source = read_repository_config(arguments.repository.as_deref())?;
         return plan_from_source(&source, arguments);
     }
+    let workflow = SystemWorkflow;
+    match command {
+        Commands::Build(arguments) => run_runtime(arguments, false, &workflow),
+        Commands::Verify(arguments) => run_runtime(arguments, true, &workflow),
+        Commands::Clean(arguments) => {
+            let request = CleanRequest {
+                repository: arguments.repository,
+                all: arguments.all,
+                include_images: arguments.include_images,
+                include_cache: arguments.include_cache,
+                dry_run: arguments.dry_run,
+            };
+            let use_case = CleanUseCase::new(&workflow);
+            let plan = use_case.plan(&request)?;
+            if !request.dry_run && !arguments.yes {
+                eprintln!("{}", render_clean_plan(&plan));
+                eprint!("Remove these owned resources? [y/N] ");
+                io::stderr()
+                    .flush()
+                    .map_err(|error| AppError::Environment(error.to_string()))?;
+                let mut answer = String::new();
+                io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|error| AppError::Environment(error.to_string()))?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+                    return Ok(RunOutput {
+                        message: Some("clean cancelled; no resources changed".into()),
+                        exit_code: ExitCode::Success,
+                    });
+                }
+            }
+            let result = use_case.execute(&plan, request.dry_run)?;
+            let message = render_clean_result(&plan, &result);
+            Ok(RunOutput {
+                message: Some(message),
+                exit_code: if result.complete() {
+                    ExitCode::Success
+                } else {
+                    ExitCode::Environment
+                },
+            })
+        }
+        Commands::Doctor(_) | Commands::Plan(_) => unreachable!(),
+    }
+}
+
+fn render_clean_plan(plan: &repo_sandbox_core::application::CleanPlan) -> String {
+    let mut lines = vec![format!(
+        "clean plan: {} candidate(s), {} refused",
+        plan.candidates.len(),
+        plan.refused.len()
+    )];
+    for item in &plan.candidates {
+        lines.push(format!(
+            "  candidate {:?} {} task={}",
+            item.kind, item.identifier, item.task_id
+        ));
+    }
+    for reason in &plan.refused {
+        lines.push(format!("  refused {reason}"));
+    }
+    lines.join("\n")
+}
+
+fn render_clean_result(
+    plan: &repo_sandbox_core::application::CleanPlan,
+    result: &repo_sandbox_core::application::CleanResult,
+) -> String {
+    let mut lines = vec![
+        render_clean_plan(plan),
+        format!(
+            "clean: {} succeeded, {} skipped, {} failed{}",
+            result.succeeded.len(),
+            result.skipped.len(),
+            result.failed.len(),
+            if result.dry_run { " (dry-run)" } else { "" }
+        ),
+    ];
+    for item in &result.succeeded {
+        lines.push(format!("  removed {:?} {}", item.kind, item.identifier));
+    }
+    for item in &result.skipped {
+        lines.push(format!("  skipped {item}"));
+    }
+    for item in &result.failed {
+        lines.push(format!("  failed {item}"));
+    }
+    lines.join("\n")
+}
+
+fn run_runtime(
+    arguments: RuntimeArgs,
+    verify: bool,
+    workflow: &SystemWorkflow,
+) -> Result<RunOutput, AppError> {
+    let mut arguments = arguments;
+    let source = if let Some(repository) = arguments
+        .repository
+        .as_deref()
+        .filter(|value| value.contains("://") || value.starts_with("git@"))
+    {
+        let materialized = GitSnapshotter::default()
+            .with_authentication(
+                repo_sandbox_adapters::workflow::environment_git_authentication(repository),
+            )
+            .create(
+                &SourceSpec::RemoteGit {
+                    repository: repository.to_owned(),
+                    git_ref: arguments.git_ref.clone().unwrap_or_else(|| "HEAD".into()),
+                },
+                SnapshotOptions {
+                    recurse_submodules: arguments.recurse_submodules,
+                    cleanup: CleanupPolicy::Delete,
+                },
+            )
+            .map_err(|error| AppError::Environment(error.to_string()))?;
+        if let SnapshotOrigin::RemoteGit { commit, .. } = &materialized.snapshot.origin {
+            arguments.git_ref = Some(commit.as_str().to_owned());
+        }
+        fs::read_to_string(materialized.path().join(".repo-sandbox.yaml")).map_err(|error| {
+            AppError::Configuration(format!("remote .repo-sandbox.yaml: {error}"))
+        })?
+    } else {
+        read_repository_config(arguments.repository.as_deref())?
+    };
+    let execution = execution_plan_from_source(&source, arguments)?;
+    let result = if verify {
+        VerifyUseCase::new(workflow).execute(&execution)
+    } else {
+        BuildUseCase::new(workflow).execute(&execution)
+    }?;
     Ok(RunOutput {
-        message: Some(route(Command::from(command))?),
+        message: Some(render_workflow(&result)),
         exit_code: ExitCode::Success,
     })
+}
+
+fn execution_plan_from_source(
+    source: &str,
+    arguments: RuntimeArgs,
+) -> Result<ExecutionPlan, AppError> {
+    let config =
+        Config::parse_yaml(source).map_err(|error| AppError::Configuration(error.to_string()))?;
+    if config.legacy.is_some() {
+        return Err(AppError::Configuration(
+            "legacy inline execution is unsupported; select a central template profile".into(),
+        ));
+    }
+    let request = ExecutionRequest::resolve(&config, arguments.into());
+    let template = TemplateCatalog::builtin()
+        .map_err(|error| AppError::Configuration(error.to_string()))?
+        .plan(&config.template, request.platform)
+        .map_err(|error| AppError::Configuration(error.to_string()))?;
+    Ok(ExecutionPlan::new(template, request))
+}
+
+fn render_workflow(result: &repo_sandbox_core::application::WorkflowResult) -> String {
+    format!(
+        "task={} status={:?} source=sha256:{} image={}@{} plan={}",
+        result.report.task_id,
+        result.report.status,
+        result.report.source_snapshot.id,
+        result.report.image,
+        result.report.image_digest,
+        result.plan_digest
+    )
 }
 
 fn read_repository_config(repository: Option<&str>) -> Result<String, AppError> {
@@ -197,6 +376,21 @@ pub fn render_plan(plan: &TemplatePlan) -> String {
             stage.build_context.display()
         ));
     }
+    lines.push("Execution profile:".to_owned());
+    for step in &plan.execution.build {
+        lines.push(format!("  build {}: {}", step.name, step.command));
+    }
+    for step in &plan.execution.test {
+        lines.push(format!("  test {}: {}", step.name, step.command));
+    }
+    lines.push(format!(
+        "  resources: cpu={} memory={}MiB temporary-storage={}MiB timeout={}s fail-fast={}",
+        plan.execution.resources.cpu,
+        plan.execution.resources.memory_mb,
+        plan.execution.resources.temporary_storage_mb,
+        plan.execution.timeout_seconds,
+        plan.execution.fail_fast
+    ));
     lines.join("\n")
 }
 
@@ -356,22 +550,29 @@ mod tests {
     }
 
     #[test]
-    fn every_reserved_subcommand_parses() {
+    fn implemented_subcommands_parse_with_their_finite_surfaces() {
         let doctor = Cli::try_parse_from(["repo-sandbox", "doctor"]).unwrap();
         let result = run_with_probe(doctor, &ReadyProbe).unwrap();
         assert_eq!(result.exit_code, ExitCode::Success);
         assert!(result.message.unwrap().contains("doctor: ready"));
 
-        for name in ["build", "verify", "clean"] {
+        for name in ["build", "verify"] {
             let cli = Cli::try_parse_from(["repo-sandbox", name]).unwrap();
-            assert_eq!(
-                run_with_probe(cli, &ReadyProbe).unwrap(),
-                RunOutput {
-                    message: Some(format!("{name} is not implemented yet")),
-                    exit_code: ExitCode::Success,
-                }
-            );
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Build(_)) | Some(Commands::Verify(_))
+            ));
         }
+        let clean = Cli::try_parse_from(["repo-sandbox", "clean", "--dry-run", "--include-images"])
+            .unwrap();
+        assert!(matches!(
+            clean.command,
+            Some(Commands::Clean(CleanArgs {
+                dry_run: true,
+                include_images: true,
+                ..
+            }))
+        ));
     }
 
     #[test]
@@ -391,6 +592,7 @@ template:
         assert!(message.contains("[0] base-tools@1.0.0 <- (root)"));
         assert!(message.contains("[1] bazel@1.0.0 <- base-tools"));
         assert!(message.contains("[2] rust@1.0.0 <- base-tools"));
+        assert!(message.contains("build bazel-build: bazelisk build //..."));
     }
 
     #[test]

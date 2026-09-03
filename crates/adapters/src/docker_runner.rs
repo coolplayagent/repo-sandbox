@@ -258,12 +258,13 @@ pub fn plan(spec: &RunSpec) -> Result<DockerRunPlan, PlanError> {
         &format!("label={label}"),
     ]);
     let memory = format!("{}m", spec.resources.memory_mb);
+    let cpu = spec.resources.cpu_count.to_string();
     let temporary = format!(
         "/tmp:rw,nosuid,nodev,size={}m",
         spec.resources.temporary_storage_mb
     );
     let writable_layer = format!("size={}m", spec.resources.temporary_storage_mb);
-    let create = docker(vec![
+    let mut create_args = vec![
         "container",
         "create",
         "--name",
@@ -273,7 +274,7 @@ pub fn plan(spec: &RunSpec) -> Result<DockerRunPlan, PlanError> {
         "--network",
         "bridge",
         "--cpus",
-        &spec.resources.cpu_count.to_string(),
+        &cpu,
         "--memory",
         &memory,
         "--memory-swap",
@@ -290,11 +291,31 @@ pub fn plan(spec: &RunSpec) -> Result<DockerRunPlan, PlanError> {
         "/workspace",
         "--platform",
         spec.platform.as_str(),
+    ];
+    for name in &spec.environment_names {
+        create_args.extend(["--env", name]);
+    }
+    let secret_mounts = spec
+        .secret_mounts
+        .iter()
+        .map(|secret| {
+            format!(
+                "type=bind,src={},dst=/run/repo-sandbox-secrets/{},readonly",
+                secret.source.to_string_lossy(),
+                secret.environment
+            )
+        })
+        .collect::<Vec<_>>();
+    for mount in &secret_mounts {
+        create_args.extend(["--mount", mount.as_str()]);
+    }
+    create_args.extend([
         spec.image.as_str(),
         "/bin/sh",
         "-c",
         "trap 'exit 0' TERM INT; while :; do sleep 3600; done",
     ]);
+    let create = docker(create_args);
     let start = docker(vec!["container", "start", &name]);
     let steps = spec
         .build
@@ -310,7 +331,9 @@ pub fn plan(spec: &RunSpec) -> Result<DockerRunPlan, PlanError> {
                 &name,
                 "/bin/sh",
                 "-lc",
-                &step.command,
+                &if spec.secret_mounts.is_empty() { step.command.clone() } else {
+                    format!("for f in /run/repo-sandbox-secrets/*; do n=${{f##*/}}; export \"$n=$(cat \"$f\")\"; done; {}", step.command)
+                },
             ]),
         })
         .collect();
@@ -354,9 +377,9 @@ fn validate_spec(spec: &RunSpec) -> Result<(), PlanError> {
             "all resource limits must be greater than zero".to_owned(),
         ));
     }
-    if spec.build.is_empty() || spec.test.is_empty() {
+    if spec.build.is_empty() && spec.test.is_empty() {
         return Err(PlanError(
-            "build and test must each contain at least one step".to_owned(),
+            "at least one build or test step is required".to_owned(),
         ));
     }
     if spec
@@ -367,6 +390,31 @@ fn validate_spec(spec: &RunSpec) -> Result<(), PlanError> {
     {
         return Err(PlanError(
             "step names and commands must not be empty".to_owned(),
+        ));
+    }
+    if spec.environment_names.iter().any(|name| {
+        name.is_empty()
+            || name.bytes().enumerate().any(|(index, byte)| {
+                !(byte == b'_'
+                    || byte.is_ascii_alphabetic()
+                    || (index > 0 && byte.is_ascii_digit()))
+            })
+    }) {
+        return Err(PlanError(
+            "environment names must use POSIX identifier syntax".to_owned(),
+        ));
+    }
+    if spec.secret_mounts.iter().any(|secret| {
+        secret.environment.is_empty()
+            || !secret.source.is_file()
+            || secret.environment.bytes().enumerate().any(|(index, byte)| {
+                !(byte == b'_'
+                    || byte.is_ascii_alphabetic()
+                    || (index > 0 && byte.is_ascii_digit()))
+            })
+    }) {
+        return Err(PlanError(
+            "secret mounts require a regular file and POSIX environment name".to_owned(),
         ));
     }
     Ok(())
@@ -400,6 +448,16 @@ impl<E, C, S> DockerRunner<E, C, S> {
 
 impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
     pub fn run(&self, spec: &RunSpec) -> Result<RunReport, PlanError> {
+        self.run_with_container_hook(spec, |_| Ok(()))
+    }
+
+    /// Register the exact Docker ID immediately after successful creation and
+    /// before start. A failed durable registration triggers exact cleanup.
+    pub fn run_with_container_hook(
+        &self,
+        spec: &RunSpec,
+        hook: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<RunReport, PlanError> {
         let run_plan = plan(spec)?;
         let started = self.clock.now();
         let mut report = RunReport {
@@ -418,6 +476,7 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
             artifact_error: None,
             cleanup: CleanupResult::NotNeeded,
             cleanup_error: None,
+            published: None,
         };
 
         if let Err(status) = self.ensure_unowned(&run_plan, spec, started.monotonic_ms) {
@@ -446,6 +505,17 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
             return Ok(self.finish(report, started));
         }
         report.container_id = Some(container_id.clone());
+        if let Err(error) = hook(&container_id) {
+            report.status = infrastructure("register owned container", error);
+            match self.cleanup(&container_id) {
+                Ok(()) => report.cleanup = CleanupResult::Removed,
+                Err(error) => {
+                    report.cleanup = CleanupResult::Failed;
+                    report.cleanup_error = Some(error.to_string());
+                }
+            }
+            return Ok(self.finish(report, started));
+        }
 
         match self.execute_remaining(&run_plan.start, spec, started.monotonic_ms) {
             Ok(output) if output.interrupted => report.status = RunStatus::TimedOut,
@@ -696,13 +766,37 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
                 stderr_bytes: Vec::new(),
             });
         }
-        self.executor.execute_streaming(
-            invocation,
-            Duration::from_millis(remaining),
-            &self.sink,
-            phase,
-            step,
-        )
+        if spec.secret_mounts.is_empty() {
+            self.executor.execute_streaming(
+                invocation,
+                Duration::from_millis(remaining),
+                &self.sink,
+                phase,
+                step,
+            )
+        } else {
+            let mut output = self
+                .executor
+                .execute(invocation, Duration::from_millis(remaining))?;
+            for secret in &spec.secret_mounts {
+                if let Ok(bytes) = std::fs::read(&secret.source) {
+                    if !bytes.is_empty() {
+                        let value = String::from_utf8_lossy(&bytes);
+                        output.stdout = output.stdout.replace(value.as_ref(), "[REDACTED]");
+                        output.stderr = output.stderr.replace(value.as_ref(), "[REDACTED]");
+                    }
+                }
+            }
+            let stdout_bytes = output.stdout.as_bytes().to_vec();
+            let stderr_bytes = output.stderr.as_bytes().to_vec();
+            self.sink.stdout(phase, step, &stdout_bytes);
+            self.sink.stderr(phase, step, &stderr_bytes);
+            Ok(StreamedProcessOutput {
+                output,
+                stdout_bytes,
+                stderr_bytes,
+            })
+        }
     }
 
     fn cleanup(&self, container_id: &str) -> io::Result<()> {
@@ -780,7 +874,9 @@ mod tests {
     use repo_sandbox_core::build::ImageDigest;
     use repo_sandbox_core::build::ImageRef;
     use repo_sandbox_core::config::Platform;
-    use repo_sandbox_core::runner::{ConfigSummary, RunResources, RunStep, write_report_json};
+    use repo_sandbox_core::runner::{
+        ConfigSummary, RunResources, RunStep, SecretMount, write_report_json,
+    };
     use repo_sandbox_core::snapshot::{SnapshotId, SnapshotOrigin, SourceSnapshot};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -923,6 +1019,7 @@ mod tests {
             },
             config_summary: ConfigSummary {
                 template_id: "rust".to_owned(),
+                plan_digest: "sha256:test".to_owned(),
                 platform: Platform::LinuxAmd64,
                 build_steps: vec!["compile".to_owned(), "lint".to_owned()],
                 test_steps: vec!["unit".to_owned()],
@@ -950,9 +1047,48 @@ mod tests {
             },
             timeout_ms: 5_000,
             fail_fast,
+            environment_names: Vec::new(),
+            secret_mounts: Vec::new(),
             artifact_export_root: None,
             keep_on_failure: false,
         }
+    }
+
+    #[test]
+    fn secret_values_never_reach_docker_argv_sink_or_report() {
+        let clock = FakeClock(Rc::new(Cell::new(0)));
+        let executor = FakeExecutor::new(
+            &clock,
+            vec![
+                output(0, "", ""),
+                output(0, "container-secret\n", ""),
+                output(0, "", ""),
+                output(0, "token-super-secret\n", "err token-super-secret"),
+                output(0, "", ""),
+            ],
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let secret = temporary.path().join("TOKEN");
+        fs::write(&secret, "token-super-secret").unwrap();
+        let mut request = spec(true);
+        request.build.truncate(1);
+        request.test.clear();
+        request.secret_mounts = vec![SecretMount {
+            environment: "TOKEN".into(),
+            source: secret,
+        }];
+        let sink = RecordingSink::default();
+        let report = DockerRunner::new_with_sink(&executor, clock, sink.clone())
+            .run(&request)
+            .unwrap();
+        let invocations = format!("{:?}", executor.invocations());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!invocations.contains("token-super-secret"));
+        assert!(!json.contains("token-super-secret"));
+        assert!(
+            !String::from_utf8_lossy(&sink.stdout.lock().unwrap()).contains("token-super-secret")
+        );
+        assert!(json.contains("[REDACTED]"));
     }
 
     #[derive(Clone, Default)]

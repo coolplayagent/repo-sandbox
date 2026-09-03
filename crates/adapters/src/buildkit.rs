@@ -1009,6 +1009,10 @@ fn plan_digest_for_platforms(plan: &TemplatePlan, platforms: &[Platform]) -> Str
             hash_field(&mut hasher, dependency);
         }
     }
+    hash_field(
+        &mut hasher,
+        &serde_json::to_string(&plan.execution).expect("execution profile is serializable"),
+    );
     format!("sha256:{:x}", hasher.finalize())
 }
 
@@ -1203,6 +1207,7 @@ mod tests {
                 build_context: PathBuf::from("templates/components/base-tools/context"),
                 depends_on: Vec::new(),
             }],
+            execution: Default::default(),
         }
     }
 

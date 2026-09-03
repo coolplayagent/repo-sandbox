@@ -28,6 +28,11 @@ each local image's OS/architecture, and then rechecks the original tag to detect
 a mutable-tag race. A raw single-image manifest is accepted for exactly one
 requested platform, which must match the pulled local image.
 
+The CLI seeds and publishes only after every requested build/verify step has
+succeeded. Missing Registry configuration fails before Docker build side
+effects, and seed, immutable-tag, manifest, or alias errors always return
+non-zero rather than being ignored.
+
 ## Configurable integration test
 
 No external credentials or registry are assumed by the default test suite. To

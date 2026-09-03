@@ -1,7 +1,7 @@
 //! Central environment template catalog and deterministic dependency planning.
 
 use crate::config::{Platform, TemplateSelection};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -27,6 +27,83 @@ pub struct TemplateDefinition {
     pub build_context: PathBuf,
     #[serde(default)]
     pub parameters: BTreeMap<String, ParameterDefinition>,
+    pub execution: ExecutionDefinition,
+}
+
+/// Versioned central execution profile. Repository configuration can select and
+/// parameterize a profile, but cannot replace commands or safety limits.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionDefinition {
+    pub version: u8,
+    pub build: Vec<ExecutionStep>,
+    pub test: Vec<ExecutionStep>,
+    pub resources: ExecutionResources,
+    pub timeout_seconds: u32,
+    #[serde(default = "default_true")]
+    pub fail_fast: bool,
+    #[serde(default)]
+    pub environment_allow: Vec<String>,
+    #[serde(default)]
+    pub secret_environment: Vec<String>,
+    #[serde(default)]
+    pub artifact_directories: Vec<PathBuf>,
+    #[serde(default)]
+    pub registry: Option<RegistryPolicy>,
+}
+
+impl Default for ExecutionDefinition {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            build: vec![ExecutionStep {
+                name: "build".into(),
+                command: "true".into(),
+            }],
+            test: vec![ExecutionStep {
+                name: "test".into(),
+                command: "true".into(),
+            }],
+            resources: ExecutionResources {
+                cpu: 1,
+                memory_mb: 512,
+                temporary_storage_mb: 1024,
+            },
+            timeout_seconds: 300,
+            fail_fast: true,
+            environment_allow: Vec::new(),
+            secret_environment: Vec::new(),
+            artifact_directories: Vec::new(),
+            registry: None,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionStep {
+    pub name: String,
+    pub command: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionResources {
+    pub cpu: u16,
+    pub memory_mb: u32,
+    pub temporary_storage_mb: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryPolicy {
+    pub repository: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -49,7 +126,7 @@ pub struct TemplateCatalog {
     components: Vec<ComponentDefinition>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TemplatePlan {
     pub template_id: String,
     pub template_version: String,
@@ -60,9 +137,10 @@ pub struct TemplatePlan {
     pub build_context: PathBuf,
     pub parameters: BTreeMap<String, String>,
     pub stages: Vec<PlanStage>,
+    pub execution: ExecutionDefinition,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PlanStage {
     pub id: String,
     pub version: String,
@@ -277,6 +355,18 @@ impl TemplateCatalog {
                 })
             })
             .collect();
+        let mut execution = template.execution.clone();
+        if let Some(registry) = &mut execution.registry {
+            registry.repository = interpolate(&registry.repository, &parameters);
+            registry.aliases = registry
+                .aliases
+                .iter()
+                .map(|value| interpolate(value, &parameters))
+                .collect();
+            if registry.repository.trim().is_empty() {
+                execution.registry = None;
+            }
+        }
         Ok(TemplatePlan {
             template_id: template.id.clone(),
             template_version: template.version.clone(),
@@ -286,6 +376,7 @@ impl TemplateCatalog {
             build_context: template.build_context.clone(),
             parameters,
             stages,
+            execution,
         })
     }
 
@@ -306,6 +397,7 @@ impl TemplateCatalog {
                 &format!("{path}.target_platforms"),
                 &template.target_platforms,
             )?;
+            validate_execution(&format!("{path}.execution"), &template.execution)?;
             let mut component_ids = BTreeSet::new();
             for (component_index, component) in template.components.iter().enumerate() {
                 require_non_empty(
@@ -418,6 +510,71 @@ fn validate_platforms(path: &str, platforms: &[Platform]) -> Result<(), PlanErro
     Ok(())
 }
 
+fn validate_execution(path: &str, execution: &ExecutionDefinition) -> Result<(), PlanError> {
+    if execution.version != 1 {
+        return Err(PlanError::new(
+            format!("{path}.version"),
+            "expected version 1",
+        ));
+    }
+    if execution.build.is_empty() || execution.test.is_empty() {
+        return Err(PlanError::new(
+            path,
+            "build and test must each contain at least one step",
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for (phase, steps) in [("build", &execution.build), ("test", &execution.test)] {
+        for (index, step) in steps.iter().enumerate() {
+            require_non_empty(&format!("{path}.{phase}[{index}].name"), &step.name)?;
+            require_non_empty(&format!("{path}.{phase}[{index}].command"), &step.command)?;
+            if !names.insert(step.name.as_str()) {
+                return Err(PlanError::new(
+                    format!("{path}.{phase}[{index}].name"),
+                    "step names must be unique across build and test",
+                ));
+            }
+        }
+    }
+    if execution.resources.cpu == 0
+        || execution.resources.memory_mb == 0
+        || execution.resources.temporary_storage_mb == 0
+        || execution.timeout_seconds == 0
+    {
+        return Err(PlanError::new(
+            path,
+            "resource limits and timeout must be greater than zero",
+        ));
+    }
+    for (index, directory) in execution.artifact_directories.iter().enumerate() {
+        validate_context(&format!("{path}.artifact_directories[{index}]"), directory)?;
+    }
+    for (kind, values) in [
+        ("environment_allow", &execution.environment_allow),
+        ("secret_environment", &execution.secret_environment),
+    ] {
+        let mut seen = BTreeSet::new();
+        for (index, value) in values.iter().enumerate() {
+            let valid = value.bytes().enumerate().all(|(offset, byte)| {
+                byte == b'_' || byte.is_ascii_alphabetic() || (offset > 0 && byte.is_ascii_digit())
+            });
+            if !valid || value.is_empty() || !seen.insert(value) {
+                return Err(PlanError::new(
+                    format!("{path}.{kind}[{index}]"),
+                    "must be a unique POSIX environment name",
+                ));
+            }
+        }
+    }
+    if let Some(registry) = &execution.registry {
+        require_non_empty(&format!("{path}.registry.repository"), &registry.repository)?;
+        for (index, alias) in registry.aliases.iter().enumerate() {
+            require_non_empty(&format!("{path}.registry.aliases[{index}]"), alias)?;
+        }
+    }
+    Ok(())
+}
+
 fn interpolate(value: &str, parameters: &BTreeMap<String, String>) -> String {
     parameters
         .iter()
@@ -475,6 +632,23 @@ build_context: templates/components/base
     }
 
     #[test]
+    fn execution_profile_is_mandatory_and_versioned() {
+        let missing = r#"id: test
+version: "1"
+base_image: example:1
+components: []
+target_platforms: [linux/amd64]
+build_context: templates/test
+"#;
+        let error = TemplateCatalog::from_yaml_sources(&[missing], &[]).unwrap_err();
+        assert!(error.to_string().contains("missing field `execution`"));
+        let invalid = missing.to_owned()
+            + "execution: { version: 2, build: [{ name: b, command: \"true\" }], test: [{ name: t, command: \"true\" }], resources: { cpu: 1, memory_mb: 1, temporary_storage_mb: 1 }, timeout_seconds: 1 }\n";
+        let error = TemplateCatalog::from_yaml_sources(&[&invalid], &[]).unwrap_err();
+        assert_eq!(error.path(), "$.templates[0].execution.version");
+    }
+
+    #[test]
     fn stable_topological_order_uses_ids_to_break_ties() {
         let template = r#"
 id: test
@@ -488,6 +662,7 @@ components:
     depends_on: [base]
 target_platforms: [linux/amd64]
 build_context: templates/test
+execution: { version: 1, build: [{ name: build, command: "true" }], test: [{ name: test, command: "true" }], resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }, timeout_seconds: 1 }
 "#;
         let zed = COMPONENT.replace("id: base", "id: zed");
         let alpha = COMPONENT.replace("id: base", "id: alpha");
@@ -515,6 +690,7 @@ base_image: example:1
 components: [{ id: absent }]
 target_platforms: [linux/amd64]
 build_context: templates/test
+execution: { version: 1, build: [{ name: build, command: "true" }], test: [{ name: test, command: "true" }], resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }, timeout_seconds: 1 }
 "#;
         let catalog = TemplateCatalog::from_yaml_sources(&[template], &[COMPONENT]).unwrap();
         let error = catalog
@@ -539,6 +715,7 @@ base_image: example:1
 components: []
 target_platforms: [linux/amd64]
 build_context: templates/test
+execution: { version: 1, build: [{ name: build, command: "true" }], test: [{ name: test, command: "true" }], resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }, timeout_seconds: 1 }
 "#;
         let error = TemplateCatalog::from_yaml_sources(&[template, template], &[]).unwrap_err();
         assert_eq!(error.path(), "$.templates[1].id");
@@ -555,6 +732,7 @@ components:
   - { id: other, depends_on: [base] }
 target_platforms: [linux/amd64]
 build_context: templates/test
+execution: { version: 1, build: [{ name: build, command: "true" }], test: [{ name: test, command: "true" }], resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }, timeout_seconds: 1 }
 "#;
         let other = COMPONENT.replace("id: base", "id: other");
         let catalog =
@@ -575,6 +753,7 @@ base_image: example:1
 components: [{ id: base }]
 target_platforms: [linux/arm64]
 build_context: templates/test
+execution: { version: 1, build: [{ name: build, command: "true" }], test: [{ name: test, command: "true" }], resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }, timeout_seconds: 1 }
 "#;
         let catalog = TemplateCatalog::from_yaml_sources(&[template], &[COMPONENT]).unwrap();
         let error = catalog

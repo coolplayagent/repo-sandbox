@@ -47,6 +47,11 @@ invoke `MaterializedSnapshot::retain_on_failure` when the CLI flag is present.
 Neither path issues Docker image removal, builder removal, or any prune command,
 so shared images and global BuildKit cache are outside the cleanup boundary.
 
+Ordinary allowlisted environment variables are inherited by name. Secrets are
+private temporary files mounted read-only and loaded only inside `docker exec`,
+so their values do not enter argv or persistent `Config.Env`. Secret-bearing
+step output is buffered and value-redacted before console and report emission.
+
 Artifact export is declaration based: every request must exactly equal a
 configured relative directory. Portable validation rejects both slash styles,
 absolute/drive/UNC forms, `..`, links, and Windows reparse points. Every source

@@ -18,3 +18,25 @@ parameters:
     default: "1.27.0"
   bazel_version:
     default: "8.3.1"
+  registry_repository:
+    default: ""
+execution:
+  version: 1
+  build:
+    - name: bazel-build
+      command: bazelisk build //...
+  test:
+    - name: bazel-test
+      command: bazelisk test //...
+  resources:
+    cpu: 2
+    memory_mb: 4096
+    temporary_storage_mb: 8192
+  timeout_seconds: 1800
+  fail_fast: true
+  environment_allow: []
+  secret_environment: []
+  artifact_directories: []
+  registry:
+    repository: "${registry_repository}"
+    aliases: [verified]

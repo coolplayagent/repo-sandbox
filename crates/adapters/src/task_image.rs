@@ -47,6 +47,7 @@ pub struct TaskImageOptions {
     pub progress: Progress,
     pub cache: CacheConfig,
     pub builder: Builder,
+    pub output: ImageOutput,
 }
 
 impl Default for TaskImageOptions {
@@ -55,6 +56,7 @@ impl Default for TaskImageOptions {
             progress: Progress::Auto,
             cache: CacheConfig::default(),
             builder: Builder::default(),
+            output: ImageOutput::Load,
         }
     }
 }
@@ -162,6 +164,7 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
             build_context: PathBuf::from("."),
             parameters: Default::default(),
             stages: Vec::new(),
+            execution: Default::default(),
         };
         let mut build_args = std::collections::BTreeMap::new();
         for (name, value) in labels(&request, &identity) {
@@ -176,7 +179,7 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
                     image,
                     BuildOptions {
                         progress: request.options.progress,
-                        output: ImageOutput::Load,
+                        output: request.options.output,
                         cache: request.options.cache,
                         builder: request.options.builder,
                         build_args,

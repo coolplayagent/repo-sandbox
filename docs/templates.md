@@ -37,7 +37,8 @@ repo-sandbox plan --repository path/to/repository
 ```
 
 The output identifies the resolved template, image, platform, central build
-context, and every dependency edge in stable execution order.
+context, every dependency edge, and the mandatory versioned execution profile
+in stable order. Repository YAML cannot replace profile commands or limits.
 
 ## BuildKit adapter
 

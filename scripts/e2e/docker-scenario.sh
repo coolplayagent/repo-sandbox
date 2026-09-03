@@ -13,6 +13,61 @@ run_test() {
 }
 
 case "$scenario" in
+  cli-build-success|cli-verify-success|cli-build-failure|cli-test-failure|cli-clean-owned-only)
+    fixture=$(mktemp -d)
+    cleanup_cli_fixture() { rm -rf -- "$fixture"; }
+    trap cleanup_cli_fixture EXIT
+    cp "$root/.repo-sandbox.yaml.example" "$fixture/.repo-sandbox.yaml"
+    git -C "$fixture" init -q
+    git -C "$fixture" config user.email e2e@example.invalid
+    git -C "$fixture" config user.name repo-sandbox-e2e
+    if [[ "$scenario" == cli-build-failure || "$scenario" == cli-clean-owned-only ]]; then
+      printf 'this is not valid bazel syntax !!!\n' >"$fixture/BUILD.bazel"
+    else
+      cat >"$fixture/BUILD.bazel" <<'EOF'
+genrule(name = "build_ok", outs = ["built.txt"], cmd = "echo built > $@")
+sh_test(name = "tests", srcs = ["test.sh"])
+EOF
+      if [[ "$scenario" == cli-test-failure ]]; then
+        printf '#!/bin/sh\nexit 23\n' >"$fixture/test.sh"
+      else
+        printf '#!/bin/sh\nexit 0\n' >"$fixture/test.sh"
+      fi
+      chmod +x "$fixture/test.sh"
+    fi
+    git -C "$fixture" add .
+    git -C "$fixture" commit -qm fixture
+    cargo build -p repo-sandbox-cli
+    cli="$root/target/debug/repo-sandbox"
+    report="$fixture/report.json"
+    case "$scenario" in
+      cli-build-success) "$cli" build --repository "$fixture" --report-path "$report" ;;
+      cli-verify-success) "$cli" verify --repository "$fixture" --report-path "$report" ;;
+      cli-build-failure)
+        set +e; "$cli" build --repository "$fixture" --report-path "$report"; status=$?; set -e
+        [[ $status -eq 10 ]]
+        ;;
+      cli-test-failure)
+        set +e; "$cli" verify --repository "$fixture" --report-path "$report"; status=$?; set -e
+        [[ $status -eq 11 ]]
+        ;;
+      cli-clean-owned-only)
+        foreign=$(docker create --label io.repo-sandbox.task-id=foreign busybox:1.36 true)
+        set +e; "$cli" build --repository "$fixture" --keep-on-failure --report-path "$report"; status=$?; set -e
+        [[ $status -eq 10 ]]
+        before=$(docker inspect --format '{{.Id}}' "$foreign")
+        "$cli" clean --repository "$fixture" --dry-run --include-images --include-cache
+        "$cli" clean --repository "$fixture" --yes --include-images --include-cache
+        "$cli" clean --repository "$fixture" --yes --include-images --include-cache
+        [[ $(docker inspect --format '{{.Id}}' "$foreign") == "$before" ]]
+        docker rm "$foreign" >/dev/null
+        ;;
+    esac
+    [[ -s "$report" ]]
+    grep -q '"task_id"' "$report"
+    echo "$scenario=passed"
+    printf 'passed\n' >"$result_directory/$scenario.passed"
+    ;;
   adapters)
     run_test 'task_image::tests::docker_task_image_contains_only_snapshot_source'
     echo 'stage=snapshot-task-image status=passed'

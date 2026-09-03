@@ -1,3 +1,5 @@
 /bazel-*
 /.distdir/
 /target/
+/.repo-sandbox/
+/.e2e-results/

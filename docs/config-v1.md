@@ -69,8 +69,8 @@ The `plan`, `build`, and `verify` routes accept only these runtime options:
 | `--repository PATH_OR_URL` | repository source |
 | `--git-ref REF` | Git ref to check out |
 | `--platform PLATFORM` | target platform; overrides `template.parameters.platform` |
-| `--push` | request a future image push |
-| `--report-path PATH` | future report destination |
+| `--push` | publish a successful/verified task image using the central Registry policy |
+| `--report-path PATH` | atomic, no-overwrite JSON report destination |
 | `--keep-on-failure` | retain a failed sandbox |
 | `--recurse-submodules` | recursively materialize Git submodules in the source snapshot |
 
@@ -88,4 +88,11 @@ option can replace the central image, component graph, or build contexts.
 | `11` | test failed |
 
 Build and test execution is outside v1's implementation scope; codes `10` and
-`11` are reserved now so later execution work does not change the public API.
+Build-step failures map to `10`; test-step failures map to `11`.
+
+The selected central template has a mandatory versioned `execution` profile.
+It owns ordered build/test commands, fail-fast, CPU/memory/temporary-storage
+limits, timeout, allowlisted environment names, external Secret names, artifact
+directories, and optional parameterized Registry repository/aliases. Unknown
+fields fail. The complete resolved DAG, profile, parameters and finite CLI
+overrides form the execution/task identity digest.
