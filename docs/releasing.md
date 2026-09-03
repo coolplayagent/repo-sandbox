@@ -21,11 +21,16 @@ cache entries cannot become release inputs.
 ## Publishing
 
 1. Update the workspace version in `Cargo.toml`, `MODULE.bazel`, and both CLI
-   targets in `crates/cli/BUILD.bazel`.
+   targets in `apps/cli/BUILD.bazel`.
 2. Merge the version change after both required checks pass.
 3. Create a tag in the exact form `vMAJOR.MINOR.PATCH`, pointing at that commit,
    and push it. Configure the `release` GitHub Environment and tag ruleset so
    only release maintainers can approve or create matching tags.
+
+The same existing tag can be selected through `workflow_dispatch` for an
+operator-controlled retry. Manual dispatch does not broaden the release set:
+the tag must still be canonical, resolve to the version declared by the tagged
+tree, and point to a commit already contained in `origin/main`.
 
 The tag workflow validates that the tagged commit is already on `origin/main`,
 the tag is canonical, and all version declarations match before it builds
@@ -34,7 +39,9 @@ anything. Native GitHub runners build `linux-amd64` and
 run the Bazel tests, enforce a maximum GLIBC 2.28 symbol requirement, execute
 each binary, create a
 deterministic archive, and attach both per-asset checksums and `SHA256SUMS` to a
-GitHub Release with generated notes. Only the `Publish protected tag release`
+GitHub Release with generated notes. Each platform archive contains exactly one
+root-level `repo-sandbox` executable. The publish job also records GitHub build
+provenance attestations for both archive digests. Only the `Publish protected tag release`
 job receives `contents: write`; build and fresh-machine jobs remain read-only.
 All third-party Actions are pinned to full commits and checkout never persists
 the workflow token.

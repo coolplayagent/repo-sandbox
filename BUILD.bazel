@@ -5,6 +5,6 @@ exports_files([
 
 alias(
     name = "repo-sandbox",
-    actual = "//crates/cli:repo-sandbox",
+    actual = "//apps/cli:repo-sandbox",
     visibility = ["//visibility:public"],
 )

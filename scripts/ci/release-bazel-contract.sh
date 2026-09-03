@@ -26,7 +26,7 @@ case $1 in
     shift
     [[ $# == 3 ]]
     [[ $1 == //crates/core:core_test ]]
-    [[ $2 == //crates/cli:cli_test ]]
+    [[ $2 == //apps/cli:cli_test ]]
     [[ $3 == //:root_test ]]
     touch "$MOCK_STATE/test"
     ;;
@@ -35,7 +35,7 @@ esac
 EOF
 chmod +x "$temporary/bin/bazelisk"
 
-valid_targets=$'//crates/core:core_test\n//crates/cli:cli_test\n//:root_test\n'
+valid_targets=$'//crates/core:core_test\n//apps/cli:cli_test\n//:root_test\n'
 PATH="$temporary/bin:$PATH" MOCK_STATE="$temporary" MOCK_QUERY_OUTPUT="$valid_targets" \
   "$root/scripts/ci/release-bazel.sh" >/dev/null
 [[ -f $temporary/build && -f $temporary/query && -f $temporary/test ]]

@@ -4,20 +4,59 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vMAJOR.MINOR.PATCH tag to publish or verify
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
   BAZEL_CACHE_NAMESPACE: bazel-release-v1
 
 jobs:
+  prepare:
+    name: Validate release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      commit: ${{ steps.identity.outputs.commit }}
+    steps:
+      - name: Resolve requested tag
+        id: requested
+        env:
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          [[ $REQUESTED_TAG =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+      - name: Checkout tagged commit without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.requested.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag, versions, and main ancestry
+        id: identity
+        env:
+          RELEASE_TAG: ${{ steps.requested.outputs.tag }}
+        run: |
+          commit=$(git rev-parse HEAD)
+          git -C "$GITHUB_WORKSPACE" -c "safe.directory=$GITHUB_WORKSPACE" \
+            merge-base --is-ancestor "$commit" origin/main
+          GITHUB_SHA=$commit scripts/ci/validate-release-inputs.sh "$RELEASE_TAG"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.platform }}
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -35,13 +74,15 @@ jobs:
       - name: Checkout the tagged commit without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.prepare.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
       - name: Validate Rocky Linux C++ linker prerequisite
         run: scripts/ci/verify-rocky-cxx.sh
       - name: Validate immutable release inputs
-        run: scripts/ci/validate-release-inputs.sh "$GITHUB_REF_NAME"
+        env:
+          GITHUB_SHA: ${{ needs.prepare.outputs.commit }}
+        run: scripts/ci/validate-release-inputs.sh "${{ needs.prepare.outputs.tag }}"
       - name: Install checksum-pinned Bazelisk
         run: scripts/ci/install-bazelisk.sh "$RUNNER_TEMP/bin"
       - name: Restore release Bazel cache namespace
@@ -55,12 +96,21 @@ jobs:
             ${{ env.BAZEL_CACHE_NAMESPACE }}-${{ runner.os }}-${{ runner.arch }}-
       - name: Build and test with Bazel
         run: scripts/ci/release-bazel.sh
-      - name: Package versioned CLI and checksum
+      - name: Package twice and verify reproducible bytes
         env:
           RELEASE_PLATFORM: ${{ matrix.platform }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           binary=$(bazelisk cquery --config=release //:repo-sandbox --output=files | tail -n 1)
-          scripts/ci/package-cli.sh "$GITHUB_REF_NAME" "$RELEASE_PLATFORM" "$binary" release
+          scripts/ci/package-cli.sh "$RELEASE_TAG" "$RELEASE_PLATFORM" "$binary" release-a
+          scripts/ci/package-cli.sh "$RELEASE_TAG" "$RELEASE_PLATFORM" "$binary" release-b
+          archive="repo-sandbox-${RELEASE_TAG#v}-${RELEASE_PLATFORM}.tar.gz"
+          cmp "release-a/$archive" "release-b/$archive"
+          cmp "release-a/$archive.sha256" "release-b/$archive.sha256"
+          mv release-a release
+          python3 tools/release/verify_archive.py \
+            --tag "$RELEASE_TAG" --platform "$RELEASE_PLATFORM" \
+            --archive "release/$archive" --checksum "release/$archive.sha256"
       - name: Upload immutable run artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -72,46 +122,45 @@ jobs:
 
   publish:
     name: Publish protected tag release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: release
     permissions:
       actions: read
+      artifact-metadata: write
+      attestations: write
       contents: write
+      id-token: write
     steps:
       - name: Checkout release contracts without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.prepare.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
       - name: Validate immutable release inputs
-        run: scripts/ci/validate-release-inputs.sh "$GITHUB_REF_NAME"
+        env:
+          GITHUB_SHA: ${{ needs.prepare.outputs.commit }}
+        run: scripts/ci/validate-release-inputs.sh "${{ needs.prepare.outputs.tag }}"
       - name: Download latest successful platform artifacts from this run
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/ci/download-release-artifacts.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release
-      - name: Verify artifact set and checksums
-        run: |
-          version=${GITHUB_REF_NAME#v}
-          for platform in linux-amd64 linux-arm64; do
-            archive="repo-sandbox-${version}-${platform}.tar.gz"
-            checksum="${archive}.sha256"
-            test -f "release/$archive"
-            test -f "release/$checksum"
-            (cd release && sha256sum --check --strict "$checksum")
-          done
-          test "$(find release -maxdepth 1 -type f | wc -l)" -eq 4
-          (cd release && sha256sum repo-sandbox-*.tar.gz > SHA256SUMS)
+        run: scripts/ci/download-release-artifacts.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release
+      - name: Verify exact artifact set and generate aggregate checksums
+        run: python3 tools/release/assemble_release.py --tag "${{ needs.prepare.outputs.tag }}" --directory release
+      - name: Attest release archives
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-checksums: release/SHA256SUMS
       - name: Publish or verify immutable GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/ci/publish-release.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" release "$GITHUB_SHA"
+        run: scripts/ci/publish-release.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" release "${{ needs.prepare.outputs.commit }}"
 
   fresh-machine:
     name: Fresh machine ${{ matrix.platform }}
-    needs: publish
+    needs: [prepare, publish]
     strategy:
       fail-fast: false
       matrix:
@@ -132,12 +181,14 @@ jobs:
         env:
           RELEASE_BASE_URL: https://github.com/${{ github.repository }}/releases/download
           RELEASE_PLATFORM: ${{ matrix.platform }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
           curl --fail --location --proto '=https' --tlsv1.2 \
             --output /tmp/verify-release.sh \
-            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-release.sh"
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_COMMIT}/scripts/ci/verify-release.sh"
           curl --fail --location --proto '=https' --tlsv1.2 \
             --output /tmp/verify-glibc-baseline.sh \
-            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-glibc-baseline.sh"
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_COMMIT}/scripts/ci/verify-glibc-baseline.sh"
           chmod +x /tmp/verify-release.sh /tmp/verify-glibc-baseline.sh
-          /tmp/verify-release.sh "$GITHUB_REF_NAME" "$RELEASE_PLATFORM" "$RELEASE_BASE_URL"
+          /tmp/verify-release.sh "$RELEASE_TAG" "$RELEASE_PLATFORM" "$RELEASE_BASE_URL"

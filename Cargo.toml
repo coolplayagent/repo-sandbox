@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/adapters",
-    "crates/cli",
+    "apps/cli",
     "crates/core",
 ]
 resolver = "3"

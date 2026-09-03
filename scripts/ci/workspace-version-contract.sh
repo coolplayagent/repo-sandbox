@@ -4,10 +4,10 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT
-mkdir -p "$temporary/crates/cli"
+mkdir -p "$temporary/apps/cli"
 cp "$root/Cargo.toml" "$temporary/Cargo.toml"
 cp "$root/MODULE.bazel" "$temporary/MODULE.bazel"
-cp "$root/crates/cli/BUILD.bazel" "$temporary/crates/cli/BUILD.bazel"
+cp "$root/apps/cli/BUILD.bazel" "$temporary/apps/cli/BUILD.bazel"
 
 expected=$("$root/scripts/ci/workspace-version.sh")
 [[ $("$root/scripts/ci/workspace-version.sh" "$temporary") == "$expected" ]]
