@@ -424,7 +424,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
                 digest: digest.clone(),
             }]
         } else {
-            self.inspect_platform_digests(request, platforms, cancellation)?
+            self.inspect_platform_digests(request, &digest, platforms, cancellation)?
         };
         Ok(BuiltImage {
             image: request.image.clone(),
@@ -492,6 +492,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
     fn inspect_platform_digests(
         &self,
         request: &BuildRequest<'_>,
+        pushed_digest: &ImageDigest,
         platforms: &[Platform],
         cancellation: &dyn Cancellation,
     ) -> Result<Vec<PlatformDigest>, BuildError> {
@@ -504,7 +505,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
                         "imagetools".to_owned(),
                         "inspect".to_owned(),
                         "--raw".to_owned(),
-                        request.image.to_string(),
+                        format!("{}@{}", request.image, pushed_digest),
                     ],
                     current_dir: None,
                 };
@@ -1503,6 +1504,17 @@ mod tests {
             "inspect".to_owned(),
             "--raw".to_owned()
         ])));
+        let inspect = invocations
+            .iter()
+            .find(|call| call.args.get(2).map(String::as_str) == Some("inspect"))
+            .unwrap();
+        assert_eq!(
+            inspect.args.last().unwrap(),
+            &format!(
+                "registry.test/repo-sandbox/rust-bazel:test@sha256:{}",
+                "a".repeat(64)
+            )
+        );
     }
 
     #[test]

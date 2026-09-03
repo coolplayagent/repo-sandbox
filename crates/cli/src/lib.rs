@@ -40,7 +40,7 @@ impl Cli {
     pub fn requires_interrupt_handler(&self) -> bool {
         matches!(
             self.command,
-            Some(Commands::Build(_) | Commands::Verify(_) | Commands::Clean(_))
+            Some(Commands::Plan(_) | Commands::Build(_) | Commands::Verify(_) | Commands::Clean(_))
         )
     }
 }
@@ -441,8 +441,27 @@ fn canonicalize_credential_path(
     path: Option<PathBuf>,
     description: &str,
 ) -> Result<Option<PathBuf>, AppError> {
+    canonicalize_credential_path_from(
+        path,
+        description,
+        &std::env::current_dir().map_err(|error| {
+            AppError::Configuration(format!("cannot resolve invocation directory: {error}"))
+        })?,
+    )
+}
+
+fn canonicalize_credential_path_from(
+    path: Option<PathBuf>,
+    description: &str,
+    invocation_directory: &std::path::Path,
+) -> Result<Option<PathBuf>, AppError> {
     path.map(|path| {
-        path.canonicalize().map_err(|error| {
+        let candidate = if path.is_absolute() {
+            path.clone()
+        } else {
+            invocation_directory.join(&path)
+        };
+        candidate.canonicalize().map_err(|error| {
             AppError::Configuration(format!(
                 "cannot resolve {description} {}: {error}",
                 path.display()
@@ -767,24 +786,34 @@ mod tests {
 
     #[test]
     fn relative_ssh_credential_paths_are_resolved_from_invocation_directory() {
-        let resolved =
-            canonicalize_credential_path(Some(PathBuf::from("Cargo.toml")), "SSH private key")
-                .unwrap()
-                .unwrap();
+        let invocation = std::env::temp_dir().join(format!(
+            "repo-sandbox-cli-credential-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&invocation).unwrap();
+        fs::write(invocation.join("key"), "fixture").unwrap();
+        let resolved = canonicalize_credential_path_from(
+            Some(PathBuf::from("key")),
+            "SSH private key",
+            &invocation,
+        )
+        .unwrap()
+        .unwrap();
         assert!(resolved.is_absolute());
-        assert_eq!(
-            resolved,
-            PathBuf::from("Cargo.toml").canonicalize().unwrap()
-        );
+        assert_eq!(resolved, invocation.join("key").canonicalize().unwrap());
+        fs::remove_file(invocation.join("key")).unwrap();
+        fs::remove_dir(invocation).unwrap();
     }
 
     #[test]
     fn only_cancellation_aware_commands_install_the_interrupt_handler() {
-        for command in ["doctor", "plan"] {
+        {
+            let command = "doctor";
             let cli = Cli::try_parse_from(["repo-sandbox", command]).unwrap();
             assert!(!cli.requires_interrupt_handler(), "{command}");
         }
-        for command in ["build", "verify", "clean"] {
+        for command in ["plan", "build", "verify", "clean"] {
             let cli = Cli::try_parse_from(["repo-sandbox", command]).unwrap();
             assert!(cli.requires_interrupt_handler(), "{command}");
         }

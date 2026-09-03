@@ -199,8 +199,8 @@ impl GitSnapshotter {
             }
         };
 
-        reject_lfs(&files)?;
-        let (id, file_count, manifest) = copy_and_digest(files, &checkout)?;
+        reject_lfs(&files, cancellation)?;
+        let (id, file_count, manifest) = copy_and_digest(files, &checkout, cancellation)?;
         let (path, temporary) = match options.cleanup {
             CleanupPolicy::Delete => (checkout, Some(staging)),
             CleanupPolicy::Keep => {
@@ -497,14 +497,36 @@ fn snapshot_file_mode(
         .unwrap_or_else(|| regular_mode(metadata))
 }
 
-fn reject_lfs(files: &[SourceFile]) -> Result<(), SnapshotError> {
+fn ensure_snapshot_not_cancelled(cancellation: &dyn Cancellation) -> Result<(), SnapshotError> {
+    if cancellation.is_cancelled() {
+        Err(SnapshotError::Io("snapshot creation cancelled".into()))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_lfs(files: &[SourceFile], cancellation: &dyn Cancellation) -> Result<(), SnapshotError> {
     for file in files
         .iter()
         .filter(|file| file.relative.ends_with(".gitattributes"))
     {
+        ensure_snapshot_not_cancelled(cancellation)?;
         let Some(source) = &file.source else { continue };
-        let text =
-            fs::read_to_string(source).map_err(io_error("inspect Git attributes for LFS"))?;
+        let mut input = File::open(source).map_err(io_error("inspect Git attributes for LFS"))?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            ensure_snapshot_not_cancelled(cancellation)?;
+            let count = input
+                .read(&mut buffer)
+                .map_err(io_error("inspect Git attributes for LFS"))?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| SnapshotError::InvalidInput(".gitattributes is not valid UTF-8".into()))?;
         for line in text.lines() {
             let line = line.trim();
             if !line.starts_with('#')
@@ -524,10 +546,12 @@ fn reject_lfs(files: &[SourceFile]) -> Result<(), SnapshotError> {
 fn copy_and_digest(
     mut files: Vec<SourceFile>,
     destination: &Path,
+    cancellation: &dyn Cancellation,
 ) -> Result<(SnapshotId, usize, Vec<SnapshotManifestEntry>), SnapshotError> {
     files.sort_by(|left, right| left.relative.as_bytes().cmp(right.relative.as_bytes()));
     let mut manifest = Sha256::new();
     for file in &files {
+        ensure_snapshot_not_cancelled(cancellation)?;
         let mut content = Sha256::new();
         let mut length = 0_u64;
         if let Some(source) = &file.source {
@@ -539,6 +563,7 @@ fn copy_and_digest(
             let mut output = File::create(&target).map_err(io_error("create snapshot file"))?;
             let mut buffer = [0_u8; 64 * 1024];
             loop {
+                ensure_snapshot_not_cancelled(cancellation)?;
                 let count = input
                     .read(&mut buffer)
                     .map_err(io_error("read source file"))?;
@@ -1504,6 +1529,40 @@ mod tests {
         fn is_cancelled(&self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn snapshot_copy_observes_cancellation_before_publishing_content() {
+        struct CancelAfterTwoChecks(std::sync::atomic::AtomicUsize);
+        impl Cancellation for CancelAfterTwoChecks {
+            fn is_cancelled(&self) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst) >= 2
+            }
+        }
+        let source = tempfile::NamedTempFile::new().unwrap();
+        fs::write(source.path(), vec![b'x'; 128 * 1024]).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let error = copy_and_digest(
+            vec![SourceFile {
+                relative: "large.bin".into(),
+                source: Some(source.path().to_path_buf()),
+                virtual_content: None,
+                mode: 0o100644,
+            }],
+            destination.path(),
+            &CancelAfterTwoChecks(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            SnapshotError::Io("snapshot creation cancelled".into())
+        );
+        assert_eq!(
+            fs::metadata(destination.path().join("large.bin"))
+                .unwrap()
+                .len(),
+            64 * 1024
+        );
     }
 
     struct LocalPublicGitHttp {

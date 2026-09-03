@@ -71,18 +71,18 @@ impl WorkflowPort for SystemWorkflow {
         // Finish every pure plan validation before creating an explicit report
         // parent or any reservation/state file.
         validate_outputs(plan)?;
+        let oci_destination = plan
+            .request
+            .oci_layout
+            .as_deref()
+            .map(ExternalOciGuard::prepare)
+            .transpose()?;
         let report_destination =
             ReportDestination::prepare(classify_report_destination(&state, &report_path)?)?;
         let _report_reservation = OutputReservation::report(&report_path)?;
         let mut completed_report = None;
         let mut bound_state = None;
         let result = (|| {
-            let _oci_reservation = plan
-                .request
-                .oci_layout
-                .as_deref()
-                .map(OutputReservation::oci)
-                .transpose()?;
             let (state_guard, _workflow_lease, journal) =
                 prepare_leased_workflow_state(&repository, &state, &task_id)?;
             bound_state = Some(state_guard.clone());
@@ -383,7 +383,8 @@ impl WorkflowPort for SystemWorkflow {
                 report.cleanup_error.as_deref(),
             );
 
-            if output_eligible && let Some(output) = &plan.request.oci_layout {
+            if output_eligible && let Some(destination) = &oci_destination {
+                let output = destination.bound_path()?;
                 export_verified_oci(
                     plan,
                     &catalog_root,
@@ -393,7 +394,7 @@ impl WorkflowPort for SystemWorkflow {
                     &task_image.image,
                     &configuration_digest,
                     &repository_id,
-                    output,
+                    &output,
                     &cancellation,
                 )?;
             }
@@ -2380,7 +2381,6 @@ fn resolve_local_image_id_with(
 
 fn create_oci_staging(output: &Path) -> Result<tempfile::TempDir, AppError> {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(environment("create OCI output parent"))?;
     tempfile::Builder::new()
         .prefix(".repo-sandbox-oci-")
         .tempdir_in(parent)
@@ -2391,8 +2391,18 @@ fn docker_host_path(path: &Path) -> String {
     text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
 }
 fn task_id() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_TICK: AtomicU64 = AtomicU64::new(0);
+    static PROCESS_NONCE: OnceLock<u64> = OnceLock::new();
+    let process_nonce = *PROCESS_NONCE.get_or_init(|| {
+        RandomState::new().hash_one((
+            std::process::id(),
+            SystemTime::now(),
+            &PROCESS_NONCE as *const _ as usize,
+        ))
+    });
     let wall_clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2412,7 +2422,7 @@ fn task_id() -> String {
             Err(actual) => previous = actual,
         }
     };
-    format!("{}-{}", std::process::id(), unique)
+    format!("{}-{process_nonce:016x}-{unique}", std::process::id())
 }
 fn repository_id(repository: &Path) -> Result<String, AppError> {
     let mut h = Sha256::new();
@@ -2897,6 +2907,106 @@ struct ExternalReportGuard {
     _parent_reservation: OutputReservation,
 }
 
+/// Pins an OCI destination's parent for the complete workflow. On Unix every
+/// staging/final operation is addressed through the retained directory fd; on
+/// Windows the retained handle excludes delete sharing, so the parent cannot
+/// be renamed or replaced underneath the workflow.
+#[derive(Debug)]
+struct ExternalOciGuard {
+    path: PathBuf,
+    _parent: PathBuf,
+    handle: Option<fs::File>,
+    created: Vec<PathBuf>,
+    _output_reservation: OutputReservation,
+    _parent_reservation: OutputReservation,
+}
+
+impl ExternalOciGuard {
+    fn prepare(output: &Path) -> Result<Self, AppError> {
+        let output = resolved_future_path(output)?;
+        if output.exists() {
+            return Err(AppError::Configuration(format!(
+                "OCI layout already exists: {}",
+                output.display()
+            )));
+        }
+        let parent = output
+            .parent()
+            .ok_or_else(|| {
+                AppError::Configuration(format!(
+                    "OCI layout path has no parent: {}",
+                    output.display()
+                ))
+            })?
+            .to_path_buf();
+        let output_reservation = OutputReservation::oci(&output)?;
+        let parent_reservation = OutputReservation::create(&parent, "OCI layout parent")?;
+        let created = create_report_parent(&parent)?;
+        let handle = match bind_report_parent(&parent).map_err(|error| {
+            AppError::Configuration(format!(
+                "cannot bind OCI layout destination parent {}: {error}",
+                parent.display()
+            ))
+        }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                rollback_created_directories(&created);
+                return Err(error);
+            }
+        };
+        let validation = (|| {
+            let current_parent = resolved_future_path(&parent)?;
+            let bound_identity = state_identity_from_handle(&handle)?;
+            let current_identity = state_identity(&parent)?;
+            if current_parent != parent || bound_identity != current_identity {
+                return Err(AppError::Configuration(format!(
+                    "OCI layout destination changed while it was being bound: {}",
+                    parent.display()
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            drop(handle);
+            rollback_created_directories(&created);
+            return Err(error);
+        }
+        Ok(Self {
+            path: output,
+            _parent: parent,
+            handle: Some(handle),
+            created,
+            _output_reservation: output_reservation,
+            _parent_reservation: parent_reservation,
+        })
+    }
+
+    fn bound_path(&self) -> Result<PathBuf, AppError> {
+        let name = self.path.file_name().ok_or_else(|| {
+            AppError::Configuration(format!(
+                "OCI layout path has no file name: {}",
+                self.path.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            bound_directory_path(self.handle.as_ref().expect("OCI guard handle is live"))
+                .map(|parent| parent.join(name))
+        }
+        #[cfg(windows)]
+        {
+            Ok(self._parent.join(name))
+        }
+    }
+}
+
+impl Drop for ExternalOciGuard {
+    fn drop(&mut self) {
+        drop(self.handle.take());
+        rollback_created_directories(&self.created);
+    }
+}
+
 impl ExternalReportGuard {
     fn prepare(report: &Path) -> Result<Self, AppError> {
         let report = resolved_future_path(report)?;
@@ -2908,7 +3018,12 @@ impl ExternalReportGuard {
         // workflows targeting different filenames in the same new directory.
         let parent_reservation = OutputReservation::create(parent, "report parent")?;
         let created = create_report_parent(parent)?;
-        let handle = match bind_report_parent(parent) {
+        let handle = match bind_report_parent(parent).map_err(|error| {
+            AppError::Configuration(format!(
+                "cannot bind report destination parent {}: {error}",
+                parent.display()
+            ))
+        }) {
             Ok(handle) => handle,
             Err(error) => {
                 rollback_created_directories(&created);
@@ -4125,12 +4240,25 @@ mod tests {
     }
 
     #[test]
-    fn oci_staging_creates_a_fresh_nested_output_parent() {
+    fn oci_guard_prepares_and_binds_a_fresh_nested_output_parent() {
         let temporary = tempfile::tempdir().unwrap();
         let parent = temporary.path().join("reports/task-oci");
-        let staging = create_oci_staging(&parent.join("layout")).unwrap();
+        let guard = ExternalOciGuard::prepare(&parent.join("layout")).unwrap();
+        let staging = create_oci_staging(&guard.bound_path().unwrap()).unwrap();
         assert!(parent.is_dir());
-        assert_eq!(staging.path().parent(), Some(parent.as_path()));
+        #[cfg(windows)]
+        assert_eq!(
+            staging.path().parent().unwrap().canonicalize().unwrap(),
+            parent.canonicalize().unwrap()
+        );
+        #[cfg(unix)]
+        assert!(
+            staging
+                .path()
+                .parent()
+                .unwrap()
+                .starts_with("/proc/self/fd")
+        );
     }
 
     #[test]
@@ -5249,6 +5377,60 @@ mod tests {
     }
 
     #[test]
+    fn invalid_oci_parent_fails_before_workflow_state_or_docker_side_effects() {
+        let repository = tempfile::tempdir().unwrap();
+        let file_parent = repository.path().join("not-a-directory");
+        fs::write(&file_parent, "preserved").unwrap();
+        let mut plan = default_execution_plan();
+        plan.request.repository = Some(repository.path().to_string_lossy().into_owned());
+        plan.request.oci_layout = Some(file_parent.join("layout"));
+        let plan = ExecutionPlan::new(plan.template, plan.request);
+        let error = WorkflowPort::execute(&SystemWorkflow, WorkflowMode::Build, &plan).unwrap_err();
+        assert!(error.to_string().contains("OCI layout destination parent"));
+        assert_eq!(fs::read_to_string(file_parent).unwrap(), "preserved");
+        assert!(!repository.path().join(".repo-sandbox").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oci_destination_remains_bound_when_parent_path_is_replaced() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let original = root.path().join("original");
+        let external = root.path().join("external");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&external).unwrap();
+        let guard = ExternalOciGuard::prepare(&parent.join("layout")).unwrap();
+        fs::rename(&parent, &original).unwrap();
+        symlink(&external, &parent).unwrap();
+
+        let bound = guard.bound_path().unwrap();
+        fs::create_dir(&bound).unwrap();
+        fs::write(bound.join("sentinel"), "owned").unwrap();
+        assert_eq!(
+            fs::read_to_string(original.join("layout/sentinel")).unwrap(),
+            "owned"
+        );
+        assert!(!external.join("layout").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn oci_destination_parent_cannot_be_replaced_while_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        let guard = ExternalOciGuard::prepare(&parent.join("layout")).unwrap();
+        assert!(fs::rename(&parent, root.path().join("replacement")).is_err());
+        let bound = guard.bound_path().unwrap();
+        assert_eq!(
+            bound.parent().unwrap().canonicalize().unwrap(),
+            parent.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
     fn invalid_push_is_rejected_before_an_explicit_report_parent_is_created() {
         let repository = tempfile::tempdir().unwrap();
         let report_parent = repository.path().join("new-report-parent");
@@ -5518,7 +5700,38 @@ mod tests {
         let ids = ids.lock().unwrap();
         let unique = ids.iter().collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), ids.len());
-        assert!(ids.iter().all(|id| id.split('-').count() == 2));
+        assert!(ids.iter().all(|id| id.split('-').count() == 3));
+    }
+
+    #[test]
+    fn task_id_child_process() {
+        if std::env::var_os("REPO_SANDBOX_TASK_ID_CHILD").is_some() {
+            println!("TASK-ID {}", task_id());
+        }
+    }
+
+    #[test]
+    fn task_ids_include_cross_process_entropy() {
+        let executable = std::env::current_exe().unwrap();
+        let create = || {
+            let output = std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "workflow::tests::task_id_child_process",
+                    "--nocapture",
+                ])
+                .env("REPO_SANDBOX_TASK_ID_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("TASK-ID "))
+                .unwrap()
+                .to_owned()
+        };
+        assert_ne!(create(), create());
     }
 
     #[test]
