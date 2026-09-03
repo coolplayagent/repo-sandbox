@@ -80,6 +80,8 @@ impl ProcessExecutor for SystemProcessExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         configure_process_tree(&mut command);
+        #[cfg(all(unix, not(target_os = "linux")))]
+        configure_oci_fd_inheritance(&mut command, invocation)?;
         let mut child = command.spawn()?;
         let process_tree = ProcessTree::attach(&mut child).inspect_err(|_error| {
             let _ = child.kill();
@@ -107,6 +109,46 @@ impl ProcessExecutor for SystemProcessExecutor {
             interrupted,
         })
     }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn configure_oci_fd_inheritance(
+    command: &mut Command,
+    invocation: &ProcessInvocation,
+) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let Some(fd) = invocation
+        .args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("type=oci,dest=/dev/fd/"))
+        .and_then(|tail| tail.split(['/', ',']).next())
+        .and_then(|value| value.parse::<i32>().ok())
+    else {
+        return Ok(());
+    };
+    unsafe extern "C" {
+        fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
+    }
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    // Check the retained fd in the parent, but clear CLOEXEC only in the
+    // forked Docker child. Unrelated concurrent children never inherit it.
+    if unsafe { fcntl(fd, F_GETFD, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pre_exec performs only async-signal-safe fcntl and captures an fd.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = fcntl(fd, F_GETFD, 0);
+            if flags < 0 || fcntl(fd, F_SETFD, flags & !FD_CLOEXEC) < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    Ok(())
 }
 
 fn read_stream(mut stream: impl Read) -> io::Result<Vec<u8>> {
