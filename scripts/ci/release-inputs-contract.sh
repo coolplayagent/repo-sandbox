@@ -47,6 +47,11 @@ fixture="$temporary/repository"
 fixture=$(cd "$fixture" && pwd -P)
 cp "$root/scripts/ci/validate-release-inputs.sh" \
   "$fixture/scripts/ci/validate-release-inputs.sh"
+cp "$root/scripts/ci/workspace-version.sh" \
+  "$fixture/scripts/ci/workspace-version.sh"
+cp "$root/Cargo.toml" "$fixture/Cargo.toml"
+cp "$root/MODULE.bazel" "$fixture/MODULE.bazel"
+cp "$root/crates/cli/BUILD.bazel" "$fixture/crates/cli/BUILD.bazel"
 fixture_head=$("$real_git" -C "$fixture" rev-parse HEAD)
 "$real_git" -C "$fixture" update-ref refs/remotes/origin/main "$fixture_head"
 GITHUB_WORKSPACE=$fixture GITHUB_SHA=$fixture_head \

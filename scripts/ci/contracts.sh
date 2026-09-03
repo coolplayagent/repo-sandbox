@@ -12,6 +12,7 @@ for required in "$ci" "$release" "$root/scripts/ci/workspace-version.sh" \
   "$root/scripts/ci/validate-release.sh" "$root/scripts/ci/validate-release-inputs.sh" \
   "$root/scripts/ci/package-cli.sh" \
   "$root/scripts/ci/publish-release.sh" "$root/scripts/ci/verify-release.sh" \
+  "$root/scripts/ci/download-https.sh" \
   "$root/scripts/ci/verify-rocky-cxx.sh" "$root/scripts/ci/release-bazel.sh"; do
   [[ -f $required ]] || { echo "missing CI contract: $required" >&2; exit 1; }
 done
@@ -42,6 +43,13 @@ grep -Fq '[[ $libstdcxx != libstdc++.so && -f $libstdcxx ]]' \
   "$root/scripts/ci/verify-rocky-cxx.sh"
 grep -Fq '^(gcc-c\+\+|libstdc\+\+-devel)-' "$root/scripts/ci/verify-rocky-cxx.sh"
 ! grep -Fq 'cargo build' "$release"
+! grep -Rq --exclude='*contract*.sh' -- '--retry-all-errors' "$root/scripts/ci"
+grep -Fq 'download-https.sh" "$base_url/$tag/$asset" "$temporary/$asset"' \
+  "$root/scripts/ci/verify-release.sh"
+grep -Fq 'raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/download-https.sh' \
+  "$release"
+grep -Fq 'chmod +x /tmp/download-https.sh' "$release"
+[[ $(grep -c '^          /tmp/download-https.sh \\$' "$release") -eq 2 ]]
 grep -Fq 'binary=$(bazelisk cquery --config=release //:repo-sandbox --output=files' "$release"
 grep -Fq 'verify-glibc-baseline.sh" "$binary" 2.28' "$root/scripts/ci/package-cli.sh"
 grep -Fq 'verify-glibc-baseline.sh" "$temporary/repo-sandbox" 2.28' \
@@ -166,5 +174,6 @@ fi
 "$root/scripts/ci/release-inputs-contract.sh" >/dev/null
 "$root/scripts/ci/rocky-cxx-contract.sh" >/dev/null
 "$root/scripts/ci/release-bazel-contract.sh" >/dev/null
+"$root/scripts/ci/download-https-contract.sh" >/dev/null
 
 echo 'CI permission, fork, cache, tag, platform, checksum, and fresh-machine contracts passed'

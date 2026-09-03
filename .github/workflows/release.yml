@@ -134,10 +134,14 @@ jobs:
           RELEASE_PLATFORM: ${{ matrix.platform }}
         run: |
           curl --fail --location --proto '=https' --tlsv1.2 \
-            --output /tmp/verify-release.sh \
-            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-release.sh"
-          curl --fail --location --proto '=https' --tlsv1.2 \
-            --output /tmp/verify-glibc-baseline.sh \
-            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-glibc-baseline.sh"
+            --output /tmp/download-https.sh \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/download-https.sh"
+          chmod +x /tmp/download-https.sh
+          /tmp/download-https.sh \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-release.sh" \
+            /tmp/verify-release.sh
+          /tmp/download-https.sh \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-glibc-baseline.sh" \
+            /tmp/verify-glibc-baseline.sh
           chmod +x /tmp/verify-release.sh /tmp/verify-glibc-baseline.sh
           /tmp/verify-release.sh "$GITHUB_REF_NAME" "$RELEASE_PLATFORM" "$RELEASE_BASE_URL"

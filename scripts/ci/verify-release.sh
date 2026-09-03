@@ -21,8 +21,7 @@ script_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cleanup() { rm -rf -- "$temporary"; }
 trap cleanup EXIT
 for asset in "$archive" "$checksum"; do
-  curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors \
-    --output "$temporary/$asset" "$base_url/$tag/$asset"
+  "$script_directory/download-https.sh" "$base_url/$tag/$asset" "$temporary/$asset"
 done
 
 checksum_line=$(cat "$temporary/$checksum")
