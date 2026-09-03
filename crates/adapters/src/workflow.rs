@@ -30,9 +30,8 @@ use repo_sandbox_core::task_image::ConfigurationDigest;
 use serde_json;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -56,7 +55,7 @@ impl WorkflowPort for SystemWorkflow {
             .report
             .clone()
             .unwrap_or_else(|| state.join("reports").join(format!("{task_id}.json")));
-        let _report_reservation = ReportReservation::create(&report_path)?;
+        let _report_reservation = OutputReservation::report(&report_path)?;
         let mut completed_report = None;
         let result = (|| {
             validate_outputs(plan)?;
@@ -64,7 +63,7 @@ impl WorkflowPort for SystemWorkflow {
                 .request
                 .oci_layout
                 .as_deref()
-                .map(OciReservation::create)
+                .map(OutputReservation::oci)
                 .transpose()?;
             let journal = ManifestJournal::create(&state, &task_id)?;
             let registry = plan.template.execution.registry.as_ref();
@@ -74,6 +73,7 @@ impl WorkflowPort for SystemWorkflow {
                 ));
             }
             preflight(plan, &repository, &cancellation)?;
+            let _workflow_lease = WorkflowLease::shared(&repository.join(".repo-sandbox"))?;
             let cache = state.join("cache");
             fs::create_dir_all(&cache).map_err(environment("create owned cache"))?;
             fs::write(cache.join(OWNER_MARKER), &repository_id)
@@ -529,7 +529,10 @@ impl CleanPort for SystemWorkflow {
                 }
             }
         }
-        let mut plan = CleanPlan::default();
+        let mut plan = CleanPlan {
+            lease_path: Some(state.join(".workflow.lock")),
+            ..CleanPlan::default()
+        };
         let mut latest = std::collections::BTreeMap::new();
         for (manifests, expected_repository) in stores {
             if !manifests.is_dir() {
@@ -545,7 +548,7 @@ impl CleanPort for SystemWorkflow {
                 .map(|entry| entry.map(|entry| entry.path()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(environment("read task manifest entry"))?;
-            entries.sort();
+            entries.sort_by_key(|path| journal_event_order(path));
             for path in entries {
                 if path.extension().and_then(|v| v.to_str()) != Some("json") {
                     continue;
@@ -621,6 +624,24 @@ impl CleanPort for SystemWorkflow {
             skipped: plan.refused.clone(),
             ..CleanResult::default()
         };
+        let _lease = if let Some(path) = &plan.lease_path {
+            match WorkflowLease::exclusive(path)? {
+                Some(lease) => Some(lease),
+                None => {
+                    result
+                        .skipped
+                        .extend(plan.candidates.iter().map(|candidate| {
+                            format!(
+                                "{}: active workflow holds the repository lease",
+                                candidate.identifier
+                            )
+                        }));
+                    return Ok(result);
+                }
+            }
+        } else {
+            None
+        };
         for candidate in &plan.candidates {
             if dry_run {
                 result.skipped.push(format!(
@@ -655,6 +676,49 @@ impl CleanPort for SystemWorkflow {
             }
         }
         Ok(result)
+    }
+}
+
+struct WorkflowLease {
+    _file: fs::File,
+}
+
+impl WorkflowLease {
+    fn open(path: &Path) -> Result<fs::File, AppError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(environment("create workflow lease directory"))?;
+        }
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(environment("open workflow lease"))
+    }
+
+    fn shared(state: &Path) -> Result<Self, AppError> {
+        let file = Self::open(&state.join(".workflow.lock"))?;
+        file.try_lock_shared().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => {
+                AppError::Environment("clean is active for this repository".into())
+            }
+            std::fs::TryLockError::Error(error) => {
+                AppError::Environment(format!("lock workflow lease: {error}"))
+            }
+        })?;
+        Ok(Self { _file: file })
+    }
+
+    fn exclusive(path: &Path) -> Result<Option<Self>, AppError> {
+        let file = Self::open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(AppError::Environment(format!(
+                "lock clean execution lease: {error}"
+            ))),
+        }
     }
 }
 
@@ -770,12 +834,12 @@ fn failure_phase(error: &AppError) -> &'static str {
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("preflight") {
         "preflight"
-    } else if message.contains("snapshot") || message.contains("git ") {
-        "snapshot"
     } else if message.contains("environment image") || message.contains("environment:") {
         "environment_image"
     } else if message.contains("task image") || message.contains("oci task") {
         "task_image"
+    } else if message.contains("snapshot") || message.contains("git ") {
+        "snapshot"
     } else if message.contains("registry") || message.contains("publish") {
         "publish"
     } else if matches!(error, AppError::BuildFailed(_)) {
@@ -1402,98 +1466,80 @@ fn bounded_error(
     }
 }
 
-struct ReportReservation {
-    path: PathBuf,
+/// Cross-process reservation for a requested output path. The reservation is
+/// kept outside the source repository so it can never alter snapshot identity.
+#[derive(Debug)]
+pub struct OutputReservation {
+    _file: fs::File,
 }
 
-#[derive(Debug)]
-struct OciReservation {
-    path: PathBuf,
-}
-impl OciReservation {
-    fn create(output: &Path) -> Result<Self, AppError> {
+impl OutputReservation {
+    pub fn oci(output: &Path) -> Result<Self, AppError> {
         if output.exists() {
             return Err(AppError::Configuration(format!(
                 "OCI layout already exists: {}",
                 output.display()
             )));
         }
-        let parent = output.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(environment("create OCI output parent"))?;
-        let name = output
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("layout");
-        let path = parent.join(format!(".{name}.repo-sandbox-reservation"));
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                AppError::Configuration(format!(
-                    "cannot reserve OCI layout {}: {error}",
-                    output.display()
-                ))
-            })?;
-        Ok(Self { path })
+        Self::create(output, "OCI layout")
     }
-}
-impl Drop for OciReservation {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-impl ReportReservation {
-    fn create(report: &Path) -> Result<Self, AppError> {
-        let parent = report.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(environment("create report directory"))?;
+
+    pub fn report(report: &Path) -> Result<Self, AppError> {
         if report.exists() {
             return Err(AppError::Configuration(format!(
                 "report already exists: {}",
                 report.display()
             )));
         }
-        let name = report
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("report.json");
-        let path = parent.join(format!(".{name}.repo-sandbox-reservation"));
-        OpenOptions::new()
+        Self::create(report, "report")
+    }
+
+    fn create(output: &Path, description: &str) -> Result<Self, AppError> {
+        let absolute = if output.is_absolute() {
+            output.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(environment("resolve output reservation directory"))?
+                .join(output)
+        };
+        let mut digest = Sha256::new();
+        digest.update(absolute.to_string_lossy().as_bytes());
+        let root = std::env::temp_dir().join("repo-sandbox-output-reservations-v1");
+        fs::create_dir_all(&root).map_err(environment("create output reservation directory"))?;
+        let path = root.join(format!("{:x}.lock", digest.finalize()));
+        let file = OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(&path)
             .map_err(|error| {
-                AppError::Configuration(format!(
-                    "cannot reserve report {}: {error}",
-                    report.display()
+                AppError::Environment(format!(
+                    "cannot reserve {description} {}: {error}",
+                    output.display()
                 ))
             })?;
-        Ok(Self { path })
-    }
-}
-impl Drop for ReportReservation {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        file.try_lock().map_err(|error| {
+            AppError::Configuration(format!(
+                "cannot reserve {description} {}: {error}",
+                output.display()
+            ))
+        })?;
+        Ok(Self { _file: file })
     }
 }
 
 struct ManifestJournal {
     root: PathBuf,
     task_id: String,
-    sequence: AtomicU64,
 }
 
-static CLEAN_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 fn append_cleanup_state(root: &Path, candidate: &CleanCandidate) -> Result<(), AppError> {
     let mut completed = candidate.clone();
     completed.state = ResourceState::Cleaned;
-    let sequence = CLEAN_EVENT_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
+    let sequence = next_journal_sequence(root)?;
     let final_path = root.join(format!(
-        "zz-cleanup-{timestamp:020}-{}-{sequence:06}.json",
+        "event-{sequence:020}-cleanup-{}.json",
         std::process::id()
     ));
     let temporary = final_path.with_extension("tmp");
@@ -1519,19 +1565,18 @@ impl ManifestJournal {
         let journal = Self {
             root,
             task_id: task_id.into(),
-            sequence: AtomicU64::new(0),
         };
         journal.append(&[])?;
         Ok(journal)
     }
 
     fn append(&self, candidates: &[CleanCandidate]) -> Result<(), AppError> {
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+        let sequence = next_journal_sequence(&self.root)?;
         let final_path = self
             .root
-            .join(format!("{}-{sequence:06}.json", self.task_id));
+            .join(format!("event-{sequence:020}-{}.json", self.task_id));
         let temporary = self.root.join(format!(
-            ".{}-{sequence:06}.{}.tmp",
+            ".event-{sequence:020}-{}.{}.tmp",
             self.task_id,
             std::process::id()
         ));
@@ -1549,6 +1594,69 @@ impl ManifestJournal {
             .map_err(environment("sync task manifest event"))?;
         fs::rename(&temporary, &final_path).map_err(environment("publish task manifest event"))
     }
+}
+
+fn next_journal_sequence(root: &Path) -> Result<u64, AppError> {
+    fs::create_dir_all(root).map_err(environment("create journal directory"))?;
+    let path = root.join(".sequence");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(environment("open journal sequence"))?;
+    file.lock().map_err(environment("lock journal sequence"))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(environment("read journal sequence"))?;
+    let observed = fs::read_dir(root)
+        .map_err(environment("scan journal sequence"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| new_event_sequence(&entry.path()))
+        .max()
+        .unwrap_or(0);
+    let previous = text.trim().parse::<u64>().unwrap_or(0).max(observed);
+    let next = previous.checked_add(1).ok_or_else(|| {
+        AppError::Environment("journal sequence exhausted its numeric range".into())
+    })?;
+    file.set_len(0)
+        .map_err(environment("truncate journal sequence"))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(environment("seek journal sequence"))?;
+    writeln!(file, "{next}").map_err(environment("write journal sequence"))?;
+    file.sync_all()
+        .map_err(environment("sync journal sequence"))?;
+    Ok(next)
+}
+
+fn new_event_sequence(path: &Path) -> Option<u64> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("event-")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn journal_event_order(path: &Path) -> (u8, u128, String) {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    if let Some(sequence) = new_event_sequence(path) {
+        return (1, u128::from(sequence), name);
+    }
+    let modified = path
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    (0, modified, name)
 }
 
 fn docker_output(args: &[&str]) -> Result<crate::buildkit::ProcessOutput, String> {
@@ -1762,9 +1870,20 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let output = temporary.path().join("layout");
         fs::create_dir(&output).unwrap();
-        let error = OciReservation::create(&output).unwrap_err();
+        let error = OutputReservation::oci(&output).unwrap_err();
         assert!(error.to_string().contains("already exists"));
         assert!(output.is_dir());
+    }
+
+    #[test]
+    fn output_reservation_never_creates_repository_local_bookkeeping() {
+        let repository = tempfile::tempdir().unwrap();
+        let parent = repository.path().join("uncreated");
+        let output = parent.join("report.json");
+        let reservation = OutputReservation::report(&output).unwrap();
+        assert!(!parent.exists());
+        assert_eq!(fs::read_dir(repository.path()).unwrap().count(), 0);
+        drop(reservation);
     }
 
     #[test]
@@ -1826,6 +1945,15 @@ mod tests {
                 .to_string()
                 .contains("only")
         );
+    }
+
+    #[test]
+    fn explicit_image_phase_wins_over_git_text_in_diagnostics() {
+        let environment =
+            AppError::Environment("environment image: package command `git install` failed".into());
+        let task = AppError::Environment("task image: git metadata failure".into());
+        assert_eq!(failure_phase(&environment), "environment_image");
+        assert_eq!(failure_phase(&task), "task_image");
     }
 
     #[test]
@@ -1950,11 +2078,126 @@ mod tests {
             refused: Vec::new(),
             manifest_root: None,
             journal_roots: std::collections::BTreeMap::from([(repository_id, not_a_directory)]),
+            lease_path: None,
         };
         let result = CleanPort::execute(&SystemWorkflow, &plan, false).unwrap();
         assert_eq!(result.succeeded.len(), 2);
         assert_eq!(result.failed.len(), 2);
         assert!(!Path::new(&first.identifier).exists());
         assert!(!Path::new(&second.identifier).exists());
+    }
+
+    #[test]
+    fn registration_after_cleanup_supersedes_the_cleaned_state() {
+        let repository = tempfile::tempdir().unwrap();
+        let canonical = repository.path().canonicalize().unwrap();
+        let repository_id = repository_id(&canonical).unwrap();
+        let state = canonical.join(".repo-sandbox");
+        let cache = state.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join(OWNER_MARKER), &repository_id).unwrap();
+        let candidate = CleanCandidate {
+            task_id: "original".into(),
+            repository_id: repository_id.clone(),
+            kind: ResourceKind::Cache,
+            identifier: cache.display().to_string(),
+            owner: repository_id,
+            state: ResourceState::Registered,
+        };
+        let first = ManifestJournal::create(&state, "original").unwrap();
+        first.append(std::slice::from_ref(&candidate)).unwrap();
+        append_cleanup_state(&state.join("tasks"), &candidate).unwrap();
+        let mut rebuilt = candidate.clone();
+        rebuilt.task_id = "rebuilt".into();
+        ManifestJournal::create(&state, "rebuilt")
+            .unwrap()
+            .append(std::slice::from_ref(&rebuilt))
+            .unwrap();
+
+        let plan = SystemWorkflow
+            .plan(&CleanRequest {
+                repository: canonical,
+                include_cache: true,
+                dry_run: true,
+                ..CleanRequest::default()
+            })
+            .unwrap();
+        assert_eq!(plan.candidates, vec![rebuilt]);
+    }
+
+    #[test]
+    fn journal_sequence_is_monotonic_across_reopen_and_concurrent_processes() {
+        let root = tempfile::tempdir().unwrap();
+        let helper = std::env::current_exe().unwrap();
+        let test_name = "workflow::tests::journal_sequence_process_helper";
+        let spawn = || {
+            std::process::Command::new(&helper)
+                .args(["--exact", test_name, "--nocapture"])
+                .env("REPO_SANDBOX_SEQUENCE_HELPER_ROOT", root.path())
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn();
+        let mut second = spawn();
+        assert!(first.wait().unwrap().success());
+        assert!(second.wait().unwrap().success());
+        let mut sequences = fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| new_event_sequence(&entry.path()))
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, (1..=40).collect::<Vec<_>>());
+        assert_eq!(next_journal_sequence(root.path()).unwrap(), 41);
+    }
+
+    #[test]
+    fn journal_sequence_process_helper() {
+        let Some(root) = std::env::var_os("REPO_SANDBOX_SEQUENCE_HELPER_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        for _ in 0..20 {
+            let sequence = next_journal_sequence(&root).unwrap();
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(root.join(format!(
+                    "event-{sequence:020}-helper-{}.json",
+                    std::process::id()
+                )))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn active_workflow_lease_blocks_only_its_repository_cleanup() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_state = first.path().join(".repo-sandbox");
+        let second_state = second.path().join(".repo-sandbox");
+        let _active = WorkflowLease::shared(&first_state).unwrap();
+        let candidate = |_root: &Path, name: &str| CleanCandidate {
+            task_id: name.into(),
+            repository_id: format!("sha256:{}", name.repeat(64)),
+            kind: ResourceKind::Container,
+            identifier: name.into(),
+            owner: name.into(),
+            state: ResourceState::Registered,
+        };
+        let blocked = CleanPlan {
+            candidates: vec![candidate(first.path(), "a")],
+            lease_path: Some(first_state.join(".workflow.lock")),
+            ..CleanPlan::default()
+        };
+        let independent = CleanPlan {
+            candidates: vec![candidate(second.path(), "b")],
+            lease_path: Some(second_state.join(".workflow.lock")),
+            ..CleanPlan::default()
+        };
+        let blocked = CleanPort::execute(&SystemWorkflow, &blocked, true).unwrap();
+        assert!(blocked.skipped[0].contains("active workflow"));
+        let independent = CleanPort::execute(&SystemWorkflow, &independent, true).unwrap();
+        assert!(independent.skipped[0].contains("dry-run"));
     }
 }

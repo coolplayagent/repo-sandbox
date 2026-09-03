@@ -282,6 +282,9 @@ pub struct CleanPlan {
     pub manifest_root: Option<PathBuf>,
     #[serde(skip)]
     pub journal_roots: BTreeMap<String, PathBuf>,
+    /// Advisory OS lock shared by workflows and held exclusively by cleanup.
+    #[serde(skip)]
+    pub lease_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]

@@ -87,6 +87,17 @@ pub trait DockerExecutor {
             stderr_bytes,
         })
     }
+
+    /// Execute bounded task cleanup after a cancellation has already been consumed.
+    /// Implementations backed by a process-wide signal flag must not immediately
+    /// cancel this operation, or Ctrl-C would strand the owned container.
+    fn execute_cleanup(
+        &self,
+        invocation: &ProcessInvocation,
+        timeout: Duration,
+    ) -> io::Result<ProcessOutput> {
+        self.execute(invocation, timeout)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -256,6 +267,15 @@ impl DockerExecutor for SystemDockerExecutor {
     ) -> io::Result<StreamedProcessOutput> {
         self.execute_process(invocation, timeout, Some((sink, phase, step)))
     }
+
+    fn execute_cleanup(
+        &self,
+        invocation: &ProcessInvocation,
+        timeout: Duration,
+    ) -> io::Result<ProcessOutput> {
+        self.execute_process_with_cancellation(invocation, timeout, None, false)
+            .map(|output| output.output)
+    }
 }
 
 impl SystemDockerExecutor {
@@ -264,6 +284,16 @@ impl SystemDockerExecutor {
         invocation: &ProcessInvocation,
         timeout: Duration,
         live: Option<(&dyn LogSink, StepPhase, &str)>,
+    ) -> io::Result<StreamedProcessOutput> {
+        self.execute_process_with_cancellation(invocation, timeout, live, true)
+    }
+
+    fn execute_process_with_cancellation(
+        &self,
+        invocation: &ProcessInvocation,
+        timeout: Duration,
+        live: Option<(&dyn LogSink, StepPhase, &str)>,
+        observe_user_cancellation: bool,
     ) -> io::Result<StreamedProcessOutput> {
         let mut child = Command::new(&invocation.program)
             .args(&invocation.args)
@@ -290,7 +320,7 @@ impl SystemDockerExecutor {
             });
             let deadline = Instant::now() + timeout;
             let (status, interrupted) = loop {
-                if Instant::now() >= deadline || is_cancelled() {
+                if Instant::now() >= deadline || (observe_user_cancellation && is_cancelled()) {
                     child.kill()?;
                     break (child.wait()?, true);
                 }
@@ -955,7 +985,9 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
 
     fn cleanup(&self, container_id: &str) -> io::Result<()> {
         let invocation = docker(vec!["container", "rm", "--force", container_id]);
-        let output = self.executor.execute(&invocation, CLEANUP_TIMEOUT)?;
+        let output = self
+            .executor
+            .execute_cleanup(&invocation, CLEANUP_TIMEOUT)?;
         if output.exit_code == Some(0) {
             Ok(())
         } else {
@@ -1097,6 +1129,36 @@ mod tests {
         clock: Rc<Cell<u64>>,
         control_calls: Cell<usize>,
         bytes: Vec<u8>,
+    }
+
+    struct CleanupRoutingExecutor {
+        ordinary_calls: Cell<usize>,
+        cleanup_calls: Cell<usize>,
+    }
+
+    impl DockerExecutor for &CleanupRoutingExecutor {
+        fn execute(
+            &self,
+            _invocation: &ProcessInvocation,
+            _timeout: Duration,
+        ) -> io::Result<ProcessOutput> {
+            self.ordinary_calls.set(self.ordinary_calls.get() + 1);
+            Err(io::Error::other("ordinary execution observes cancellation"))
+        }
+
+        fn execute_cleanup(
+            &self,
+            invocation: &ProcessInvocation,
+            timeout: Duration,
+        ) -> io::Result<ProcessOutput> {
+            self.cleanup_calls.set(self.cleanup_calls.get() + 1);
+            assert_eq!(timeout, CLEANUP_TIMEOUT);
+            assert_eq!(
+                invocation.args,
+                ["container", "rm", "--force", "owned-container"]
+            );
+            Ok(output(0, "", ""))
+        }
     }
 
     impl DockerExecutor for &RawStepExecutor {
@@ -1700,6 +1762,19 @@ mod tests {
         ));
         assert!(report.container_id.is_none());
         assert_eq!(executor.invocations().len(), 1);
+    }
+
+    #[test]
+    fn cleanup_uses_the_bounded_post_cancellation_execution_path() {
+        let executor = CleanupRoutingExecutor {
+            ordinary_calls: Cell::new(0),
+            cleanup_calls: Cell::new(0),
+        };
+        DockerRunner::new(&executor, FakeClock(Rc::new(Cell::new(0))))
+            .cleanup("owned-container")
+            .unwrap();
+        assert_eq!(executor.cleanup_calls.get(), 1);
+        assert_eq!(executor.ordinary_calls.get(), 0);
     }
 
     #[test]

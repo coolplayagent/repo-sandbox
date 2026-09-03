@@ -16,7 +16,6 @@ use repo_sandbox_core::snapshot::{CleanupPolicy, SnapshotOptions, SnapshotOrigin
 use repo_sandbox_core::template::{TemplateCatalog, TemplatePlan};
 use std::fmt::Write as _;
 use std::fs;
-use std::fs::OpenOptions;
 use std::io::{self, Write as IoWrite};
 use std::path::PathBuf;
 
@@ -281,9 +280,9 @@ fn run_runtime(
     workflow: &SystemWorkflow,
 ) -> Result<RunOutput, AppError> {
     let requested_report = arguments.report.clone();
-    let _report_reservation = requested_report
+    let report_reservation = requested_report
         .as_deref()
-        .map(CliReportReservation::create)
+        .map(repo_sandbox_adapters::workflow::OutputReservation::report)
         .transpose()?;
     let prepared = prepare_execution(arguments);
     let execution = match prepared {
@@ -297,6 +296,9 @@ fn run_runtime(
             return Err(error);
         }
     };
+    // Preparation failures are protected by the CLI reservation. The workflow
+    // immediately acquires the same cross-process reservation for execution.
+    drop(report_reservation);
     let result = if verify {
         VerifyUseCase::new(workflow).execute(&execution)
     } else {
@@ -319,47 +321,12 @@ fn run_runtime(
     })
 }
 
-struct CliReportReservation {
-    path: PathBuf,
-}
-
-impl CliReportReservation {
-    fn create(report: &std::path::Path) -> Result<Self, AppError> {
-        let parent = report.parent().unwrap_or_else(|| std::path::Path::new("."));
-        fs::create_dir_all(parent)
-            .map_err(|error| AppError::Environment(format!("create report directory: {error}")))?;
-        if report.exists() {
-            return Err(AppError::Configuration(format!(
-                "report already exists: {}",
-                report.display()
-            )));
-        }
-        let name = report
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("report.json");
-        let path = parent.join(format!(".{name}.repo-sandbox-cli-reservation"));
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                AppError::Configuration(format!(
-                    "cannot reserve report {}: {error}",
-                    report.display()
-                ))
-            })?;
-        Ok(Self { path })
-    }
-}
-
-impl Drop for CliReportReservation {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 fn prepare_execution(mut arguments: RuntimeArgs) -> Result<ExecutionPlan, AppError> {
+    if arguments.recurse_submodules && arguments.git_https_token_env.is_some() {
+        return Err(AppError::Configuration(
+            "--recurse-submodules with --git-https-token-env requires separately scoped submodule credentials, which are not supported in v1".into(),
+        ));
+    }
     let remote_auth = RemoteAuthentication {
         https_username: arguments.git_https_username.clone(),
         https_token_environment: arguments.git_https_token_env.clone(),
@@ -955,6 +922,19 @@ test: [{ name: test, run: cargo test }]
         ])
         .unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn https_token_and_recursive_submodules_fail_before_remote_access() {
+        let arguments = RuntimeArgs {
+            repository: Some("https://example.invalid/repository.git".into()),
+            recurse_submodules: true,
+            git_https_token_env: Some("REPO_SANDBOX_TOKEN".into()),
+            ..RuntimeArgs::default()
+        };
+        let error = prepare_execution(arguments).unwrap_err();
+        assert_eq!(error.exit_code(), ExitCode::Configuration);
+        assert!(error.to_string().contains("separately scoped"));
     }
 
     #[test]

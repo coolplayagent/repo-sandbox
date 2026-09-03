@@ -76,6 +76,14 @@ impl GitSnapshotter {
         source: &SourceSpec,
         options: SnapshotOptions,
     ) -> Result<MaterializedSnapshot, SnapshotError> {
+        if options.recurse_submodules
+            && matches!(source, SourceSpec::RemoteGit { .. })
+            && matches!(&self.authentication, GitAuthentication::HttpsToken { .. })
+        {
+            return Err(SnapshotError::InvalidInput(
+                "--recurse-submodules with an HTTPS token requires separately scoped submodule credentials, which are not supported in v1".into(),
+            ));
+        }
         let staging = self.new_tempdir()?;
         let checkout = staging.path().join("source");
         fs::create_dir(&checkout).map_err(io_error("create isolated snapshot directory"))?;
@@ -291,6 +299,13 @@ fn collect_repository(
             SnapshotError::Unsupported("non-UTF-8 Git paths are not supported in v1".into())
         })?;
         let relative = safe_relative_path(value)?;
+        if relative
+            .components()
+            .next()
+            .is_some_and(|part| part.as_os_str() == ".repo-sandbox")
+        {
+            continue;
+        }
         if relative.components().any(|part| part.as_os_str() == ".git") {
             continue;
         }
@@ -1450,6 +1465,46 @@ mod tests {
         .unwrap();
         let path_changed = create_local(repo.path());
         assert_ne!(content_changed.snapshot.id, path_changed.snapshot.id);
+    }
+
+    #[test]
+    fn local_snapshot_excludes_all_repo_sandbox_owned_state() {
+        let repo = repository();
+        let owned = repo.path().join(".repo-sandbox/tasks");
+        fs::create_dir_all(&owned).unwrap();
+        fs::write(
+            owned.join("task-with-host-path.json"),
+            r#"{"path":"C:\\secret"}"#,
+        )
+        .unwrap();
+        let snapshot = create_local(repo.path());
+        assert!(!snapshot.path().join(".repo-sandbox").exists());
+        assert_eq!(snapshot.snapshot.file_count, 1);
+    }
+
+    #[test]
+    fn recursive_https_token_is_rejected_before_secret_or_network_access() {
+        let error = GitSnapshotter::default()
+            .with_authentication(GitAuthentication::HttpsToken {
+                username: "robot".into(),
+                token: ExternalSecret::Environment(
+                    "REPO_SANDBOX_TEST_INTENTIONALLY_MISSING_TOKEN".into(),
+                ),
+            })
+            .create(
+                &SourceSpec::RemoteGit {
+                    repository: "https://example.invalid/repository.git".into(),
+                    git_ref: "HEAD".into(),
+                },
+                SnapshotOptions {
+                    recurse_submodules: true,
+                    cleanup: CleanupPolicy::Delete,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, SnapshotError::InvalidInput(_)));
+        assert!(error.to_string().contains("separately scoped"));
+        assert!(!error.to_string().contains("unavailable"));
     }
 
     #[cfg(unix)]
