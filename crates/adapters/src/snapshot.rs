@@ -777,7 +777,12 @@ fn resolve_commit(
     requested: &str,
     cancellation: &dyn Cancellation,
 ) -> Result<CommitSha, SnapshotError> {
-    let candidates = if requested.starts_with("refs/") || requested == "HEAD" {
+    let candidates = if let Some(branch) = requested.strip_prefix("refs/heads/") {
+        vec![
+            requested.to_owned(),
+            format!("refs/remotes/origin/{branch}"),
+        ]
+    } else if requested.starts_with("refs/") || requested == "HEAD" {
         vec![requested.to_owned()]
     } else {
         vec![
@@ -1759,7 +1764,7 @@ mod tests {
             .create(
                 &SourceSpec::RemoteGit {
                     repository: repo.path().to_string_lossy().into_owned(),
-                    git_ref: branch.trim().into(),
+                    git_ref: format!("refs/heads/{}", branch.trim()),
                 },
                 SnapshotOptions::default(),
             )

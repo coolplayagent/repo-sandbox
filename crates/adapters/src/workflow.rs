@@ -2,7 +2,7 @@
 
 use crate::artifacts::{OWNER_MARKER, cleanup_owned_temp_source};
 use crate::buildkit::{
-    BuildKit, BuildOptions, BuildRequest, CacheConfig, ImageOutput, NeverCancelled,
+    BuildKit, BuildOptions, BuildRequest, CacheConfig, Cancellation, ImageOutput, NeverCancelled,
     ProcessExecutor, ProcessInvocation, Progress, SystemProcessExecutor,
 };
 use crate::cancellation::DeadlineCancellation;
@@ -116,7 +116,7 @@ impl WorkflowPort for SystemWorkflow {
             let trusted_catalog = trusted_catalog()?;
             let catalog_root = trusted_catalog.path().to_path_buf();
             let cache_import = cache.join("environment");
-            let cache_export = cache.join("environment-next");
+            let cache_export = task_cache_export(&cache, &task_id);
             if cache_export.exists() {
                 fs::remove_dir_all(&cache_export)
                     .map_err(environment("remove stale owned cache export"))?;
@@ -152,10 +152,7 @@ impl WorkflowPort for SystemWorkflow {
                 )
                 .map_err(|error| bounded_error("environment image", error, &cancellation))?;
             if cache_export.exists() {
-                if cache_import.exists() {
-                    let _ = fs::remove_dir_all(&cache_import);
-                }
-                let _ = fs::rename(&cache_export, &cache_import);
+                rotate_cache_export(&cache, &cache_export, &cache_import, &cancellation)?;
             }
 
             let configuration_digest =
@@ -183,6 +180,7 @@ impl WorkflowPort for SystemWorkflow {
                     &cancellation,
                 )
                 .map_err(|error| bounded_error("task image", error, &cancellation))?;
+            let execution_image = resolve_local_image_id(&task_image.image, &cancellation)?;
             journal.append(&[CleanCandidate {
                 task_id: task_id.clone(),
                 repository_id: repository_id.clone(),
@@ -238,7 +236,7 @@ impl WorkflowPort for SystemWorkflow {
             let spec = RunSpec {
                 task_id: task_id.clone(),
                 repository_id: repository_id.clone(),
-                image: task_image.image.image.clone(),
+                image: execution_image,
                 image_digest: task_image.image.digest.clone(),
                 source_snapshot: materialized.snapshot.clone(),
                 config_summary: ConfigSummary {
@@ -899,13 +897,7 @@ fn build_multi_platform_task(
     repository: &RegistryRepository,
     cancellation: &DeadlineCancellation,
 ) -> Result<(ImageRef, BuiltImage), AppError> {
-    let environment_repository = format!("{}-environment", repository.as_str());
-    let environment_ref = ImageRef::new(format!(
-        "{}:{}",
-        environment_repository,
-        short_digest(&plan.digest)
-    ))
-    .map_err(AppError::Configuration)?;
+    let environment_ref = multi_environment_ref(repository, &plan.digest)?;
     let environment = BuildKit::new(SystemProcessExecutor)
         .build(
             BuildRequest::environment(
@@ -986,11 +978,7 @@ fn export_verified_oci(
     output: &Path,
     cancellation: &DeadlineCancellation,
 ) -> Result<(), AppError> {
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    let temporary = tempfile::Builder::new()
-        .prefix(".repo-sandbox-oci-")
-        .tempdir_in(parent)
-        .map_err(environment("create OCI staging directory"))?;
+    let temporary = create_oci_staging(output)?;
     let mut layouts = Vec::new();
     for (index, platform) in plan.request.platforms.iter().copied().enumerate() {
         let environment = if platform == plan.request.platform {
@@ -1401,6 +1389,114 @@ fn short_digest(value: &str) -> &str {
         .unwrap_or(value)
         .get(..24)
         .unwrap_or(value)
+}
+
+fn task_cache_export(cache: &Path, task_id: &str) -> PathBuf {
+    cache.join(format!("environment-next-{task_id}"))
+}
+
+fn rotate_cache_export(
+    cache: &Path,
+    export: &Path,
+    current: &Path,
+    cancellation: &DeadlineCancellation,
+) -> Result<(), AppError> {
+    let lock_path = cache.join(".rotation.lock");
+    let file = WorkflowLease::open(&lock_path)?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if !cancellation.is_cancelled() => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(AppError::Environment(
+                    "workflow cancelled while waiting to rotate cache".into(),
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(AppError::Environment(format!(
+                    "lock cache rotation: {error}"
+                )));
+            }
+        }
+    }
+    let backup = cache.join(format!("environment-previous-{}", task_id()));
+    if current.exists() {
+        fs::rename(current, &backup).map_err(environment("preserve current cache"))?;
+    }
+    if let Err(error) = fs::rename(export, current) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, current);
+        }
+        return Err(AppError::Environment(format!(
+            "rotate cache export: {error}"
+        )));
+    }
+    if backup.exists() {
+        fs::remove_dir_all(backup).map_err(environment("remove previous cache"))?;
+    }
+    Ok(())
+}
+
+fn multi_environment_ref(
+    repository: &RegistryRepository,
+    plan_digest: &str,
+) -> Result<ImageRef, AppError> {
+    ImageRef::new(format!(
+        "{}:environment-{}",
+        repository.as_str(),
+        short_digest(plan_digest)
+    ))
+    .map_err(AppError::Configuration)
+}
+
+fn resolve_local_image_id(
+    image: &BuiltImage,
+    cancellation: &DeadlineCancellation,
+) -> Result<ImageRef, AppError> {
+    resolve_local_image_id_with(&SystemProcessExecutor, image, cancellation)
+}
+
+fn resolve_local_image_id_with(
+    executor: &dyn ProcessExecutor,
+    image: &BuiltImage,
+    cancellation: &dyn Cancellation,
+) -> Result<ImageRef, AppError> {
+    let output = executor
+        .execute(
+            &ProcessInvocation {
+                program: "docker".into(),
+                args: vec![
+                    "image".into(),
+                    "inspect".into(),
+                    "--format={{.Id}}".into(),
+                    image.image.to_string(),
+                ],
+                current_dir: None,
+            },
+            cancellation,
+        )
+        .map_err(environment("resolve immutable local task image ID"))?;
+    if output.interrupted || output.exit_code != Some(0) {
+        return Err(AppError::Environment(format!(
+            "resolve immutable local task image ID failed: {}",
+            output.stderr.trim()
+        )));
+    }
+    let id = output.stdout.trim();
+    repo_sandbox_core::build::ImageDigest::new(id)
+        .map_err(|_| AppError::Environment("Docker returned an invalid task image ID".into()))?;
+    ImageRef::new(id).map_err(AppError::Configuration)
+}
+
+fn create_oci_staging(output: &Path) -> Result<tempfile::TempDir, AppError> {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(environment("create OCI output parent"))?;
+    tempfile::Builder::new()
+        .prefix(".repo-sandbox-oci-")
+        .tempdir_in(parent)
+        .map_err(environment("create OCI staging directory"))
 }
 fn docker_host_path(path: &Path) -> String {
     let text = path.to_string_lossy();
@@ -1874,15 +1970,39 @@ fn remove_candidate(candidate: &CleanCandidate) -> Result<bool, String> {
 fn trusted_source_path(identifier: &str) -> bool {
     let path = Path::new(identifier);
     let has_owned_name = path
-        .file_name()
+        .parent()
+        .and_then(Path::file_name)
         .and_then(|value| value.to_str())
         .is_some_and(|name| name.starts_with("repo-sandbox-source-"));
-    has_owned_name && path.starts_with(std::env::temp_dir())
+    has_owned_name
+        && path.file_name().is_some_and(|name| name == "source")
+        && path.starts_with(std::env::temp_dir())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct InspectExecutor {
+        calls: std::sync::Mutex<Vec<ProcessInvocation>>,
+        image_id: String,
+    }
+
+    impl ProcessExecutor for InspectExecutor {
+        fn execute(
+            &self,
+            invocation: &ProcessInvocation,
+            _cancellation: &dyn Cancellation,
+        ) -> std::io::Result<crate::buildkit::ProcessOutput> {
+            self.calls.lock().unwrap().push(invocation.clone());
+            Ok(crate::buildkit::ProcessOutput {
+                exit_code: Some(0),
+                stdout: format!("{}\n", self.image_id),
+                stderr: String::new(),
+                interrupted: false,
+            })
+        }
+    }
 
     fn fake_layout(root: &Path, digest: &str) {
         fs::create_dir_all(root.join("blobs/sha256")).unwrap();
@@ -1928,6 +2048,153 @@ mod tests {
         assert_eq!(descriptors[1]["platform"]["architecture"], "arm64");
         assert!(output.join("blobs/sha256").join("a".repeat(64)).is_file());
         assert!(output.join("blobs/sha256").join("b".repeat(64)).is_file());
+    }
+
+    #[test]
+    fn oci_staging_creates_a_fresh_nested_output_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = temporary.path().join("reports/task-oci");
+        let staging = create_oci_staging(&parent.join("layout")).unwrap();
+        assert!(parent.is_dir());
+        assert_eq!(staging.path().parent(), Some(parent.as_path()));
+    }
+
+    #[test]
+    fn cache_exports_are_task_specific_and_rotation_preserves_latest_complete_export() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = temporary.path();
+        let current = cache.join("environment");
+        let first = task_cache_export(cache, "first");
+        let second = task_cache_export(cache, "second");
+        assert_ne!(first, second);
+        fs::create_dir(&first).unwrap();
+        fs::write(first.join("value"), "first").unwrap();
+        rotate_cache_export(
+            cache,
+            &first,
+            &current,
+            &DeadlineCancellation::new(std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(second.join("value"), "second").unwrap();
+        rotate_cache_export(
+            cache,
+            &second,
+            &current,
+            &DeadlineCancellation::new(std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(current.join("value")).unwrap(), "second");
+        assert!(!first.exists());
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn concurrent_cache_rotations_publish_only_complete_task_exports() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = temporary.path().to_path_buf();
+        let current = cache.join("environment");
+        let first = task_cache_export(&cache, "first-concurrent");
+        let second = task_cache_export(&cache, "second-concurrent");
+        for (path, value) in [(&first, "first"), (&second, "second")] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("value"), value).unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let spawn = |export: PathBuf| {
+            let cache = cache.clone();
+            let current = current.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                rotate_cache_export(
+                    &cache,
+                    &export,
+                    &current,
+                    &DeadlineCancellation::new(std::time::Duration::from_secs(2)),
+                )
+                .unwrap();
+            })
+        };
+        let first_thread = spawn(first.clone());
+        let second_thread = spawn(second.clone());
+        barrier.wait();
+        first_thread.join().unwrap();
+        second_thread.join().unwrap();
+        let value = fs::read_to_string(current.join("value")).unwrap();
+        assert!(matches!(value.as_str(), "first" | "second"));
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert_eq!(
+            fs::read_dir(&cache)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("environment-previous-"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn multi_platform_environment_stays_in_the_configured_repository() {
+        let repository = RegistryRepository::new("registry.test/team/task").unwrap();
+        let reference =
+            multi_environment_ref(&repository, &format!("sha256:{}", "a".repeat(64))).unwrap();
+        assert_eq!(
+            reference.as_str(),
+            format!("registry.test/team/task:environment-{}", "a".repeat(24))
+        );
+        assert!(!reference.as_str().contains("task-environment"));
+    }
+
+    #[test]
+    fn runner_uses_resolved_image_id_even_if_the_source_tag_is_later_repointed() {
+        let manifest_digest =
+            repo_sandbox_core::build::ImageDigest::new(format!("sha256:{}", "a".repeat(64)))
+                .unwrap();
+        let local_id = format!("sha256:{}", "b".repeat(64));
+        let image = BuiltImage {
+            image: ImageRef::new("repo-sandbox-task:mutable").unwrap(),
+            digest: manifest_digest.clone(),
+            platform_digests: Vec::new(),
+        };
+        let executor = InspectExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            image_id: local_id.clone(),
+        };
+        let resolved = resolve_local_image_id_with(&executor, &image, &NeverCancelled).unwrap();
+        assert_eq!(resolved.as_str(), local_id);
+        // A later mutation of the source tag cannot change the ID already passed to RunSpec.
+        let repointed_tag_id = format!("sha256:{}", "c".repeat(64));
+        assert_ne!(resolved.as_str(), repointed_tag_id);
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args.last().unwrap(), "repo-sandbox-task:mutable");
+        assert_eq!(image.digest, manifest_digest);
+    }
+
+    #[test]
+    fn retained_source_trusts_only_the_owned_temp_parent_and_source_leaf() {
+        let trusted = std::env::temp_dir()
+            .join("repo-sandbox-source-abc")
+            .join("source");
+        assert!(trusted_source_path(&trusted.to_string_lossy()));
+        assert!(!trusted_source_path(
+            &std::env::temp_dir()
+                .join("untrusted")
+                .join("source")
+                .to_string_lossy()
+        ));
+        assert!(!trusted_source_path(
+            &std::env::temp_dir()
+                .join("repo-sandbox-source-abc")
+                .join("other")
+                .to_string_lossy()
+        ));
     }
 
     #[test]
