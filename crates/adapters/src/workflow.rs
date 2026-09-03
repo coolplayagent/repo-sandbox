@@ -804,12 +804,14 @@ fn validate_outputs(plan: &ExecutionPlan) -> Result<(), AppError> {
             "multiple --platform values require --push or --oci-layout".into(),
         ));
     }
-    if let (Some(oci), Some(report)) = (&plan.request.oci_layout, &plan.request.report)
-        && normalized_output_path(oci)? == normalized_output_path(report)?
-    {
-        return Err(AppError::Configuration(
-            "--oci-layout and --report-path must be different".into(),
-        ));
+    if let (Some(oci), Some(report)) = (&plan.request.oci_layout, &plan.request.report) {
+        let oci = normalized_output_path(oci)?;
+        let report = normalized_output_path(report)?;
+        if oci == report || oci.starts_with(&report) || report.starts_with(&oci) {
+            return Err(AppError::Configuration(
+                "--oci-layout and --report-path must not overlap".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1764,14 +1766,28 @@ fn docker_host_path(path: &Path) -> String {
     text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
 }
 fn task_id() -> String {
-    format!(
-        "{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    )
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_TICK: AtomicU64 = AtomicU64::new(0);
+    let wall_clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let mut previous = LAST_TICK.load(Ordering::Relaxed);
+    let unique = loop {
+        let candidate = wall_clock.max(previous.saturating_add(1));
+        match LAST_TICK.compare_exchange_weak(
+            previous,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break candidate,
+            Err(actual) => previous = actual,
+        }
+    };
+    format!("{}-{}", std::process::id(), unique)
 }
 fn repository_id(repository: &Path) -> Result<String, AppError> {
     let mut h = Sha256::new();
@@ -2909,12 +2925,45 @@ mod tests {
             validate_outputs(&plan)
                 .unwrap_err()
                 .to_string()
-                .contains("different")
+                .contains("overlap")
         );
         assert_eq!(
             normalized_output_path(Path::new("reports/other/../result.json")).unwrap(),
             normalized_output_path(Path::new("reports/result.json")).unwrap()
         );
+    }
+
+    #[test]
+    fn ancestor_output_paths_are_rejected_before_execution() {
+        for (report, oci) in [("out", "out/layout"), ("out/report.json", "out")] {
+            let mut plan = default_execution_plan();
+            plan.request.report = Some(PathBuf::from(report));
+            plan.request.oci_layout = Some(PathBuf::from(oci));
+            assert!(
+                validate_outputs(&plan)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("overlap")
+            );
+        }
+    }
+
+    #[test]
+    fn task_ids_are_unique_under_same_process_concurrency() {
+        let ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let threads = (0..32)
+            .map(|_| {
+                let ids = ids.clone();
+                std::thread::spawn(move || ids.lock().unwrap().push(task_id()))
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let ids = ids.lock().unwrap();
+        let unique = ids.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), ids.len());
+        assert!(ids.iter().all(|id| id.split('-').count() == 2));
     }
 
     #[test]
