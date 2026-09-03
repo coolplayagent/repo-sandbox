@@ -80,6 +80,9 @@ RUN --mount=type=cache,id=repo-sandbox-cargo-registry-${TARGETARCH},target=/usr/
 ARG REPO_SANDBOX_TEMPLATE_ID
 ARG REPO_SANDBOX_TEMPLATE_VERSION
 ARG REPO_SANDBOX_PLAN_DIGEST
+ARG REPO_SANDBOX_REPOSITORY_ID
 LABEL org.opencontainers.image.title="${REPO_SANDBOX_TEMPLATE_ID}" \
       org.opencontainers.image.version="${REPO_SANDBOX_TEMPLATE_VERSION}" \
-      io.repo-sandbox.plan-digest="${REPO_SANDBOX_PLAN_DIGEST}"
+      io.repo-sandbox.plan-digest="${REPO_SANDBOX_PLAN_DIGEST}" \
+      io.repo-sandbox.owner="${REPO_SANDBOX_PLAN_DIGEST}" \
+      io.repo-sandbox.repository-id="${REPO_SANDBOX_REPOSITORY_ID}"

@@ -325,6 +325,7 @@ LABEL org.opencontainers.image.created="${TASK_CREATED}" \
       io.repo-sandbox.config.digest="${TASK_CONFIG_DIGEST}" \
       io.repo-sandbox.environment.digest="${TASK_ENVIRONMENT_DIGEST}" \
       io.repo-sandbox.task.identity="${TASK_IDENTITY}" \
+      io.repo-sandbox.owner="${TASK_IDENTITY}" \
       io.repo-sandbox.repository-id="${TASK_REPOSITORY_ID}"
 "#
 }
@@ -468,6 +469,7 @@ mod tests {
                 assert!(dockerfile.contains("FROM ${BASE_IMAGE} AS environment"));
                 assert!(dockerfile.contains("FROM environment AS task"));
                 assert!(dockerfile.contains("COPY --link source/ /workspace/"));
+                assert!(dockerfile.contains("io.repo-sandbox.owner=\"${TASK_IDENTITY}\""));
                 assert!(!dockerfile.contains("ENTRYPOINT"));
                 let metadata = PathBuf::from(value_after(&invocation.args, "--metadata-file"));
                 fs::write(

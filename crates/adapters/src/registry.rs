@@ -477,7 +477,13 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
             image.to_string(),
         ]);
         let raw = self.run("inspect raw manifest", &raw_invocation, None, cancellation)?;
-        let platforms = parse_platforms(&raw.stdout)?;
+        let mut platforms = parse_platforms(&raw.stdout)?;
+        if platforms.is_empty() && expected.len() == 1 && expected[0].digest == digest {
+            // OCI image manifests do not carry an os/architecture descriptor;
+            // the exact top-level digest plus BuildKit's single requested
+            // platform is the complete immutable evidence in this case.
+            platforms = expected.to_vec();
+        }
         if !expected.is_empty() {
             verify_platforms(&platforms, expected)?;
         }
@@ -1092,6 +1098,24 @@ mod tests {
                 &NeverCancelled,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn publication_accepts_an_exact_single_platform_manifest() {
+        let executor = FakeExecutor::new(vec![ok(""), ok(described()), ok(single_manifest())]);
+        let registry = DockerRegistry::new(executor);
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/team/image:source").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: vec![PlatformDigest {
+                platform: Platform::LinuxAmd64,
+                digest: root_digest(),
+            }],
+            aliases: Vec::new(),
+        };
+        let published = registry.publish(&request, &NeverCancelled).unwrap();
+        assert_eq!(published.platform_digests, request.platform_digests);
     }
 
     /// Configurable end-to-end coverage against an operator-provided disposable repository.

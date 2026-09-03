@@ -348,6 +348,13 @@ fn prepare_execution_cancellable(
             "--recurse-submodules with --git-https-token-env requires separately scoped submodule credentials, which are not supported in v1".into(),
         ));
     }
+    if let Some(repository) = arguments
+        .repository
+        .as_deref()
+        .filter(|value| repo_sandbox_adapters::workflow::is_remote_repository(value))
+    {
+        repo_sandbox_adapters::workflow::validate_remote_repository(repository)?;
+    }
     let remote_auth = RemoteAuthentication {
         https_username: arguments.git_https_username.clone(),
         https_token_environment: arguments.git_https_token_env.clone(),
@@ -957,6 +964,18 @@ test: [{ name: test, run: cargo test }]
         let error = prepare_execution(arguments).unwrap_err();
         assert_eq!(error.exit_code(), ExitCode::Configuration);
         assert!(error.to_string().contains("separately scoped"));
+    }
+
+    #[test]
+    fn remote_query_credentials_fail_before_remote_access() {
+        let arguments = RuntimeArgs {
+            repository: Some("https://example.invalid/repository.git?token=sensitive".into()),
+            ..RuntimeArgs::default()
+        };
+        let error = prepare_execution(arguments).unwrap_err();
+        assert_eq!(error.exit_code(), ExitCode::Configuration);
+        assert!(!error.to_string().contains("sensitive"));
+        assert!(error.to_string().contains("query"));
     }
 
     #[test]
