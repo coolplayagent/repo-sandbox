@@ -556,6 +556,7 @@ fn validate_execution(path: &str, execution: &ExecutionDefinition) -> Result<(),
     for (index, directory) in execution.artifact_directories.iter().enumerate() {
         validate_context(&format!("{path}.artifact_directories[{index}]"), directory)?;
     }
+    let mut ordinary_environment = BTreeSet::new();
     for (kind, values) in [
         ("environment_allow", &execution.environment_allow),
         ("secret_environment", &execution.secret_environment),
@@ -569,6 +570,14 @@ fn validate_execution(path: &str, execution: &ExecutionDefinition) -> Result<(),
                 return Err(PlanError::new(
                     format!("{path}.{kind}[{index}]"),
                     "must be a unique POSIX environment name",
+                ));
+            }
+            if kind == "environment_allow" {
+                ordinary_environment.insert(value);
+            } else if ordinary_environment.contains(value) {
+                return Err(PlanError::new(
+                    format!("{path}.{kind}[{index}]"),
+                    "must not overlap environment_allow",
                 ));
             }
         }
@@ -653,6 +662,32 @@ build_context: templates/test
             + "execution: { version: 2, build: [{ name: b, command: \"true\" }], test: [{ name: t, command: \"true\" }], resources: { cpu: 1, memory_mb: 1, temporary_storage_mb: 1 }, timeout_seconds: 1 }\n";
         let error = TemplateCatalog::from_yaml_sources(&[&invalid], &[]).unwrap_err();
         assert_eq!(error.path(), "$.templates[0].execution.version");
+    }
+
+    #[test]
+    fn secret_environment_cannot_overlap_persisted_environment() {
+        let template = r#"
+id: test
+version: "1"
+base_image: example:1
+components: []
+target_platforms: [linux/amd64]
+build_context: templates/test
+execution:
+  version: 1
+  build: [{ name: build, command: "true" }]
+  test: [{ name: test, command: "true" }]
+  resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }
+  timeout_seconds: 1
+  environment_allow: [TOKEN]
+  secret_environment: [TOKEN]
+"#;
+        let error = TemplateCatalog::from_yaml_sources(&[template], &[]).unwrap_err();
+        assert_eq!(
+            error.path(),
+            "$.templates[0].execution.secret_environment[0]"
+        );
+        assert!(error.to_string().contains("must not overlap"));
     }
 
     #[test]

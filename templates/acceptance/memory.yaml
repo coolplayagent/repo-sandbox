@@ -10,8 +10,7 @@ execution:
   test:
     - name: acceptance-memory
       command: >-
-        printf '#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\nint main(void){size_t n=268435456;char*p=malloc(n);if(!p)return 2;memset(p,1,n);sleep(2);return p[0]==1?0:3;}\n' >/tmp/oom.c && cc /tmp/oom.c -o /tmp/oom && /tmp/oom
+        printf '#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\nint main(void){size_t n=268435456;char*p=malloc(n);if(!p)return 2;memset(p,1,n);sleep(2);return p[0]==1?0:3;}\n' >/workspace/.repo-sandbox-oom.c && cc /workspace/.repo-sandbox-oom.c -o /workspace/.repo-sandbox-oom && /workspace/.repo-sandbox-oom
   resources: { cpu: 1, memory_mb: 64, temporary_storage_mb: 64 }
   timeout_seconds: 120
   fail_fast: true
-

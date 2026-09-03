@@ -5,7 +5,7 @@ use crate::buildkit::{
     BuildKit, BuildOptions, BuildRequest, CacheConfig, ImageOutput, NeverCancelled,
     ProcessExecutor, ProcessInvocation, Progress, SystemProcessExecutor,
 };
-use crate::cancellation::ProcessCancellation;
+use crate::cancellation::DeadlineCancellation;
 use crate::docker_runner::{DockerRunner, SystemClock, SystemDockerExecutor};
 use crate::doctor::{DoctorProbe, SystemDoctorProbe};
 use crate::registry::{DockerRegistry, OciRegistry, SystemRegistryExecutor};
@@ -45,7 +45,9 @@ impl WorkflowPort for SystemWorkflow {
         plan: &ExecutionPlan,
     ) -> Result<WorkflowResult, AppError> {
         let repository = repository_path(plan)?;
-        let cancellation = ProcessCancellation;
+        let cancellation = DeadlineCancellation::new(std::time::Duration::from_secs(u64::from(
+            plan.template.execution.timeout_seconds,
+        )));
         let task_id = task_id();
         let repository_id = repository_id_for_plan(plan, &repository)?;
         let state = state_root(plan, &repository, &repository_id);
@@ -105,7 +107,8 @@ impl WorkflowPort for SystemWorkflow {
                     },
                 )
                 .map_err(|error| AppError::Environment(format!("snapshot: {error}")))?;
-            let catalog_root = catalog_root(&repository)?;
+            let trusted_catalog = trusted_catalog()?;
+            let catalog_root = trusted_catalog.path().to_path_buf();
             let cache_import = cache.join("environment");
             let cache_export = cache.join("environment-next");
             if cache_export.exists() {
@@ -141,7 +144,7 @@ impl WorkflowPort for SystemWorkflow {
                     ),
                     &cancellation,
                 )
-                .map_err(|error| AppError::Environment(format!("environment image: {error}")))?;
+                .map_err(|error| bounded_error("environment image", error, &cancellation))?;
             if cache_export.exists() {
                 if cache_import.exists() {
                     let _ = fs::remove_dir_all(&cache_import);
@@ -156,6 +159,7 @@ impl WorkflowPort for SystemWorkflow {
                 .build(
                     TaskImageRequest {
                         environment: &environment_image,
+                        identity_environment_digest: None,
                         materialized: &materialized,
                         template_id: &plan.template.template_id,
                         template_version: &plan.template.template_version,
@@ -172,7 +176,7 @@ impl WorkflowPort for SystemWorkflow {
                     },
                     &cancellation,
                 )
-                .map_err(|error| AppError::Environment(format!("task image: {error}")))?;
+                .map_err(|error| bounded_error("task image", error, &cancellation))?;
             journal.append(&[CleanCandidate {
                 task_id: task_id.clone(),
                 repository_id: repository_id.clone(),
@@ -257,7 +261,12 @@ impl WorkflowPort for SystemWorkflow {
                     memory_mb: execution.resources.memory_mb,
                     temporary_storage_mb: execution.resources.temporary_storage_mb,
                 },
-                timeout_ms: u64::from(execution.timeout_seconds) * 1000,
+                timeout_ms: cancellation
+                    .remaining()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX)
+                    .max(1),
                 fail_fast: execution.fail_fast,
                 environment_names: execution.environment_allow.clone(),
                 secret_mounts,
@@ -291,9 +300,7 @@ impl WorkflowPort for SystemWorkflow {
             let mut bookkeeping_errors = Vec::new();
             if report.cleanup == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure {
                 materialized.retain_on_failure();
-                if !materialized.is_automatically_cleaned()
-                    && is_remote(plan.request.repository.as_deref().unwrap_or(""))
-                {
+                if !materialized.is_automatically_cleaned() {
                     if let Err(error) = fs::write(materialized.path().join(OWNER_MARKER), &task_id)
                         .map_err(environment("mark retained source"))
                     {
@@ -360,6 +367,8 @@ impl WorkflowPort for SystemWorkflow {
                         plan,
                         &catalog_root,
                         &materialized,
+                        &environment_image,
+                        &task_image.image,
                         &configuration_digest,
                         &repository_id,
                         &repository,
@@ -370,6 +379,7 @@ impl WorkflowPort for SystemWorkflow {
                         &task_image.image.image,
                         &repository,
                         task_image.identity.as_str(),
+                        &cancellation,
                     )?;
                     (seeded, task_image.image.clone())
                 };
@@ -385,7 +395,7 @@ impl WorkflowPort for SystemWorkflow {
                             },
                             &cancellation,
                         )
-                        .map_err(|error| AppError::Environment(error.to_string()))?,
+                        .map_err(|error| bounded_error("publish", error, &cancellation))?,
                 )
             } else {
                 None
@@ -649,6 +659,12 @@ impl CleanPort for SystemWorkflow {
 }
 
 fn validate_outputs(plan: &ExecutionPlan) -> Result<(), AppError> {
+    if plan.request.git_ref.is_some() && !plan.request.repository.as_deref().is_some_and(is_remote)
+    {
+        return Err(AppError::Configuration(
+            "--git-ref is supported only with a remote repository URL".into(),
+        ));
+    }
     if plan.request.push {
         let policy = plan.template.execution.registry.as_ref().ok_or_else(|| {
             AppError::Configuration(
@@ -676,7 +692,9 @@ fn validate_outputs(plan: &ExecutionPlan) -> Result<(), AppError> {
             "multiple --platform values require --push or --oci-layout".into(),
         ));
     }
-    if plan.request.oci_layout.as_ref() == plan.request.report.as_ref() {
+    if let (Some(oci), Some(report)) = (&plan.request.oci_layout, &plan.request.report)
+        && oci == report
+    {
         return Err(AppError::Configuration(
             "--oci-layout and --report-path must be different".into(),
         ));
@@ -769,14 +787,17 @@ fn failure_phase(error: &AppError) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps verified and publication identities explicit.
 fn build_multi_platform_task(
     plan: &ExecutionPlan,
     catalog_root: &Path,
     materialized: &crate::snapshot::MaterializedSnapshot,
+    primary_environment: &BuiltImage,
+    verified_task: &BuiltImage,
     configuration_digest: &ConfigurationDigest,
     repository_id: &str,
     repository: &RegistryRepository,
-    cancellation: &ProcessCancellation,
+    cancellation: &DeadlineCancellation,
 ) -> Result<(ImageRef, BuiltImage), AppError> {
     let environment_repository = format!("{}-environment", repository.as_str());
     let environment_ref = ImageRef::new(format!(
@@ -800,11 +821,25 @@ fn build_multi_platform_task(
             ),
             cancellation,
         )
-        .map_err(|error| AppError::Environment(format!("multi-platform environment: {error}")))?;
+        .map_err(|error| bounded_error("multi-platform environment", error, cancellation))?;
+    let primary_environment_manifest = environment
+        .platform_digests
+        .iter()
+        .find(|item| item.platform == plan.request.platform)
+        .ok_or_else(|| {
+            AppError::Environment("multi-platform environment omitted the verified platform".into())
+        })?;
+    if primary_environment_manifest.digest != primary_environment.digest {
+        return Err(AppError::Environment(
+            "multi-platform environment primary manifest differs from the verified environment"
+                .into(),
+        ));
+    }
     let task = TaskImageBuilder::new(SystemProcessExecutor)
         .build(
             TaskImageRequest {
                 environment: &environment,
+                identity_environment_digest: Some(&primary_environment.digest),
                 materialized,
                 template_id: &plan.template.template_id,
                 template_version: &plan.template.template_version,
@@ -822,7 +857,21 @@ fn build_multi_platform_task(
             },
             cancellation,
         )
-        .map_err(|error| AppError::Environment(format!("multi-platform task image: {error}")))?;
+        .map_err(|error| bounded_error("multi-platform task image", error, cancellation))?;
+    let primary_task_manifest = task
+        .image
+        .platform_digests
+        .iter()
+        .find(|item| item.platform == plan.request.platform)
+        .ok_or_else(|| {
+            AppError::Environment("multi-platform task image omitted the verified platform".into())
+        })?;
+    if primary_task_manifest.digest != verified_task.digest {
+        return Err(AppError::Environment(
+            "multi-platform task primary manifest differs from the image verified by the runner"
+                .into(),
+        ));
+    }
     Ok((task.image.image.clone(), task.image))
 }
 
@@ -835,7 +884,7 @@ fn export_verified_oci(
     configuration_digest: &ConfigurationDigest,
     repository_id: &str,
     output: &Path,
-    cancellation: &ProcessCancellation,
+    cancellation: &DeadlineCancellation,
 ) -> Result<(), AppError> {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     let temporary = tempfile::Builder::new()
@@ -867,7 +916,11 @@ fn export_verified_oci(
                     cancellation,
                 )
                 .map_err(|error| {
-                    AppError::Environment(format!("OCI environment for {platform}: {error}"))
+                    bounded_error(
+                        &format!("OCI environment for {platform}"),
+                        error,
+                        cancellation,
+                    )
                 })?
         };
         let layout = temporary.path().join(format!("platform-{index}"));
@@ -875,6 +928,7 @@ fn export_verified_oci(
             .build(
                 TaskImageRequest {
                     environment: &environment,
+                    identity_environment_digest: None,
                     materialized,
                     template_id: &plan.template.template_id,
                     template_version: &plan.template.template_version,
@@ -892,7 +946,9 @@ fn export_verified_oci(
                 },
                 cancellation,
             )
-            .map_err(|error| AppError::Environment(format!("OCI task for {platform}: {error}")))?;
+            .map_err(|error| {
+                bounded_error(&format!("OCI task for {platform}"), error, cancellation)
+            })?;
         layouts.push((platform, layout));
     }
     merge_oci_layouts(&layouts, output, temporary.path())
@@ -982,7 +1038,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), AppError> {
 fn preflight(
     plan: &ExecutionPlan,
     repository: &Path,
-    cancellation: &ProcessCancellation,
+    cancellation: &DeadlineCancellation,
 ) -> Result<(), AppError> {
     let mut outputs = Vec::new();
     for args in [
@@ -996,7 +1052,12 @@ fn preflight(
         };
         let output = SystemProcessExecutor
             .execute(&invocation, cancellation)
-            .map_err(environment("Docker preflight"))?;
+            .map_err(|error| bounded_error("Docker preflight", error, cancellation))?;
+        if cancellation.expired() {
+            return Err(AppError::Environment(
+                "workflow timeout during Docker preflight".into(),
+            ));
+        }
         if output.exit_code != Some(0) {
             return Err(AppError::Environment(format!(
                 "Docker preflight failed: {}",
@@ -1055,7 +1116,7 @@ fn preflight(
         };
         let output = SystemProcessExecutor
             .execute(&invocation, cancellation)
-            .map_err(environment("registry /v2/ preflight"))?;
+            .map_err(|error| bounded_error("registry /v2/ preflight", error, cancellation))?;
         if !registry_probe_authenticated(&output) {
             return Err(AppError::Environment(format!(
                 "registry /v2/ preflight authentication or reachability failed: {}",
@@ -1092,22 +1153,36 @@ fn repository_path(plan: &ExecutionPlan) -> Result<PathBuf, AppError> {
         .map_err(environment("resolve repository"))
 }
 
-fn catalog_root(repository: &Path) -> Result<PathBuf, AppError> {
-    let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-    repository
-        .ancestors()
-        .map(Path::to_path_buf)
-        .chain(compiled)
-        .find(|root| {
-            root.join("templates/rust-bazel/context/Dockerfile")
-                .is_file()
-        })
-        .ok_or_else(|| {
-            AppError::Environment("cannot locate bundled central template contexts".into())
-        })
+fn trusted_catalog() -> Result<tempfile::TempDir, AppError> {
+    const ASSETS: &[(&str, &[u8])] = &[
+        (
+            "templates/rust-bazel/context/Dockerfile",
+            include_bytes!("../../../templates/rust-bazel/context/Dockerfile"),
+        ),
+        (
+            "templates/components/base-tools/context/Dockerfile",
+            include_bytes!("../../../templates/components/base-tools/context/Dockerfile"),
+        ),
+        (
+            "templates/components/bazel/context/Dockerfile",
+            include_bytes!("../../../templates/components/bazel/context/Dockerfile"),
+        ),
+        (
+            "templates/components/rust/context/Dockerfile",
+            include_bytes!("../../../templates/components/rust/context/Dockerfile"),
+        ),
+    ];
+    let catalog = tempfile::Builder::new()
+        .prefix("repo-sandbox-catalog-")
+        .tempdir()
+        .map_err(environment("create trusted central catalog"))?;
+    for (relative, bytes) in ASSETS {
+        let path = catalog.path().join(relative);
+        fs::create_dir_all(path.parent().expect("catalog asset has parent"))
+            .map_err(environment("create trusted catalog asset directory"))?;
+        fs::write(path, bytes).map_err(environment("write trusted catalog asset"))?;
+    }
+    Ok(catalog)
 }
 
 fn is_remote(value: &str) -> bool {
@@ -1315,6 +1390,18 @@ fn environment(operation: &'static str) -> impl FnOnce(std::io::Error) -> AppErr
     move |error| AppError::Environment(format!("{operation}: {error}"))
 }
 
+fn bounded_error(
+    operation: &str,
+    error: impl std::fmt::Display,
+    cancellation: &DeadlineCancellation,
+) -> AppError {
+    if cancellation.expired() {
+        AppError::Environment(format!("workflow timeout during {operation}"))
+    } else {
+        AppError::Environment(format!("{operation}: {error}"))
+    }
+}
+
 struct ReportReservation {
     path: PathBuf,
 }
@@ -1479,6 +1566,7 @@ fn seed_registry(
     source: &ImageRef,
     repository: &RegistryRepository,
     identity: &str,
+    cancellation: &DeadlineCancellation,
 ) -> Result<ImageRef, AppError> {
     let staging = repository.tagged(
         &RegistryTag::new(format!("staging-{}", &identity[..24]))
@@ -1488,7 +1576,19 @@ fn seed_registry(
         vec!["image", "tag", source.as_str(), staging.as_str()],
         vec!["push", staging.as_str()],
     ] {
-        let output = docker_output(&args).map_err(AppError::Environment)?;
+        let invocation = ProcessInvocation {
+            program: "docker".into(),
+            args: args.into_iter().map(str::to_owned).collect(),
+            current_dir: None,
+        };
+        let output = SystemProcessExecutor
+            .execute(&invocation, cancellation)
+            .map_err(|error| bounded_error("registry seed push", error, cancellation))?;
+        if cancellation.expired() {
+            return Err(AppError::Environment(
+                "workflow timeout during registry seed push".into(),
+            ));
+        }
         if output.exit_code != Some(0) {
             return Err(AppError::Environment(format!(
                 "registry seed push failed: {}",
@@ -1689,6 +1789,58 @@ mod tests {
             None,
             "connection refused"
         )));
+    }
+
+    fn default_execution_plan() -> ExecutionPlan {
+        let config = repo_sandbox_core::config::Config::parse_yaml(
+            "version: 1\ntemplate:\n  id: rust-bazel\n  parameters:\n    platform: linux/amd64\n",
+        )
+        .unwrap();
+        let request = repo_sandbox_core::config::ExecutionRequest::resolve(
+            &config,
+            repo_sandbox_core::config::CliOverrides::default(),
+        );
+        let template = repo_sandbox_core::template::TemplateCatalog::builtin()
+            .unwrap()
+            .plan(&config.template, request.platform)
+            .unwrap();
+        ExecutionPlan::new(template, request)
+    }
+
+    #[test]
+    fn default_outputs_do_not_report_a_false_none_collision() {
+        let plan = default_execution_plan();
+        assert!(plan.request.report.is_none());
+        assert!(plan.request.oci_layout.is_none());
+        validate_outputs(&plan).unwrap();
+    }
+
+    #[test]
+    fn local_git_ref_is_rejected_instead_of_ignored() {
+        let mut plan = default_execution_plan();
+        plan.request.repository = Some(".".into());
+        plan.request.git_ref = Some("main".into());
+        assert!(
+            validate_outputs(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("only")
+        );
+    }
+
+    #[test]
+    fn trusted_catalog_is_embedded_and_not_loaded_from_the_target_repository() {
+        let catalog = trusted_catalog().unwrap();
+        let dockerfile = fs::read_to_string(
+            catalog
+                .path()
+                .join("templates/rust-bazel/context/Dockerfile"),
+        )
+        .unwrap();
+        assert_eq!(
+            dockerfile,
+            include_str!("../../../templates/rust-bazel/context/Dockerfile")
+        );
     }
 
     #[test]

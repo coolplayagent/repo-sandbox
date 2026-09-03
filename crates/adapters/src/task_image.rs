@@ -5,7 +5,7 @@ use crate::buildkit::{
     ProcessExecutor, Progress,
 };
 use crate::snapshot::MaterializedSnapshot;
-use repo_sandbox_core::build::{BuiltImage, ImageRef};
+use repo_sandbox_core::build::{BuiltImage, ImageDigest, ImageRef};
 use repo_sandbox_core::config::Platform;
 use repo_sandbox_core::snapshot::SnapshotError;
 use repo_sandbox_core::task_image::{
@@ -65,6 +65,10 @@ impl Default for TaskImageOptions {
 
 pub struct TaskImageRequest<'a> {
     pub environment: &'a BuiltImage,
+    /// Optional verified single-platform digest used to keep the primary task
+    /// manifest byte-identical while a multi-platform environment index is used
+    /// as the build source.
+    pub identity_environment_digest: Option<&'a ImageDigest>,
     pub materialized: &'a MaterializedSnapshot,
     pub template_id: &'a str,
     pub template_version: &'a str,
@@ -144,8 +148,11 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
         cancellation: &dyn Cancellation,
     ) -> Result<BuiltTaskImage, TaskImageError> {
         validate_request(&request)?;
+        let identity_environment_digest = request
+            .identity_environment_digest
+            .unwrap_or(&request.environment.digest);
         let identity = task_image_identity(&TaskImageInputs {
-            environment_digest: &request.environment.digest,
+            environment_digest: identity_environment_digest,
             snapshot: &request.materialized.snapshot,
             template_id: request.template_id,
             template_version: request.template_version,
@@ -346,7 +353,10 @@ fn labels(
         ),
         (
             "TASK_ENVIRONMENT_DIGEST",
-            request.environment.digest.to_string(),
+            request
+                .identity_environment_digest
+                .unwrap_or(&request.environment.digest)
+                .to_string(),
         ),
         ("TASK_IDENTITY", identity.oci_value()),
         ("TASK_REPOSITORY_ID", request.repository_id.to_owned()),
@@ -530,6 +540,7 @@ mod tests {
     ) -> TaskImageRequest<'a> {
         TaskImageRequest {
             environment,
+            identity_environment_digest: None,
             materialized,
             template_id: "rust-bazel",
             template_version: "1.0.0",
@@ -726,6 +737,30 @@ mod tests {
             .unwrap();
         assert_ne!(first.identity, second.identity);
         assert_ne!(first.image.image, second.image.image);
+    }
+
+    #[test]
+    fn multi_platform_request_can_preserve_verified_primary_identity() {
+        let (_repository, materialized) = materialize(&[("source.rs", "safe")]);
+        let verified_environment = environment();
+        let mut environment_index = verified_environment.clone();
+        environment_index.digest = ImageDigest::new(format!("sha256:{}", "e".repeat(64))).unwrap();
+        let config = config();
+        let executor = InspectingExecutor::new();
+        let verified = TaskImageBuilder::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(
+                request(&verified_environment, &materialized, &config),
+                &NeverCancelled,
+            )
+            .unwrap();
+        let mut multi = request(&environment_index, &materialized, &config);
+        multi.identity_environment_digest = Some(&verified_environment.digest);
+        let multi = TaskImageBuilder::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(multi, &NeverCancelled)
+            .unwrap();
+        assert_eq!(multi.identity, verified.identity);
     }
 
     /// Optional end-to-end check. It validates labels, history, exported files, and workdir.

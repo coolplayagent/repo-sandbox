@@ -398,6 +398,12 @@ fn prepare_execution(mut arguments: RuntimeArgs) -> Result<ExecutionPlan, AppErr
             AppError::Configuration(format!("remote .repo-sandbox.yaml: {error}"))
         })?
     } else {
+        if arguments.git_ref.is_some() {
+            return Err(AppError::Configuration(
+                "--git-ref is supported only with a remote repository URL".into(),
+            ));
+        }
+        repo_sandbox_adapters::workflow::external_git_authentication("", &remote_auth)?;
         read_repository_config(arguments.repository.as_deref())?
     };
     execution_plan_from_source(&source, arguments)
