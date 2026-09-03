@@ -70,15 +70,69 @@ assert_oci_manifest_platform() {
   return 1
 }
 
+assert_oci_blob_digests() {
+  local layout=$1 descriptors digest size blob actual_digest actual_size
+  descriptors=$(awk '
+    /"digest"[[:space:]]*:/ {
+      digest = $0
+      sub(/^.*"digest"[[:space:]]*:[[:space:]]*"/, "", digest)
+      sub(/".*$/, "", digest)
+    }
+    digest != "" && /"size"[[:space:]]*:/ {
+      size = $0
+      sub(/^.*"size"[[:space:]]*:[[:space:]]*/, "", size)
+      sub(/[^0-9].*$/, "", size)
+      print digest, size
+      digest = ""
+    }
+  ' "$layout/index.json")
+  [[ -n $descriptors ]]
+  while read -r digest size; do
+    [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]
+    [[ $size =~ ^[0-9]+$ ]]
+    blob="$layout/blobs/sha256/${digest#sha256:}"
+    [[ -f $blob ]]
+    actual_digest=$(sha256sum "$blob" | awk '{print "sha256:" $1}')
+    actual_size=$(wc -c <"$blob" | tr -d '[:space:]')
+    [[ $actual_digest == "$digest" ]]
+    [[ $actual_size == "$size" ]]
+  done <<<"$descriptors"
+  while IFS= read -r blob; do
+    [[ $(sha256sum "$blob" | awk '{print $1}') == $(basename "$blob") ]]
+  done < <(find "$layout/blobs/sha256" -type f -print)
+}
+
+assert_report_phase() {
+  local report=$1 phase=$2 exit_code=$3
+  grep -Fq "\"phase\": \"$phase\"" "$report"
+  grep -Fq "\"exit_code\": $exit_code" "$report"
+}
+
 case "$scenario" in
-  cli-build-success|cli-verify-success|cli-build-failure|cli-test-failure|cli-clean-owned-only|cli-interrupt-cleanup|cli-multi-platform-oci)
+  cli-build-success|cli-verify-success|cli-build-failure|cli-test-failure|cli-clean-owned-only|cli-interrupt-cleanup|cli-multi-platform-oci|cli-registry-publish)
     fixture=$(mktemp -d)
+    registry_container=
     cleanup_cli_fixture() {
       [[ -z ${foreign:-} ]] || docker rm --force "$foreign" >/dev/null 2>&1 || true
+      [[ -z ${registry_container:-} ]] || docker rm --force "$registry_container" >/dev/null 2>&1 || true
       rm -rf -- "$fixture"
     }
     trap cleanup_cli_fixture EXIT
     cp "$root/.repo-sandbox.yaml.example" "$fixture/.repo-sandbox.yaml"
+    if [[ $scenario == cli-registry-publish ]]; then
+      registry_container=$(docker run --detach --publish 127.0.0.1::5000 registry:2)
+      registry_port=$(docker port "$registry_container" 5000/tcp | head -n 1)
+      registry_port=${registry_port##*:}
+      [[ $registry_port =~ ^[0-9]+$ ]]
+      for _ in $(seq 1 60); do
+        curl --fail --silent "http://127.0.0.1:$registry_port/v2/" >/dev/null && break
+        sleep 0.25
+      done
+      curl --fail --silent "http://127.0.0.1:$registry_port/v2/" >/dev/null
+      registry_repository="127.0.0.1:$registry_port/repo-sandbox/e2e"
+      sed -i "s|bazelisk_version: \"1.27.0\"|bazelisk_version: \"1.27.0\"\n    registry_repository: \"$registry_repository\"|" \
+        "$fixture/.repo-sandbox.yaml"
+    fi
     printf '.repo-sandbox/\nreport*.json\n.*.repo-sandbox-reservation\n' >"$fixture/.gitignore"
     printf 'module(name = "repo_sandbox_e2e_fixture")\n' >"$fixture/MODULE.bazel"
     git -C "$fixture" init -q
@@ -295,9 +349,49 @@ EOF
         [[ $(grep -c '"platform": {' "$layout/index.json") -eq 2 ]]
         assert_oci_manifest_platform "$layout" amd64
         assert_oci_manifest_platform "$layout" arm64
+        assert_oci_blob_digests "$layout"
         grep -Eq '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
           "$layout/index.json"
         echo 'multi_platform=linux/amd64,linux/arm64 output=oci-layout runner=verified'
+        ;;
+      cli-registry-publish)
+        "$cli" verify --repository "$fixture" --report-path "$report" --push
+        assert_report_common "$report" removed
+        assert_step "$report" build bazel-build succeeded
+        assert_step "$report" test bazel-test succeeded
+        digest=$(sed -nE 's/^[[:space:]]*"digest": "(sha256:[0-9a-f]{64})",?$/\1/p' \
+          "$report" | head -n 1)
+        [[ -n $digest ]]
+        immutable="$registry_repository:sha256-${digest#sha256:}"
+        alias="$registry_repository:verified"
+        grep -Fq "\"immutable\": \"$immutable\"" "$report"
+        grep -Fq "\"$alias\"" "$report"
+        docker buildx imagetools inspect "$immutable" --raw >"$result_directory/immutable.json"
+        docker buildx imagetools inspect "$alias" --raw >"$result_directory/alias.json"
+        [[ $(sha256sum "$result_directory/immutable.json" | awk '{print $1}') == \
+          $(sha256sum "$result_directory/alias.json" | awk '{print $1}') ]]
+        grep -Fq '"schemaVersion":2' "$result_directory/immutable.json"
+        grep -Eq '"mediaType":"application/vnd\.(oci\.image\.manifest|docker\.distribution\.manifest)\.' \
+          "$result_directory/immutable.json"
+        docker pull --platform linux/amd64 "$immutable" >/dev/null
+        docker image inspect --format '{{join .RepoDigests "\n"}}' "$immutable" | \
+          grep -Fq "$registry_repository@$digest"
+        tags_before=$(curl --fail --silent \
+          "http://127.0.0.1:$registry_port/v2/repo-sandbox/e2e/tags/list")
+
+        printf 'int main() { return 23; }\n' >"$fixture/test.cc"
+        git -C "$fixture" add test.cc
+        git -C "$fixture" commit -qm failing-test
+        failure_report="$fixture/report-push-failure.json"
+        run_expect_status 11 "$cli" verify --repository "$fixture" \
+          --report-path "$failure_report" --push
+        assert_report_common "$failure_report" removed
+        assert_step "$failure_report" test bazel-test command_failed
+        ! grep -Fq '"published"' "$failure_report"
+        tags_after=$(curl --fail --silent \
+          "http://127.0.0.1:$registry_port/v2/repo-sandbox/e2e/tags/list")
+        [[ $tags_after == "$tags_before" ]]
+        echo 'registry_cli=published immutable=verified alias=verified pullback=verified failed_verify_publish=none'
         ;;
     esac
     echo "$scenario=passed"
@@ -372,6 +466,60 @@ EOF
     ! grep -R -Fq -- "$credential_marker" "$remote_state"
     echo "private_remote=${scenario#cli-private-} credential_scan=passed"
     printf 'passed\n' >"$result_directory/$scenario.passed"
+    ;;
+  cli-profile-contracts)
+    profile_root=$REPO_SANDBOX_E2E_PROFILE_FIXTURE_ROOT
+    profile_secret=$REPO_SANDBOX_E2E_PROFILE_SECRET
+    cargo build -p repo-sandbox-cli
+    cli="$root/target/debug/repo-sandbox"
+    for profile in timeout memory temporary-storage architecture; do
+      repository="$profile_root/$profile"
+      report="$result_directory/profile-$profile.json"
+      case "$profile" in
+        timeout)
+          expected_exit=3; expected_status=timed_out; expected_phase=runner
+          expected_step_status=timed_out
+          ;;
+        memory)
+          expected_exit=3; expected_status=resource_exceeded; expected_phase=test
+          expected_step_status=resource_exceeded
+          ;;
+        temporary-storage)
+          expected_exit=3; expected_status=resource_exceeded; expected_phase=test
+          expected_step_status=resource_exceeded
+          ;;
+        architecture)
+          expected_exit=11; expected_status=command_failed; expected_phase=test
+          expected_step_status=command_failed
+          ;;
+      esac
+      run_expect_status "$expected_exit" "$cli" verify --repository "$repository" \
+        --report-path "$report"
+      assert_report_common "$report" removed
+      grep -Fq "\"status\": \"$expected_status\"" "$report"
+      assert_report_phase "$report" "$expected_phase" "$expected_exit"
+      assert_step "$report" test bazel-test "$expected_step_status"
+      if [[ $profile == memory ]]; then
+        grep -Fq '"limit": "memory"' "$report"
+      elif [[ $profile == temporary-storage ]]; then
+        grep -Fq '"limit": "temporary_storage"' "$report"
+      fi
+    done
+
+    artifact_repository="$profile_root/secret-artifact"
+    artifact_report="$result_directory/profile-secret-artifact.json"
+    REPO_SANDBOX_E2E_PROFILE_SECRET="$profile_secret" \
+      "$cli" verify --repository "$artifact_repository" --report-path "$artifact_report"
+    assert_report_common "$artifact_report" removed
+    assert_report_phase "$artifact_report" complete 0
+    artifact=$(find "$artifact_repository/.repo-sandbox/artifacts" -type f \
+      -name profile-artifact.txt -print -quit)
+    [[ -n $artifact ]]
+    grep -Fxq 'artifact-ok' "$artifact"
+    grep -Fq 'profile-artifact.txt' "$artifact_report"
+    ! grep -R -Fq -- "$profile_secret" "$artifact_repository/.repo-sandbox" "$artifact_report"
+    echo 'profile_cli=timeout,memory,temporary-storage,architecture,secret-artifact status=verified'
+    printf 'passed\n' >"$result_directory/cli-profile-contracts.passed"
     ;;
   adapters)
     run_test 'task_image::tests::docker_task_image_contains_only_snapshot_source'

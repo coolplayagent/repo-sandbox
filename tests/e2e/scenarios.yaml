@@ -69,6 +69,18 @@ scenarios:
       log_contains: ["multi_platform=linux/amd64,linux/arm64 output=oci-layout runner=verified", "cli-multi-platform-oci=passed"]
       artifacts: [cli-multi-platform-oci.passed]
 
+  - id: cli-registry-publish
+    description: Publish a verified CLI result to a temporary local registry, verify immutable and alias manifests, pull it back, then prove a failed verify publishes nothing.
+    tier: required
+    targets: [docker]
+    covers: [cli, verify, push, local_registry, immutable_tag, alias, manifest, pullback, failed_verify_no_publish]
+    timeout_seconds: 3300
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-registry-publish, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["registry_cli=published immutable=verified alias=verified pullback=verified failed_verify_publish=none", "cli-registry-publish=passed"]
+      artifacts: [cli-registry-publish.passed, immutable.json, alias.json]
+
   - id: cli-public-file-remote
     description: Exercise the public remote CLI path against an offline local file bare repository pinned to an immutable commit.
     tier: required
@@ -109,6 +121,21 @@ scenarios:
       exit_code: 0
       log_contains: ["private_remote=ssh-remote credential_scan=passed"]
       artifacts: [cli-private-ssh-remote.passed]
+
+  - id: cli-profile-contracts
+    description: Run operator-provided central-profile fixtures for timeout, resource, architecture, secret injection and artifact export once those profiles are installed in the CLI catalog.
+    tier: opt_in
+    targets: [docker]
+    covers: [cli, verify, timeout, memory_limit, temporary_storage_limit, architecture_mismatch, secret_environment, artifact_export]
+    required_env: [REPO_SANDBOX_E2E_PROFILE_FIXTURE_ROOT, REPO_SANDBOX_E2E_PROFILE_SECRET]
+    redact_env: [REPO_SANDBOX_E2E_PROFILE_SECRET]
+    timeout_seconds: 3300
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-profile-contracts, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["profile_cli=timeout,memory,temporary-storage,architecture,secret-artifact status=verified"]
+      log_not_contains: ["${ENV:REPO_SANDBOX_E2E_PROFILE_SECRET}"]
+      artifacts: [cli-profile-contracts.passed]
 
   - id: public-git-snapshot
     description: Materialize a public remote through a task-owned localhost unauthenticated HTTP service.
