@@ -339,13 +339,7 @@ impl WorkflowPort for SystemWorkflow {
                     kind: ResourceKind::Container,
                     identifier: container.clone(),
                     owner: task_id.clone(),
-                    state: if report.cleanup
-                        == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure
-                    {
-                        ResourceState::Retained
-                    } else {
-                        ResourceState::Cleaned
-                    },
+                    state: container_resource_state(report.cleanup),
                 }])
             {
                 bookkeeping_errors.push(error.to_string());
@@ -656,7 +650,9 @@ fn execute_clean(
         skipped: plan.refused.clone(),
         ..CleanResult::default()
     };
-    let _lease = if let Some(path) = &plan.lease_path {
+    let _lease = if dry_run {
+        None
+    } else if let Some(path) = &plan.lease_path {
         match WorkflowLease::exclusive(path)? {
             Some(lease) => Some(lease),
             None => {
@@ -912,6 +908,15 @@ fn outputs_allowed(
     *status == RunStatus::Succeeded
         && cleanup != repo_sandbox_core::runner::CleanupResult::Failed
         && cleanup_error.is_none()
+}
+
+fn container_resource_state(cleanup: repo_sandbox_core::runner::CleanupResult) -> ResourceState {
+    match cleanup {
+        repo_sandbox_core::runner::CleanupResult::Removed => ResourceState::Cleaned,
+        repo_sandbox_core::runner::CleanupResult::RetainedOnFailure => ResourceState::Retained,
+        repo_sandbox_core::runner::CleanupResult::Failed
+        | repo_sandbox_core::runner::CleanupResult::NotNeeded => ResourceState::Registered,
+    }
 }
 
 fn validate_secret_value(name: &str, value: &[u8]) -> Result<(), AppError> {
@@ -3076,9 +3081,27 @@ mod tests {
             lease_path: Some(second_state.join(".workflow.lock")),
             ..CleanPlan::default()
         };
-        let blocked = CleanPort::execute(&SystemWorkflow, &blocked, true).unwrap();
+        let blocked = CleanPort::execute(&SystemWorkflow, &blocked, false).unwrap();
         assert!(blocked.skipped[0].contains("active workflow"));
         let independent = CleanPort::execute(&SystemWorkflow, &independent, true).unwrap();
         assert!(independent.skipped[0].contains("dry-run"));
+        assert!(!second_state.exists());
+    }
+
+    #[test]
+    fn failed_container_cleanup_remains_registered_for_retry() {
+        use repo_sandbox_core::runner::CleanupResult;
+        assert_eq!(
+            container_resource_state(CleanupResult::Failed),
+            ResourceState::Registered
+        );
+        assert_eq!(
+            container_resource_state(CleanupResult::Removed),
+            ResourceState::Cleaned
+        );
+        assert_eq!(
+            container_resource_state(CleanupResult::RetainedOnFailure),
+            ResourceState::Retained
+        );
     }
 }
