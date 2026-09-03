@@ -24,7 +24,7 @@ use repo_sandbox_core::runner::{
     ConfigSummary, RunResources, RunSpec, RunStatus, SecretMount, StepPhase, write_report_json,
 };
 use repo_sandbox_core::snapshot::{
-    CleanupPolicy, ExternalSecret, GitAuthentication, SnapshotOptions, SourceSpec,
+    CleanupPolicy, ExternalSecret, GitAuthentication, SnapshotOptions, SnapshotOrigin, SourceSpec,
 };
 use repo_sandbox_core::task_image::ConfigurationDigest;
 use serde_json;
@@ -73,9 +73,9 @@ impl WorkflowPort for SystemWorkflow {
                 .as_deref()
                 .map(OutputReservation::oci)
                 .transpose()?;
-            let state_guard = prepare_state_layout(&repository, &state)?;
+            let (state_guard, _workflow_lease, journal) =
+                prepare_leased_workflow_state(&repository, &state, &task_id)?;
             bound_state = Some(state_guard.clone());
-            let journal = ManifestJournal::create(&state, &task_id, state_guard.clone())?;
             let registry = plan.template.execution.registry.as_ref();
             if plan.request.push && registry.is_none() {
                 return Err(AppError::Configuration(
@@ -83,8 +83,6 @@ impl WorkflowPort for SystemWorkflow {
                 ));
             }
             preflight(plan, &repository, &cancellation)?;
-            let _workflow_lease =
-                WorkflowLease::shared(&state_guard.bound_path(&repository.join(".repo-sandbox"))?)?;
             let cache = state.join("cache");
             let cache_io = state_guard.bound_path(&cache)?;
             write_state_file(&cache_io.join(OWNER_MARKER), repository_id.as_bytes())?;
@@ -118,6 +116,7 @@ impl WorkflowPort for SystemWorkflow {
                     &cancellation,
                 )
                 .map_err(|error| AppError::Environment(format!("snapshot: {error}")))?;
+            preserve_requested_ref(&mut materialized.snapshot.origin, &plan.request);
             let trusted_catalog = trusted_catalog()?;
             let catalog_root = trusted_catalog.path().to_path_buf();
             let cache_import = cache_io.join("environment");
@@ -377,6 +376,7 @@ impl WorkflowPort for SystemWorkflow {
                 )?;
             }
 
+            let mut publication_cleanup_error = None;
             let published = if plan.request.push && output_eligible {
                 let policy = registry.expect("checked registry");
                 let repository =
@@ -422,8 +422,16 @@ impl WorkflowPort for SystemWorkflow {
                         &cancellation,
                     )
                     .map_err(|error| bounded_error("publish", error, &cancellation))?;
+                // Publication is an irreversible remote fact. Persist it in the
+                // in-memory failure-report snapshot before attempting local tag
+                // cleanup, which is a separate best-effort cleanup phase.
+                report.published = Some(publication.clone());
+                completed_report = Some(report.clone());
                 if let Some(seed) = local_seed {
-                    remove_local_registry_tag(&seed)?;
+                    publication_cleanup_error = apply_publication_cleanup(
+                        &mut report,
+                        remove_local_registry_tag(&seed, &cancellation),
+                    );
                 }
                 Some(publication)
             } else {
@@ -444,6 +452,9 @@ impl WorkflowPort for SystemWorkflow {
                 report: report.clone(),
                 published,
             };
+            if let Some(error) = publication_cleanup_error {
+                return Err(error);
+            }
             match &report.status {
                 RunStatus::Succeeded
                     if report.cleanup != repo_sandbox_core::runner::CleanupResult::Failed =>
@@ -674,15 +685,33 @@ fn execute_clean(
     dry_run: bool,
     cancellation: &dyn Cancellation,
 ) -> Result<CleanResult, AppError> {
+    execute_clean_with_hook(plan, dry_run, cancellation, || {})
+}
+
+fn execute_clean_with_hook(
+    plan: &CleanPlan,
+    dry_run: bool,
+    cancellation: &dyn Cancellation,
+    after_revision: impl FnOnce(),
+) -> Result<CleanResult, AppError> {
     let mut result = CleanResult {
         dry_run,
         skipped: plan.refused.clone(),
         ..CleanResult::default()
     };
+    let bound_journals = if dry_run {
+        None
+    } else {
+        bind_clean_journals(plan)?
+    };
     let _lease = if dry_run {
         None
     } else if let Some(path) = &plan.lease_path {
-        match WorkflowLease::exclusive(path)? {
+        let lease_path = bound_journals
+            .as_ref()
+            .map(|bound| bound.lease.as_path())
+            .unwrap_or(path);
+        match WorkflowLease::exclusive(lease_path)? {
             Some(lease) => Some(lease),
             None => {
                 result
@@ -699,8 +728,15 @@ fn execute_clean(
     } else {
         None
     };
+    if let Some(bound) = &bound_journals {
+        bound.guard.ensure()?;
+    }
     if !dry_run {
         for (root, expected) in &plan.journal_revisions {
+            let root = bound_journals
+                .as_ref()
+                .and_then(|bound| bound.roots.get(root))
+                .unwrap_or(root);
             let mut entries = fs::read_dir(root)
                 .map_err(environment("revalidate task manifests"))?
                 .map(|entry| entry.map(|entry| entry.path()))
@@ -715,6 +751,7 @@ fn execute_clean(
             }
         }
     }
+    after_revision();
     for candidate in &plan.candidates {
         if cancellation.is_cancelled() {
             result.unfinished.push(format!(
@@ -733,11 +770,23 @@ fn execute_clean(
         match remove_candidate(candidate, cancellation) {
             Ok(RemovalOutcome::Removed) => {
                 result.succeeded.push(candidate.clone());
-                record_cleaned_state(plan, candidate, "removed", &mut result);
+                record_cleaned_state(
+                    plan,
+                    bound_journals.as_ref(),
+                    candidate,
+                    "removed",
+                    &mut result,
+                );
             }
             Ok(RemovalOutcome::Absent) => {
                 result.absent.push(candidate.identifier.clone());
-                record_cleaned_state(plan, candidate, "absent", &mut result);
+                record_cleaned_state(
+                    plan,
+                    bound_journals.as_ref(),
+                    candidate,
+                    "absent",
+                    &mut result,
+                );
             }
             Ok(RemovalOutcome::Referenced) => result
                 .unfinished
@@ -752,6 +801,7 @@ fn execute_clean(
 
 fn record_cleaned_state(
     plan: &CleanPlan,
+    bound_journals: Option<&CleanBoundJournals>,
     candidate: &CleanCandidate,
     disposition: &str,
     result: &mut CleanResult,
@@ -760,14 +810,68 @@ fn record_cleaned_state(
         .journal_roots
         .get(&candidate.repository_id)
         .or(plan.manifest_root.as_ref());
-    if let Some(root) = root
-        && let Err(error) = append_cleanup_state(root, candidate)
-    {
-        result.failed.push(format!(
-            "{}: {disposition} but failed to record cleanup state: {error}",
-            candidate.identifier
-        ));
+    if let Some(root) = root {
+        let append = (|| {
+            let root = if let Some(bound) = bound_journals {
+                bound.guard.ensure()?;
+                bound.roots.get(root).ok_or_else(|| {
+                    AppError::Environment("cleanup journal root is not bound".into())
+                })?
+            } else {
+                root
+            };
+            append_cleanup_state(root, candidate)
+        })();
+        if let Err(error) = append {
+            result.failed.push(format!(
+                "{}: {disposition} but failed to record cleanup state: {error}",
+                candidate.identifier
+            ));
+        }
     }
+}
+
+struct CleanBoundJournals {
+    guard: StateLayoutGuard,
+    lease: PathBuf,
+    roots: std::collections::BTreeMap<PathBuf, PathBuf>,
+}
+
+fn bind_clean_journals(plan: &CleanPlan) -> Result<Option<CleanBoundJournals>, AppError> {
+    let Some(lease) = &plan.lease_path else {
+        return Ok(None);
+    };
+    if plan.journal_roots.is_empty() {
+        return Ok(None);
+    }
+    let state = lease.parent().ok_or_else(|| {
+        AppError::Environment("cleanup lease has no workflow state parent".into())
+    })?;
+    let repository = state
+        .parent()
+        .ok_or_else(|| AppError::Environment("workflow state has no repository parent".into()))?;
+    let mut components = vec![state.to_path_buf()];
+    for root in plan.journal_roots.values() {
+        let parent = root
+            .parent()
+            .ok_or_else(|| AppError::Environment("cleanup journal has no state parent".into()))?;
+        components.push(parent.to_path_buf());
+        components.push(root.clone());
+    }
+    components.sort();
+    components.dedup();
+    let guard = StateLayoutGuard::capture(repository, &components)?;
+    let roots = plan
+        .journal_roots
+        .values()
+        .map(|root| Ok((root.clone(), guard.bound_path(root)?)))
+        .collect::<Result<_, AppError>>()?;
+    let lease = guard.bound_path(lease)?;
+    Ok(Some(CleanBoundJournals {
+        guard,
+        lease,
+        roots,
+    }))
 }
 
 fn journal_revision(entries: &[PathBuf]) -> Vec<String> {
@@ -821,6 +925,18 @@ impl WorkflowLease {
                 "lock clean execution lease: {error}"
             ))),
         }
+    }
+}
+
+fn preserve_requested_ref(
+    origin: &mut SnapshotOrigin,
+    request: &repo_sandbox_core::config::ExecutionRequest,
+) {
+    if let SnapshotOrigin::RemoteGit { requested_ref, .. } = origin {
+        *requested_ref = request
+            .requested_git_ref
+            .clone()
+            .unwrap_or_else(|| "HEAD".into());
     }
 }
 
@@ -907,10 +1023,10 @@ fn normalized_output_path(path: &Path) -> Result<PathBuf, AppError> {
 }
 
 fn validate_state_outputs(state: &Path, report: &Path, oci: Option<&Path>) -> Result<(), AppError> {
-    let state = normalized_output_path(state)?;
-    let report = normalized_output_path(report)?;
+    let state = resolved_future_path(state)?;
+    let report = resolved_future_path(report)?;
     if let Some(oci) = oci {
-        let oci = normalized_output_path(oci)?;
+        let oci = resolved_future_path(oci)?;
         if oci == state || oci.starts_with(&state) || state.starts_with(&oci) {
             return Err(AppError::Configuration(
                 "--oci-layout must not overlap workflow state".into(),
@@ -931,6 +1047,44 @@ fn validate_state_outputs(state: &Path, report: &Path, oci: Option<&Path>) -> Re
         }
     }
     Ok(())
+}
+
+/// Resolve the identity of the deepest existing ancestor and then append the
+/// still-missing lexical suffix. This detects aliases through symlinks and
+/// junctions without requiring the requested output itself to exist.
+fn resolved_future_path(path: &Path) -> Result<PathBuf, AppError> {
+    let path = normalized_output_path(path)?;
+    let mut ancestor = path.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let mut resolved = ancestor
+                    .canonicalize()
+                    .map_err(environment("resolve output ancestor"))?;
+                for component in suffix.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().ok_or_else(|| {
+                    AppError::Configuration(format!(
+                        "output path has no existing ancestor: {}",
+                        path.display()
+                    ))
+                })?;
+                suffix.push(name.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    AppError::Configuration(format!(
+                        "output path escapes its filesystem root: {}",
+                        path.display()
+                    ))
+                })?;
+            }
+            Err(error) => return Err(environment("inspect output ancestor")(error)),
+        }
+    }
 }
 
 fn annotate_report(report: &mut repo_sandbox_core::runner::RunReport) {
@@ -2029,16 +2183,31 @@ struct StateIdentity {
 
 impl StateLayoutGuard {
     fn capture(repository: &Path, components: &[PathBuf]) -> Result<Self, AppError> {
+        Self::capture_with_hook(repository, components, |_| {})
+    }
+
+    fn capture_with_hook(
+        repository: &Path,
+        components: &[PathBuf],
+        mut after_open: impl FnMut(&Path),
+    ) -> Result<Self, AppError> {
         Ok(Self {
             repository: repository.to_path_buf(),
             components: std::sync::Arc::new(
                 components
                     .iter()
                     .map(|path| {
+                        // Open the directory itself with no-follow semantics first.
+                        // Identity and boundary checks are derived from that fixed
+                        // handle, never from a pathname observed before opening it.
+                        let handle = bind_state_directory(path)?;
+                        let identity = state_identity_from_handle(&handle)?;
+                        after_open(path);
+                        validate_bound_state_component(repository, path, identity)?;
                         Ok(BoundStateComponent {
                             path: path.clone(),
-                            identity: state_identity(path)?,
-                            _handle: bind_state_directory(path)?,
+                            identity,
+                            _handle: handle,
                         })
                     })
                     .collect::<Result<_, AppError>>()?,
@@ -2105,7 +2274,20 @@ fn bound_directory_path(handle: &fs::File) -> Result<PathBuf, AppError> {
 
 #[cfg(unix)]
 fn bind_state_directory(path: &Path) -> Result<fs::File, AppError> {
-    fs::File::open(path).map_err(environment("open bound workflow state directory"))
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const O_DIRECTORY: i32 = 0x0001_0000;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const O_NOFOLLOW: i32 = 0x0002_0000;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const O_DIRECTORY: i32 = 0x0010_0000;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const O_NOFOLLOW: i32 = 0x0000_0100;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+        .open(path)
+        .map_err(environment("open bound workflow state directory"))
 }
 
 #[cfg(windows)]
@@ -2135,6 +2317,23 @@ fn state_identity(path: &Path) -> Result<StateIdentity, AppError> {
     })
 }
 
+#[cfg(unix)]
+fn state_identity_from_handle(handle: &fs::File) -> Result<StateIdentity, AppError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = handle
+        .metadata()
+        .map_err(environment("inspect bound workflow state directory"))?;
+    if !metadata.is_dir() {
+        return Err(AppError::Environment(
+            "bound workflow state component is not a directory".into(),
+        ));
+    }
+    Ok(StateIdentity {
+        first: metadata.dev(),
+        second: metadata.ino(),
+    })
+}
+
 #[cfg(windows)]
 fn state_identity(path: &Path) -> Result<StateIdentity, AppError> {
     use std::os::windows::fs::MetadataExt;
@@ -2145,6 +2344,38 @@ fn state_identity(path: &Path) -> Result<StateIdentity, AppError> {
         first: metadata.creation_time(),
         second: u64::from(metadata.file_attributes()),
     })
+}
+
+#[cfg(windows)]
+fn state_identity_from_handle(handle: &fs::File) -> Result<StateIdentity, AppError> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = handle
+        .metadata()
+        .map_err(environment("inspect bound workflow state directory"))?;
+    if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(AppError::Environment(
+            "bound workflow state component must be a real directory".into(),
+        ));
+    }
+    Ok(StateIdentity {
+        first: metadata.creation_time(),
+        second: u64::from(metadata.file_attributes()),
+    })
+}
+
+fn validate_bound_state_component(
+    repository: &Path,
+    path: &Path,
+    handle_identity: StateIdentity,
+) -> Result<(), AppError> {
+    validate_state_component(repository, path)?;
+    if state_identity(path)? != handle_identity {
+        return Err(AppError::Environment(format!(
+            "workflow state component changed while it was being bound: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn state_component_paths(state: &Path, base: &Path) -> Vec<PathBuf> {
@@ -2160,6 +2391,19 @@ fn state_component_paths(state: &Path, base: &Path) -> Vec<PathBuf> {
 
 fn prepare_state_layout(repository: &Path, state: &Path) -> Result<StateLayoutGuard, AppError> {
     prepare_state_layout_with_hook(repository, state, || {})
+}
+
+fn prepare_leased_workflow_state(
+    repository: &Path,
+    state: &Path,
+    task_id: &str,
+) -> Result<(StateLayoutGuard, WorkflowLease, ManifestJournal), AppError> {
+    let guard = prepare_state_layout(repository, state)?;
+    // Acquire the shared lease before the first journal write or any potentially
+    // long preflight probe, closing cleanup's state-initialization window.
+    let lease = WorkflowLease::shared(&guard.bound_path(&repository.join(".repo-sandbox"))?)?;
+    let journal = ManifestJournal::create(state, task_id, guard.clone())?;
+    Ok((guard, lease, journal))
 }
 
 fn prepare_state_layout_with_hook(
@@ -2536,13 +2780,31 @@ fn registry_content_ref(
     repository.tagged(&RegistryTag::for_digest(digest))
 }
 
-fn remove_local_registry_tag(reference: &ImageRef) -> Result<(), AppError> {
-    remove_local_registry_tag_with(&SystemProcessExecutor, reference)
+fn remove_local_registry_tag(
+    reference: &ImageRef,
+    cancellation: &dyn Cancellation,
+) -> Result<(), AppError> {
+    remove_local_registry_tag_with(&SystemProcessExecutor, reference, cancellation)
+}
+
+fn apply_publication_cleanup(
+    report: &mut repo_sandbox_core::runner::RunReport,
+    cleanup: Result<(), AppError>,
+) -> Option<AppError> {
+    cleanup.err().inspect(|error| {
+        let message = error.to_string();
+        report.cleanup = repo_sandbox_core::runner::CleanupResult::Failed;
+        report.cleanup_error = Some(match report.cleanup_error.take() {
+            Some(existing) => format!("{existing}; {message}"),
+            None => message,
+        });
+    })
 }
 
 fn remove_local_registry_tag_with(
     executor: &impl ProcessExecutor,
     reference: &ImageRef,
+    cancellation: &dyn Cancellation,
 ) -> Result<(), AppError> {
     let invocation = ProcessInvocation {
         program: "docker".into(),
@@ -2550,9 +2812,12 @@ fn remove_local_registry_tag_with(
         current_dir: None,
     };
     let output = executor
-        .execute(&invocation, &crate::buildkit::NeverCancelled)
+        .execute(&invocation, cancellation)
         .map_err(environment("remove local registry content tag"))?;
     if output.exit_code == Some(0) {
+        Ok(())
+    } else if docker_object_absent(&output.stderr) {
+        // A concurrent prune/untag has already achieved the cleanup outcome.
         Ok(())
     } else {
         Err(AppError::Environment(format!(
@@ -2748,6 +3013,18 @@ mod tests {
     struct InspectExecutor {
         calls: std::sync::Mutex<Vec<ProcessInvocation>>,
         image_id: String,
+    }
+
+    struct FixedExecutor(crate::buildkit::ProcessOutput);
+
+    impl ProcessExecutor for FixedExecutor {
+        fn execute(
+            &self,
+            _invocation: &ProcessInvocation,
+            _cancellation: &dyn Cancellation,
+        ) -> std::io::Result<crate::buildkit::ProcessOutput> {
+            Ok(self.0.clone())
+        }
     }
 
     impl ProcessExecutor for InspectExecutor {
@@ -3120,6 +3397,75 @@ mod tests {
         fs::remove_file(cache).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn state_capture_detects_replacement_after_safe_open() {
+        use std::os::unix::fs::symlink;
+        let repository = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, "unchanged").unwrap();
+        let state = repository.path().join(".repo-sandbox");
+        fs::create_dir(&state).unwrap();
+        let saved = repository.path().join("state-saved");
+        let result = StateLayoutGuard::capture_with_hook(
+            repository.path(),
+            std::slice::from_ref(&state),
+            |_| {
+                fs::rename(&state, &saved).unwrap();
+                symlink(outside.path(), &state).unwrap();
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unchanged");
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+        fs::remove_file(state).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_journal_swap_after_revision_fails_closed() {
+        use std::os::unix::fs::symlink;
+        let repository = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, "unchanged").unwrap();
+        let state = repository.path().join(".repo-sandbox");
+        let guard = prepare_state_layout(repository.path(), &state).unwrap();
+        drop(guard);
+        let tasks = state.join("tasks");
+        let missing = repository.path().join("missing-source");
+        let candidate = CleanCandidate {
+            task_id: "task".into(),
+            repository_id: "repository".into(),
+            kind: ResourceKind::Source,
+            identifier: missing.display().to_string(),
+            owner: "task".into(),
+            state: ResourceState::Registered,
+        };
+        let plan = CleanPlan {
+            candidates: vec![candidate],
+            manifest_root: Some(tasks.clone()),
+            journal_roots: [("repository".into(), tasks.clone())].into_iter().collect(),
+            lease_path: Some(state.join(".workflow.lock")),
+            journal_revisions: [(tasks.clone(), Vec::new())].into_iter().collect(),
+            refused: Vec::new(),
+        };
+        let saved = state.join("tasks-saved");
+        let result = execute_clean_with_hook(&plan, false, &NeverCancelled, || {
+            fs::rename(&tasks, &saved).unwrap();
+            symlink(outside.path(), &tasks).unwrap();
+        })
+        .unwrap();
+        assert!(!result.complete());
+        assert_eq!(result.absent, vec![missing.display().to_string()]);
+        assert_eq!(result.failed.len(), 1);
+        assert!(result.failed[0].contains("state component changed"));
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unchanged");
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+        fs::remove_file(tasks).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn junction_state_descendant_is_rejected_before_any_owned_write() {
@@ -3334,13 +3680,88 @@ mod tests {
             image_id: String::new(),
         };
         let reference = ImageRef::new("registry.test/team/task:sha256-content").unwrap();
-        remove_local_registry_tag_with(&executor, &reference).unwrap();
+        remove_local_registry_tag_with(&executor, &reference, &NeverCancelled).unwrap();
         let calls = executor.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].args,
             ["image", "rm", reference.as_str()].map(str::to_owned)
         );
+    }
+
+    #[test]
+    fn missing_local_publication_tag_is_an_idempotent_cleanup_success() {
+        let executor = FixedExecutor(crate::buildkit::ProcessOutput {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "Error: No such image: registry.test/team/task:content".into(),
+            interrupted: false,
+        });
+        let reference = ImageRef::new("registry.test/team/task:content").unwrap();
+        remove_local_registry_tag_with(&executor, &reference, &NeverCancelled).unwrap();
+    }
+
+    #[test]
+    fn publication_cleanup_failure_preserves_remote_publication_in_report() {
+        use repo_sandbox_core::build::ImageDigest;
+        use repo_sandbox_core::registry::PublishedImage;
+        use repo_sandbox_core::runner::{CleanupResult, RunReport};
+        use repo_sandbox_core::snapshot::{SnapshotId, SnapshotOrigin, SourceSnapshot};
+        let digest = ImageDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap();
+        let publication = PublishedImage {
+            immutable: ImageRef::new("registry.test/team/task:sha256-content").unwrap(),
+            aliases: vec![ImageRef::new("registry.test/team/task:verified").unwrap()],
+            digest: digest.clone(),
+            platform_digests: Vec::new(),
+        };
+        let mut report = RunReport {
+            schema_version: 1,
+            plan_digest: format!("sha256:{}", "b".repeat(64)),
+            phase: "complete".into(),
+            exit_code: 0,
+            message: "workflow succeeded".into(),
+            task_id: "task".into(),
+            container_id: None,
+            source_snapshot: SourceSnapshot {
+                id: SnapshotId::parse("c".repeat(64)).unwrap(),
+                origin: SnapshotOrigin::Local {
+                    canonical_root: PathBuf::from("repository"),
+                },
+                file_count: 1,
+                recurse_submodules: false,
+            },
+            config: ConfigSummary {
+                template_id: "rust-bazel".into(),
+                plan_digest: format!("sha256:{}", "b".repeat(64)),
+                platform: Platform::LinuxAmd64,
+                build_steps: Vec::new(),
+                test_steps: Vec::new(),
+                artifact_directories: Vec::new(),
+            },
+            image: ImageRef::new("sha256:local-image-id").unwrap(),
+            image_digest: digest,
+            started_at_unix_ms: 1,
+            ended_at_unix_ms: 2,
+            duration_ms: 1,
+            status: RunStatus::Succeeded,
+            steps: Vec::new(),
+            exported_artifacts: Vec::new(),
+            artifact_error: None,
+            cleanup: CleanupResult::Removed,
+            cleanup_error: None,
+            published: Some(publication.clone()),
+        };
+        let error = AppError::Environment("remove local registry content tag: denied".into());
+        let returned = apply_publication_cleanup(&mut report, Err(error)).unwrap();
+        annotate_report(&mut report);
+        assert_eq!(report.published, Some(publication));
+        assert_eq!(report.cleanup, CleanupResult::Failed);
+        assert!(report.cleanup_error.as_deref().unwrap().contains("denied"));
+        assert_eq!(report.exit_code, 3);
+        assert!(returned.to_string().contains("denied"));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("sha256-content"));
+        assert!(json.contains("verified"));
     }
 
     fn default_execution_plan() -> ExecutionPlan {
@@ -3423,6 +3844,58 @@ mod tests {
                 .to_string()
                 .contains("report-path")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_to_future_state_is_rejected_before_state_creation() {
+        use std::os::unix::fs::symlink;
+        let repository = tempfile::tempdir().unwrap();
+        let state = repository.path().join(".repo-sandbox");
+        let alias = repository.path().join("alias");
+        symlink(repository.path(), &alias).unwrap();
+        let report = state.join("reports/task.json");
+        let error =
+            validate_state_outputs(&state, &report, Some(&alias.join(".repo-sandbox/export")))
+                .unwrap_err();
+        assert!(error.to_string().contains("oci-layout"));
+        let error =
+            validate_state_outputs(&state, &alias.join(".repo-sandbox/cache/report.json"), None)
+                .unwrap_err();
+        assert!(error.to_string().contains("report-path"));
+        assert!(!state.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_alias_to_future_state_is_rejected_before_state_creation() {
+        let repository = tempfile::tempdir().unwrap();
+        let state = repository.path().join(".repo-sandbox");
+        let alias = repository.path().join("alias");
+        assert!(
+            std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &alias.to_string_lossy(),
+                    &repository.path().to_string_lossy(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let report = state.join("reports/task.json");
+        let error =
+            validate_state_outputs(&state, &report, Some(&alias.join(".repo-sandbox/export")))
+                .unwrap_err();
+        assert!(error.to_string().contains("oci-layout"));
+        let error =
+            validate_state_outputs(&state, &alias.join(".repo-sandbox/cache/report.json"), None)
+                .unwrap_err();
+        assert!(error.to_string().contains("report-path"));
+        assert!(!state.exists());
+        fs::remove_dir(&alias).unwrap();
     }
 
     #[test]
@@ -3524,6 +3997,30 @@ mod tests {
                 .to_string()
                 .contains("only")
         );
+    }
+
+    #[test]
+    fn pinned_remote_execution_preserves_the_operator_requested_ref() {
+        use repo_sandbox_core::snapshot::CommitSha;
+        let mut plan = default_execution_plan();
+        plan.request.requested_git_ref = Some("refs/heads/topic".into());
+        plan.request.git_ref = Some("a".repeat(40));
+        let mut origin = SnapshotOrigin::RemoteGit {
+            repository: "https://example.test/repository.git".into(),
+            requested_ref: "a".repeat(40),
+            commit: CommitSha::parse("a".repeat(40)).unwrap(),
+        };
+        preserve_requested_ref(&mut origin, &plan.request);
+        let SnapshotOrigin::RemoteGit {
+            requested_ref,
+            commit,
+            ..
+        } = origin
+        else {
+            unreachable!()
+        };
+        assert_eq!(requested_ref, "refs/heads/topic");
+        assert_eq!(commit.as_str(), "a".repeat(40));
     }
 
     #[test]
@@ -3867,6 +4364,24 @@ mod tests {
         let independent = CleanPort::execute(&SystemWorkflow, &independent, true).unwrap();
         assert!(independent.skipped[0].contains("dry-run"));
         assert!(!second_state.exists());
+    }
+
+    #[test]
+    fn workflow_lease_precedes_the_first_journal_event() {
+        let repository = tempfile::tempdir().unwrap();
+        let state = repository.path().join(".repo-sandbox");
+        let (_guard, _lease, _journal) =
+            prepare_leased_workflow_state(repository.path(), &state, "task").unwrap();
+        assert!(state.join("tasks").read_dir().unwrap().any(|entry| {
+            entry
+                .ok()
+                .is_some_and(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        }));
+        assert!(
+            WorkflowLease::exclusive(&state.join(".workflow.lock"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

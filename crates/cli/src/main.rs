@@ -3,12 +3,15 @@ use repo_sandbox_cli::{Cli, run};
 
 fn main() {
     repo_sandbox_adapters::logging::init();
-    if let Err(error) = repo_sandbox_adapters::cancellation::install() {
+    let cli = Cli::parse();
+    if cli.requires_interrupt_handler()
+        && let Err(error) = repo_sandbox_adapters::cancellation::install()
+    {
         eprintln!("error: cannot install interrupt handler: {error}");
         std::process::exit(repo_sandbox_core::exit_code::ExitCode::Environment.as_i32());
     }
 
-    match run(Cli::parse()) {
+    match run(cli) {
         Ok(output) => {
             if let Some(message) = output.message {
                 println!("{message}");

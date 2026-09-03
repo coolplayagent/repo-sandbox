@@ -33,6 +33,18 @@ pub struct Cli {
     command: Option<Commands>,
 }
 
+impl Cli {
+    /// Only commands whose adapters cooperatively observe cancellation install
+    /// the process-wide handler. Doctor intentionally retains the OS default
+    /// Ctrl-C behavior for its blocking prerequisite probes.
+    pub fn requires_interrupt_handler(&self) -> bool {
+        matches!(
+            self.command,
+            Some(Commands::Build(_) | Commands::Verify(_) | Commands::Clean(_))
+        )
+    }
+}
+
 #[derive(Clone, Debug, Subcommand)]
 enum Commands {
     /// Inspect local prerequisites without modifying the host.
@@ -63,6 +75,9 @@ pub struct RuntimeArgs {
     /// Git ref to check out in the sandbox.
     #[arg(long = "git-ref", value_name = "REF")]
     pub git_ref: Option<String>,
+    /// Resolved immutable ref used internally after remote configuration discovery.
+    #[arg(skip)]
+    resolved_git_ref: Option<String>,
     /// Override the repository-declared target platform.
     #[arg(long, value_name = "PLATFORM")]
     pub platform: Vec<Platform>,
@@ -125,9 +140,11 @@ pub struct CleanArgs {
 
 impl From<RuntimeArgs> for CliOverrides {
     fn from(value: RuntimeArgs) -> Self {
+        let requested_git_ref = value.git_ref.clone();
         Self {
             repository: value.repository,
-            git_ref: value.git_ref,
+            requested_git_ref,
+            git_ref: value.resolved_git_ref.or(value.git_ref),
             platform: value.platform.first().copied(),
             platforms: value.platform,
             oci_layout: value.oci_layout,
@@ -396,7 +413,7 @@ fn prepare_execution_cancellable(
             )
             .map_err(|error| AppError::Environment(error.to_string()))?;
         if let SnapshotOrigin::RemoteGit { commit, .. } = &materialized.snapshot.origin {
-            arguments.git_ref = Some(commit.as_str().to_owned());
+            arguments.resolved_git_ref = Some(commit.as_str().to_owned());
         }
         fs::read_to_string(materialized.path().join(".repo-sandbox.yaml")).map_err(|error| {
             AppError::Configuration(format!("remote .repo-sandbox.yaml: {error}"))
@@ -718,6 +735,18 @@ mod tests {
     }
 
     #[test]
+    fn only_cancellation_aware_commands_install_the_interrupt_handler() {
+        for command in ["doctor", "plan"] {
+            let cli = Cli::try_parse_from(["repo-sandbox", command]).unwrap();
+            assert!(!cli.requires_interrupt_handler(), "{command}");
+        }
+        for command in ["build", "verify", "clean"] {
+            let cli = Cli::try_parse_from(["repo-sandbox", command]).unwrap();
+            assert!(cli.requires_interrupt_handler(), "{command}");
+        }
+    }
+
+    #[test]
     fn help_is_a_successful_smoke_path() {
         let error = Cli::try_parse_from(["repo-sandbox", "--help"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
@@ -929,6 +958,10 @@ test: [{ name: test, run: cargo test }]
             Some("https://example.test/repository.git")
         );
         assert_eq!(overrides.git_ref.as_deref(), Some("refs/heads/topic"));
+        assert_eq!(
+            overrides.requested_git_ref.as_deref(),
+            Some("refs/heads/topic")
+        );
         assert_eq!(overrides.platform, Some(Platform::LinuxAmd64));
         assert_eq!(
             overrides.platforms,
@@ -946,6 +979,23 @@ test: [{ name: test, run: cargo test }]
         assert_eq!(
             overrides.remote_auth.https_token_environment.as_deref(),
             Some("REPOSITORY_TOKEN")
+        );
+    }
+
+    #[test]
+    fn resolved_remote_ref_does_not_replace_operator_provenance() {
+        let commit = "a".repeat(40);
+        let arguments = RuntimeArgs {
+            repository: Some("https://example.test/repository.git".into()),
+            git_ref: Some("refs/heads/topic".into()),
+            resolved_git_ref: Some(commit.clone()),
+            ..RuntimeArgs::default()
+        };
+        let overrides = CliOverrides::from(arguments);
+        assert_eq!(overrides.git_ref.as_deref(), Some(commit.as_str()));
+        assert_eq!(
+            overrides.requested_git_ref.as_deref(),
+            Some("refs/heads/topic")
         );
     }
 

@@ -120,6 +120,8 @@ pub struct Step {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CliOverrides {
     pub repository: Option<String>,
+    /// Operator-selected ref retained for provenance when `git_ref` is pinned.
+    pub requested_git_ref: Option<String>,
     pub git_ref: Option<String>,
     pub platform: Option<Platform>,
     pub platforms: Vec<Platform>,
@@ -144,6 +146,7 @@ pub struct RemoteAuthentication {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionRequest {
     pub repository: Option<String>,
+    pub requested_git_ref: Option<String>,
     pub git_ref: Option<String>,
     pub platform: Platform,
     pub platforms: Vec<Platform>,
@@ -172,6 +175,7 @@ impl ExecutionRequest {
         };
         Self {
             repository: cli.repository,
+            requested_git_ref: cli.requested_git_ref,
             git_ref: cli.git_ref,
             platform,
             platforms,

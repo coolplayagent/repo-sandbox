@@ -55,6 +55,10 @@ impl ExecutionPlan {
                 .unwrap_or(""),
         );
         hash(&mut hasher, request.repository.as_deref().unwrap_or("."));
+        hash(
+            &mut hasher,
+            request.requested_git_ref.as_deref().unwrap_or(""),
+        );
         hash(&mut hasher, request.git_ref.as_deref().unwrap_or(""));
         hash(
             &mut hasher,
