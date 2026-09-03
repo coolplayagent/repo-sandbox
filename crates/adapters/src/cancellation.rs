@@ -27,6 +27,10 @@ impl DeadlineCancellation {
         }
     }
 
+    pub const fn at(deadline: Instant) -> Self {
+        Self { deadline }
+    }
+
     pub fn expired(&self) -> bool {
         Instant::now() >= self.deadline
     }

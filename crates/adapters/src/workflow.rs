@@ -44,9 +44,14 @@ impl WorkflowPort for SystemWorkflow {
         plan: &ExecutionPlan,
     ) -> Result<WorkflowResult, AppError> {
         let repository = repository_path(plan)?;
-        let cancellation = DeadlineCancellation::new(std::time::Duration::from_secs(u64::from(
-            plan.template.execution.timeout_seconds,
-        )));
+        let cancellation = plan.deadline.map_or_else(
+            || {
+                DeadlineCancellation::new(std::time::Duration::from_secs(u64::from(
+                    plan.template.execution.timeout_seconds,
+                )))
+            },
+            DeadlineCancellation::at,
+        );
         let task_id = task_id();
         let repository_id = repository_id_for_plan(plan, &repository)?;
         let state = state_root(plan, &repository, &repository_id);
@@ -88,7 +93,7 @@ impl WorkflowPort for SystemWorkflow {
             }])?;
 
             let source = match (&plan.request.repository, &plan.request.git_ref) {
-                (Some(value), reference) if is_remote(value) => SourceSpec::RemoteGit {
+                (Some(value), reference) if is_remote_repository(value) => SourceSpec::RemoteGit {
                     repository: value.clone(),
                     git_ref: reference.clone().unwrap_or_else(|| "HEAD".into()),
                 },
@@ -99,12 +104,13 @@ impl WorkflowPort for SystemWorkflow {
                     source_repository(&source),
                     &plan.request.remote_auth,
                 )?)
-                .create(
+                .create_cancellable(
                     &source,
                     SnapshotOptions {
                         recurse_submodules: plan.request.recurse_submodules,
                         cleanup: CleanupPolicy::Delete,
                     },
+                    &cancellation,
                 )
                 .map_err(|error| AppError::Environment(format!("snapshot: {error}")))?;
             let trusted_catalog = trusted_catalog()?;
@@ -198,8 +204,10 @@ impl WorkflowPort for SystemWorkflow {
                         "required secret environment `{name}` is not set"
                     ))
                 })?;
+                let value = value.to_string_lossy();
+                validate_secret_value(name, value.as_bytes())?;
                 let path = secret_root.path().join(name);
-                fs::write(&path, value.to_string_lossy().as_bytes())
+                fs::write(&path, value.as_bytes())
                     .map_err(environment("materialize runtime secret"))?;
                 secret_mounts.push(SecretMount {
                     environment: name.clone(),
@@ -296,7 +304,6 @@ impl WorkflowPort for SystemWorkflow {
                 })
                 .map_err(|error| AppError::Configuration(error.to_string()))?;
 
-            let failed = report.status != RunStatus::Succeeded;
             let mut bookkeeping_errors = Vec::new();
             if report.cleanup == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure {
                 materialized.retain_on_failure();
@@ -339,8 +346,13 @@ impl WorkflowPort for SystemWorkflow {
 
             annotate_report(&mut report);
             completed_report = Some(report.clone());
+            let output_eligible = outputs_allowed(
+                &report.status,
+                report.cleanup,
+                report.cleanup_error.as_deref(),
+            );
 
-            if !failed && let Some(output) = &plan.request.oci_layout {
+            if output_eligible && let Some(output) = &plan.request.oci_layout {
                 export_verified_oci(
                     plan,
                     &catalog_root,
@@ -353,7 +365,7 @@ impl WorkflowPort for SystemWorkflow {
                 )?;
             }
 
-            let published = if plan.request.push && !failed {
+            let published = if plan.request.push && output_eligible {
                 let policy = registry.expect("checked registry");
                 let repository =
                     RegistryRepository::new(&policy.repository).map_err(AppError::Configuration)?;
@@ -378,7 +390,7 @@ impl WorkflowPort for SystemWorkflow {
                     let seeded = seed_registry(
                         &task_image.image.image,
                         &repository,
-                        task_image.identity.as_str(),
+                        &task_image.image.digest,
                         &cancellation,
                     )?;
                     (seeded, task_image.image.clone())
@@ -723,7 +735,12 @@ impl WorkflowLease {
 }
 
 fn validate_outputs(plan: &ExecutionPlan) -> Result<(), AppError> {
-    if plan.request.git_ref.is_some() && !plan.request.repository.as_deref().is_some_and(is_remote)
+    if plan.request.git_ref.is_some()
+        && !plan
+            .request
+            .repository
+            .as_deref()
+            .is_some_and(is_remote_repository)
     {
         return Err(AppError::Configuration(
             "--git-ref is supported only with a remote repository URL".into(),
@@ -828,6 +845,25 @@ fn apply_bookkeeping_errors(
     if matches!(report.status, RunStatus::Succeeded) {
         report.cleanup = repo_sandbox_core::runner::CleanupResult::Failed;
     }
+}
+
+fn outputs_allowed(
+    status: &RunStatus,
+    cleanup: repo_sandbox_core::runner::CleanupResult,
+    cleanup_error: Option<&str>,
+) -> bool {
+    *status == RunStatus::Succeeded
+        && cleanup != repo_sandbox_core::runner::CleanupResult::Failed
+        && cleanup_error.is_none()
+}
+
+fn validate_secret_value(name: &str, value: &[u8]) -> Result<(), AppError> {
+    if value.is_empty() || value.contains(&0) || value.contains(&b'\r') || value.contains(&b'\n') {
+        return Err(AppError::Configuration(format!(
+            "secret environment `{name}` must be non-empty and single-line"
+        )));
+    }
+    Ok(())
 }
 
 fn failure_phase(error: &AppError) -> &'static str {
@@ -1202,7 +1238,12 @@ fn registry_probe_authenticated(output: &crate::buildkit::ProcessOutput) -> bool
 }
 
 fn repository_path(plan: &ExecutionPlan) -> Result<PathBuf, AppError> {
-    if plan.request.repository.as_deref().is_some_and(is_remote) {
+    if plan
+        .request
+        .repository
+        .as_deref()
+        .is_some_and(is_remote_repository)
+    {
         return std::env::current_dir().map_err(environment(
             "resolve current repository for remote configuration",
         ));
@@ -1249,8 +1290,18 @@ fn trusted_catalog() -> Result<tempfile::TempDir, AppError> {
     Ok(catalog)
 }
 
-fn is_remote(value: &str) -> bool {
-    value.contains("://") || value.starts_with("git@")
+pub fn is_remote_repository(value: &str) -> bool {
+    value.contains("://") || is_scp_remote(value)
+}
+
+fn is_scp_remote(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(authority, path)| {
+        authority
+            .split_once('@')
+            .is_some_and(|(user, host)| !user.is_empty() && !host.is_empty())
+            && !path.is_empty()
+            && !path.starts_with(['\\', '/'])
+    })
 }
 fn source_repository(source: &SourceSpec) -> &str {
     match source {
@@ -1292,7 +1343,7 @@ pub fn external_git_authentication(
             "--git-https-username must be non-empty and single-line".into(),
         ));
     }
-    if repository.starts_with("git@") || repository.starts_with("ssh://") {
+    if is_scp_remote(repository) || repository.starts_with("ssh://") {
         if https_modes > 0 || auth.https_username.is_some() {
             return Err(AppError::Configuration(
                 "HTTPS authentication options cannot be used with an SSH remote".into(),
@@ -1308,6 +1359,11 @@ pub fn external_git_authentication(
             return Ok(GitAuthentication::SshAgent {
                 known_hosts: auth.ssh_known_hosts.clone(),
             });
+        }
+        if auth.ssh_known_hosts.is_some() {
+            return Err(AppError::Configuration(
+                "--git-ssh-known-hosts requires --git-ssh-private-key or --git-ssh-agent".into(),
+            ));
         }
         return Ok(GitAuthentication::None);
     }
@@ -1371,7 +1427,7 @@ fn repository_id_for_plan(plan: &ExecutionPlan, local_root: &Path) -> Result<Str
         .request
         .repository
         .as_deref()
-        .filter(|value| is_remote(value))
+        .filter(|value| is_remote_repository(value))
     {
         Some(remote) => {
             let normalized = normalize_remote_identity(remote)?;
@@ -1440,7 +1496,12 @@ fn normalize_remote_identity(remote: &str) -> Result<String, AppError> {
 
 fn state_root(plan: &ExecutionPlan, local_root: &Path, repository_id: &str) -> PathBuf {
     let state = local_root.join(".repo-sandbox");
-    if plan.request.repository.as_deref().is_some_and(is_remote) {
+    if plan
+        .request
+        .repository
+        .as_deref()
+        .is_some_and(is_remote_repository)
+    {
         state.join("remotes").join(
             repository_id
                 .strip_prefix("sha256:")
@@ -1673,16 +1734,13 @@ fn docker_output(args: &[&str]) -> Result<crate::buildkit::ProcessOutput, String
 fn seed_registry(
     source: &ImageRef,
     repository: &RegistryRepository,
-    identity: &str,
+    digest: &repo_sandbox_core::build::ImageDigest,
     cancellation: &DeadlineCancellation,
 ) -> Result<ImageRef, AppError> {
-    let staging = repository.tagged(
-        &RegistryTag::new(format!("staging-{}", &identity[..24]))
-            .map_err(AppError::Configuration)?,
-    );
+    let content = registry_content_ref(repository, digest);
     for args in [
-        vec!["image", "tag", source.as_str(), staging.as_str()],
-        vec!["push", staging.as_str()],
+        vec!["image", "tag", source.as_str(), content.as_str()],
+        vec!["push", content.as_str()],
     ] {
         let invocation = ProcessInvocation {
             program: "docker".into(),
@@ -1704,7 +1762,14 @@ fn seed_registry(
             )));
         }
     }
-    Ok(staging)
+    Ok(content)
+}
+
+fn registry_content_ref(
+    repository: &RegistryRepository,
+    digest: &repo_sandbox_core::build::ImageDigest,
+) -> ImageRef {
+    repository.tagged(&RegistryTag::for_digest(digest))
 }
 
 fn remove_candidate(candidate: &CleanCandidate) -> Result<bool, String> {
@@ -1887,6 +1952,46 @@ mod tests {
     }
 
     #[test]
+    fn output_reservation_is_recoverable_after_owner_process_termination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("report.json");
+        let ready = temporary.path().join("ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workflow::tests::output_reservation_process_helper",
+                "--nocapture",
+            ])
+            .env("REPO_SANDBOX_RESERVATION_HELPER_OUTPUT", &output)
+            .env("REPO_SANDBOX_RESERVATION_HELPER_READY", &ready)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "reservation helper did not become ready");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        OutputReservation::report(&output).unwrap();
+    }
+
+    #[test]
+    fn output_reservation_process_helper() {
+        let (Some(output), Some(ready)) = (
+            std::env::var_os("REPO_SANDBOX_RESERVATION_HELPER_OUTPUT"),
+            std::env::var_os("REPO_SANDBOX_RESERVATION_HELPER_READY"),
+        ) else {
+            return;
+        };
+        let _reservation = OutputReservation::report(Path::new(&output)).unwrap();
+        fs::write(ready, "ready").unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
+    #[test]
     fn registry_probe_requires_reachable_authenticated_v2_response() {
         use crate::buildkit::ProcessOutput;
         let output = |code, stderr: &str| ProcessOutput {
@@ -1908,6 +2013,20 @@ mod tests {
             None,
             "connection refused"
         )));
+    }
+
+    #[test]
+    fn single_platform_seed_uses_the_final_content_tag_not_staging() {
+        let repository = RegistryRepository::new("registry.test/team/image").unwrap();
+        let digest =
+            repo_sandbox_core::build::ImageDigest::new(format!("sha256:{}", "a".repeat(64)))
+                .unwrap();
+        let target = registry_content_ref(&repository, &digest);
+        assert_eq!(
+            target.as_str(),
+            format!("registry.test/team/image:sha256-{}", "a".repeat(64))
+        );
+        assert!(!target.as_str().contains("staging"));
     }
 
     fn default_execution_plan() -> ExecutionPlan {
@@ -1954,6 +2073,30 @@ mod tests {
         let task = AppError::Environment("task image: git metadata failure".into());
         assert_eq!(failure_phase(&environment), "environment_image");
         assert_eq!(failure_phase(&task), "task_image");
+    }
+
+    #[test]
+    fn bookkeeping_or_cleanup_failure_disqualifies_all_outputs() {
+        use repo_sandbox_core::runner::CleanupResult;
+        assert!(outputs_allowed(
+            &RunStatus::Succeeded,
+            CleanupResult::Removed,
+            None
+        ));
+        assert!(!outputs_allowed(
+            &RunStatus::Succeeded,
+            CleanupResult::Failed,
+            Some("journal failed")
+        ));
+        assert!(!outputs_allowed(
+            &RunStatus::CommandFailed {
+                phase: StepPhase::Build,
+                step: "build".into(),
+                exit_code: Some(1),
+            },
+            CleanupResult::Removed,
+            None
+        ));
     }
 
     #[test]
@@ -2006,6 +2149,42 @@ mod tests {
         assert!(
             external_git_authentication("https://example.test/repo.git", &conflicting).is_err()
         );
+        let known_hosts_only = RemoteAuthentication {
+            ssh_known_hosts: Some("known-hosts".into()),
+            ..RemoteAuthentication::default()
+        };
+        assert!(
+            external_git_authentication("person@example.test:org/repo.git", &known_hosts_only)
+                .unwrap_err()
+                .to_string()
+                .contains("requires")
+        );
+        let agent = RemoteAuthentication {
+            ssh_agent: true,
+            ..RemoteAuthentication::default()
+        };
+        assert!(matches!(
+            external_git_authentication("person@example.test:org/repo.git", &agent).unwrap(),
+            GitAuthentication::SshAgent { .. }
+        ));
+    }
+
+    #[test]
+    fn scp_style_remote_classification_matches_snapshot_transport() {
+        assert!(is_remote_repository("person@example.test:org/repo.git"));
+        assert!(is_remote_repository("git@example.test:repo.git"));
+        assert!(!is_remote_repository("C:\\work\\repo"));
+        assert!(!is_remote_repository("relative:directory"));
+    }
+
+    #[test]
+    fn secret_environment_values_must_be_exactly_representable() {
+        assert!(validate_secret_value("TOKEN", b"value").is_ok());
+        for value in [b"".as_slice(), b"value\n", b"value\r", b"a\0b"] {
+            let error = validate_secret_value("TOKEN", value).unwrap_err();
+            assert!(!error.to_string().contains("value"));
+            assert!(error.to_string().contains("TOKEN"));
+        }
     }
 
     #[test]

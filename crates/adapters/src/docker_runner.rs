@@ -128,6 +128,8 @@ struct RedactingStream {
 
 impl<'a> RedactingLogSink<'a> {
     fn new(inner: &'a dyn LogSink, secrets: Vec<Vec<u8>>) -> Self {
+        let mut secrets = secrets;
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
         Self {
             inner,
             secrets,
@@ -216,7 +218,8 @@ fn take_redacted(pending: &mut Vec<u8>, secrets: &[Vec<u8>], finish: bool) -> Ve
         if let Some(secret) = secrets
             .iter()
             .filter(|secret| !secret.is_empty())
-            .find(|secret| pending[index..].starts_with(secret))
+            .filter(|secret| pending[index..].starts_with(secret))
+            .max_by_key(|secret| secret.len())
         {
             redacted.extend_from_slice(b"[REDACTED]");
             index += secret.len();
@@ -494,7 +497,7 @@ pub fn plan(spec: &RunSpec) -> Result<DockerRunPlan, PlanError> {
                 "/bin/sh",
                 "-lc",
                 &if spec.secret_mounts.is_empty() { step.command.clone() } else {
-                    format!("for f in /run/repo-sandbox-secrets/*; do n=${{f##*/}}; export \"$n=$(cat \"$f\")\"; done; {}", step.command)
+                    format!("for f in /run/repo-sandbox-secrets/*; do n=${{f##*/}}; v=; IFS= read -r v < \"$f\" || [ -n \"$v\" ]; export \"$n=$v\"; done; {}", step.command)
                 },
             ]),
         })
@@ -1300,6 +1303,8 @@ mod tests {
             .unwrap();
         let invocations = format!("{:?}", executor.invocations());
         let json = serde_json::to_string(&report).unwrap();
+        assert!(invocations.contains("IFS= read -r"));
+        assert!(!invocations.contains("$(cat"));
         assert!(!invocations.contains("token-super-secret"));
         assert!(!json.contains("token-super-secret"));
         assert!(
@@ -1316,6 +1321,18 @@ mod tests {
         redacting.stdout(StepPhase::Test, "secret", b"secret suffix\n");
         redacting.finish(StepPhase::Test, "secret");
         assert_eq!(&*sink.stdout.lock().unwrap(), b"prefix [REDACTED] suffix\n");
+    }
+
+    #[test]
+    fn shared_prefix_secrets_redact_the_longest_value_first() {
+        let sink = RecordingSink::default();
+        let redacting = RedactingLogSink::new(
+            &sink,
+            vec![b"token".to_vec(), b"token-with-private-suffix".to_vec()],
+        );
+        redacting.stdout(StepPhase::Test, "secret", b"token-with-private-suffix\n");
+        redacting.finish(StepPhase::Test, "secret");
+        assert_eq!(&*sink.stdout.lock().unwrap(), b"[REDACTED]\n");
     }
 
     #[derive(Clone, Default)]

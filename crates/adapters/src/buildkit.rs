@@ -720,7 +720,7 @@ fn build_invocation(
         }
     }
 
-    let reserved = build_arguments(request.plan, platforms)?;
+    let reserved = build_arguments(request.plan)?;
     let reserved_names = reserved.keys().cloned().collect::<BTreeSet<_>>();
     for (name, value) in reserved
         .into_iter()
@@ -926,10 +926,7 @@ fn finish_platform_digests(
         .collect())
 }
 
-fn build_arguments(
-    plan: &TemplatePlan,
-    platforms: &[Platform],
-) -> Result<BTreeMap<String, String>, BuildError> {
+fn build_arguments(plan: &TemplatePlan) -> Result<BTreeMap<String, String>, BuildError> {
     let mut arguments = BTreeMap::from([
         ("BASE_IMAGE".to_owned(), plan.base_image.clone()),
         (
@@ -940,10 +937,7 @@ fn build_arguments(
             "REPO_SANDBOX_TEMPLATE_VERSION".to_owned(),
             plan.template_version.clone(),
         ),
-        (
-            "REPO_SANDBOX_PLAN_DIGEST".to_owned(),
-            plan_digest_for_platforms(plan, platforms),
-        ),
+        ("REPO_SANDBOX_PLAN_DIGEST".to_owned(), plan_digest(plan)),
     ]);
     for (name, value) in &plan.parameters {
         let name = parameter_argument_name(name)?;
@@ -981,37 +975,11 @@ fn parameter_argument_name(name: &str) -> Result<String, BuildError> {
 
 /// Stable fingerprint used by the Dockerfile so plan changes invalidate image configuration.
 pub fn plan_digest(plan: &TemplatePlan) -> String {
-    plan_digest_for_platforms(plan, &[plan.platform])
-}
-
-fn plan_digest_for_platforms(plan: &TemplatePlan, platforms: &[Platform]) -> String {
     let mut hasher = Sha256::new();
-    for value in [
-        plan.template_id.as_str(),
-        plan.template_version.as_str(),
-        plan.base_image.as_str(),
-        &plan.build_context.to_string_lossy(),
-    ] {
-        hash_field(&mut hasher, value);
-    }
-    for platform in platforms {
-        hash_field(&mut hasher, platform.as_str());
-    }
-    for (name, value) in &plan.parameters {
-        hash_field(&mut hasher, name);
-        hash_field(&mut hasher, value);
-    }
-    for stage in &plan.stages {
-        hash_field(&mut hasher, &stage.id);
-        hash_field(&mut hasher, &stage.version);
-        hash_field(&mut hasher, &stage.build_context.to_string_lossy());
-        for dependency in &stage.depends_on {
-            hash_field(&mut hasher, dependency);
-        }
-    }
+    hash_field(&mut hasher, "repo-sandbox-template-plan-v2");
     hash_field(
         &mut hasher,
-        &serde_json::to_string(&plan.execution).expect("execution profile is serializable"),
+        &serde_json::to_string(plan).expect("template plan is serializable"),
     );
     format!("sha256:{:x}", hasher.finalize())
 }
@@ -1466,6 +1434,45 @@ mod tests {
             "inspect".to_owned(),
             "--raw".to_owned()
         ])));
+    }
+
+    #[test]
+    fn plan_digest_build_arg_is_identical_for_single_and_multi_platform_invocations() {
+        let executor = FakeExecutor::new(BuildBehavior::Success);
+        let plan = plan();
+        let adapter = amd64_adapter(&executor);
+        adapter
+            .build(request(&plan, BuildOptions::default()), &NeverCancelled)
+            .unwrap();
+        adapter
+            .build(
+                request(
+                    &plan,
+                    BuildOptions {
+                        output: ImageOutput::Push,
+                        platforms: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
+                        ..BuildOptions::default()
+                    },
+                ),
+                &NeverCancelled,
+            )
+            .unwrap();
+        let builds = executor
+            .invocations()
+            .into_iter()
+            .filter(|call| call.args.get(1).map(String::as_str) == Some("build"))
+            .collect::<Vec<_>>();
+        let digest = |invocation: &ProcessInvocation| {
+            invocation
+                .args
+                .windows(2)
+                .find(|pair| {
+                    pair[0] == "--build-arg" && pair[1].starts_with("REPO_SANDBOX_PLAN_DIGEST=")
+                })
+                .unwrap()[1]
+                .clone()
+        };
+        assert_eq!(digest(&builds[0]), digest(&builds[1]));
     }
 
     #[test]

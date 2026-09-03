@@ -1,3 +1,4 @@
+use crate::buildkit::{Cancellation, NeverCancelled};
 use repo_sandbox_core::snapshot::{
     CleanupPolicy, CommitSha, ExternalSecret, GitAuthentication, SnapshotError, SnapshotId,
     SnapshotOptions, SnapshotOrigin, SourceSnapshot, SourceSpec,
@@ -9,7 +10,10 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::process::{Command, Output};
+use std::thread;
+use std::time::Duration;
 use tempfile::{Builder, TempDir};
 
 /// Owns a materialized snapshot. Delete-policy snapshots disappear on drop;
@@ -76,6 +80,15 @@ impl GitSnapshotter {
         source: &SourceSpec,
         options: SnapshotOptions,
     ) -> Result<MaterializedSnapshot, SnapshotError> {
+        self.create_cancellable(source, options, &NeverCancelled)
+    }
+
+    pub fn create_cancellable(
+        &self,
+        source: &SourceSpec,
+        options: SnapshotOptions,
+        cancellation: &dyn Cancellation,
+    ) -> Result<MaterializedSnapshot, SnapshotError> {
         if options.recurse_submodules
             && matches!(source, SourceSpec::RemoteGit { .. })
             && matches!(&self.authentication, GitAuthentication::HttpsToken { .. })
@@ -97,13 +110,14 @@ impl GitSnapshotter {
                         "local source must be a directory".into(),
                     ));
                 }
-                ensure_git_root(&root)?;
+                ensure_git_root(&root, cancellation)?;
                 let files = collect_repository(
                     &root,
                     &root,
                     Path::new(""),
                     options,
                     ModePolicy::LocalWorktree,
+                    cancellation,
                 )?;
                 (
                     SnapshotOrigin::Local {
@@ -136,8 +150,9 @@ impl GitSnapshotter {
                     ],
                     "clone remote repository",
                     &authentication,
+                    cancellation,
                 )?;
-                let commit = resolve_commit(&clone, git_ref)?;
+                let commit = resolve_commit(&clone, git_ref, cancellation)?;
                 git(
                     &clone,
                     [
@@ -147,6 +162,7 @@ impl GitSnapshotter {
                         OsString::from(commit.as_str()),
                     ],
                     "checkout resolved commit",
+                    cancellation,
                 )?;
                 if options.recurse_submodules {
                     git_remote(
@@ -159,6 +175,7 @@ impl GitSnapshotter {
                         ],
                         "initialize recursive submodules",
                         &authentication,
+                        cancellation,
                     )?;
                 }
                 let clone =
@@ -169,6 +186,7 @@ impl GitSnapshotter {
                     Path::new(""),
                     options,
                     ModePolicy::CommittedCheckout,
+                    cancellation,
                 )?;
                 (
                     SnapshotOrigin::RemoteGit {
@@ -243,21 +261,23 @@ struct IndexEntry {
     object_id: String,
 }
 
-fn ensure_git_root(root: &Path) -> Result<(), SnapshotError> {
-    let output = git_output(
+fn ensure_git_root(root: &Path, cancellation: &dyn Cancellation) -> Result<(), SnapshotError> {
+    let output = git_output_cancellable(
         root,
         ["rev-parse", "--is-inside-work-tree"],
         "inspect local Git worktree",
+        cancellation,
     )?;
     if output.stdout != b"true\n" && output.stdout != b"true\r\n" {
         return Err(SnapshotError::InvalidInput(
             "local source is not a Git worktree".into(),
         ));
     }
-    let top_level = git_output(
+    let top_level = git_output_cancellable(
         root,
         ["rev-parse", "--show-toplevel"],
         "locate local Git worktree",
+        cancellation,
     )?;
     let top_level = String::from_utf8(top_level.stdout)
         .map_err(|_| SnapshotError::Git("Git returned a non-UTF-8 worktree path".into()))?;
@@ -276,8 +296,9 @@ fn collect_repository(
     prefix: &Path,
     options: SnapshotOptions,
     mode_policy: ModePolicy,
+    cancellation: &dyn Cancellation,
 ) -> Result<Vec<SourceFile>, SnapshotError> {
-    let output = git_output(
+    let output = git_output_cancellable(
         repository_root,
         [
             "ls-files",
@@ -287,6 +308,7 @@ fn collect_repository(
             "--exclude-standard",
         ],
         "enumerate non-ignored source files",
+        cancellation,
     )?;
     let mut files = Vec::new();
     let mut seen = HashSet::new();
@@ -309,7 +331,7 @@ fn collect_repository(
         if relative.components().any(|part| part.as_os_str() == ".git") {
             continue;
         }
-        let index_entry = index_entry(repository_root, &relative)?;
+        let index_entry = index_entry(repository_root, &relative, cancellation)?;
         if index_entry
             .as_ref()
             .is_some_and(|entry| entry.mode == 0o120000)
@@ -328,7 +350,7 @@ fn collect_repository(
                 mode: entry.mode,
             });
             if options.recurse_submodules {
-                ensure_git_root(&source).map_err(|_| {
+                ensure_git_root(&source, cancellation).map_err(|_| {
                     SnapshotError::Git(format!(
                         "submodule is not initialized: {}",
                         display_safe_path(&prefix.join(&relative))
@@ -340,6 +362,7 @@ fn collect_repository(
                     &prefix.join(&relative),
                     options,
                     mode_policy,
+                    cancellation,
                 )?);
             }
             continue;
@@ -695,8 +718,12 @@ fn hash_manifest_entry(
     manifest.update(content_digest);
 }
 
-fn index_entry(repository: &Path, relative: &Path) -> Result<Option<IndexEntry>, SnapshotError> {
-    let output = git_output(
+fn index_entry(
+    repository: &Path,
+    relative: &Path,
+    cancellation: &dyn Cancellation,
+) -> Result<Option<IndexEntry>, SnapshotError> {
+    let output = git_output_cancellable(
         repository,
         [
             OsString::from("ls-files"),
@@ -705,6 +732,7 @@ fn index_entry(repository: &Path, relative: &Path) -> Result<Option<IndexEntry>,
             relative.as_os_str().to_owned(),
         ],
         "inspect source file mode",
+        cancellation,
     )?;
     if output.stdout.is_empty() {
         return Ok(None);
@@ -744,7 +772,11 @@ fn apply_mode(_path: &Path, _mode: u32) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-fn resolve_commit(repository: &Path, requested: &str) -> Result<CommitSha, SnapshotError> {
+fn resolve_commit(
+    repository: &Path,
+    requested: &str,
+    cancellation: &dyn Cancellation,
+) -> Result<CommitSha, SnapshotError> {
     let candidates = if requested.starts_with("refs/") || requested == "HEAD" {
         vec![requested.to_owned()]
     } else {
@@ -755,7 +787,7 @@ fn resolve_commit(repository: &Path, requested: &str) -> Result<CommitSha, Snaps
     };
     for candidate in candidates {
         let revision = format!("{candidate}^{{commit}}");
-        let output = git_raw(
+        let output = git_raw_cancellable(
             repository,
             [
                 OsString::from("rev-parse"),
@@ -763,6 +795,7 @@ fn resolve_commit(repository: &Path, requested: &str) -> Result<CommitSha, Snaps
                 OsString::from("--end-of-options"),
                 OsString::from(revision),
             ],
+            cancellation,
         )?;
         if output.status.success() {
             let value = String::from_utf8(output.stdout)
@@ -1047,12 +1080,26 @@ fn redact_repository(repository: &str) -> String {
     )
 }
 
+#[cfg(test)]
 fn git_output<I, S>(cwd: &Path, arguments: I, operation: &str) -> Result<Output, SnapshotError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = git_raw(cwd, arguments)?;
+    git_output_cancellable(cwd, arguments, operation, &NeverCancelled)
+}
+
+fn git_output_cancellable<I, S>(
+    cwd: &Path,
+    arguments: I,
+    operation: &str,
+    cancellation: &dyn Cancellation,
+) -> Result<Output, SnapshotError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = git_raw_cancellable(cwd, arguments, cancellation)?;
     if output.status.success() {
         Ok(output)
     } else {
@@ -1066,12 +1113,17 @@ where
     }
 }
 
-fn git<I, S>(cwd: &Path, arguments: I, operation: &str) -> Result<(), SnapshotError>
+fn git<I, S>(
+    cwd: &Path,
+    arguments: I,
+    operation: &str,
+    cancellation: &dyn Cancellation,
+) -> Result<(), SnapshotError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    git_output(cwd, arguments, operation).map(|_| ())
+    git_output_cancellable(cwd, arguments, operation, cancellation).map(|_| ())
 }
 
 fn git_remote<I, S>(
@@ -1079,12 +1131,18 @@ fn git_remote<I, S>(
     arguments: I,
     operation: &str,
     authentication: &AuthenticationContext,
+    cancellation: &dyn Cancellation,
 ) -> Result<(), SnapshotError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = git_raw_with_environment(cwd, arguments, &authentication.environment)?;
+    let output = git_raw_with_environment_cancellable(
+        cwd,
+        arguments,
+        &authentication.environment,
+        cancellation,
+    )?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1150,31 +1208,81 @@ fn classify_remote_failure(operation: &str, stderr: &[u8], secrets: &[String]) -
     }
 }
 
-fn git_raw<I, S>(cwd: &Path, arguments: I) -> Result<Output, SnapshotError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    git_raw_with_environment(cwd, arguments, &[])
-}
-
-fn git_raw_with_environment<I, S>(
+fn git_raw_cancellable<I, S>(
     cwd: &Path,
     arguments: I,
-    environment: &[(OsString, OsString)],
+    cancellation: &dyn Cancellation,
 ) -> Result<Output, SnapshotError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new("git")
+    git_raw_with_environment_cancellable(cwd, arguments, &[], cancellation)
+}
+
+fn git_raw_with_environment_cancellable<I, S>(
+    cwd: &Path,
+    arguments: I,
+    environment: &[(OsString, OsString)],
+    cancellation: &dyn Cancellation,
+) -> Result<Output, SnapshotError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut child = Command::new("git")
         .args(arguments)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
         .envs(environment.iter().map(|(key, value)| (key, value)))
-        .output()
-        .map_err(|error| SnapshotError::Git(format!("could not execute Git: {error}")))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| SnapshotError::Git(format!("could not execute Git: {error}")))?;
+    let stdout = child.stdout.take().expect("Git stdout is piped");
+    let stderr = child.stderr.take().expect("Git stderr is piped");
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stream = stdout;
+        stream.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stream = stderr;
+        stream.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let status = loop {
+        if cancellation.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(SnapshotError::Git(
+                "Git operation cancelled or timed out".into(),
+            ));
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| SnapshotError::Git(format!("wait for Git: {error}")))?
+        {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| SnapshotError::Git("Git stdout reader panicked".into()))?
+        .map_err(|error| SnapshotError::Git(format!("read Git stdout: {error}")))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| SnapshotError::Git("Git stderr reader panicked".into()))?
+        .map_err(|error| SnapshotError::Git(format!("read Git stderr: {error}")))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn io_error(operation: &'static str) -> impl FnOnce(std::io::Error) -> SnapshotError {
@@ -1196,6 +1304,14 @@ mod tests {
     };
     use std::thread;
     use std::time::Duration;
+
+    struct AlwaysCancelled;
+
+    impl Cancellation for AlwaysCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
 
     struct LocalPublicGitHttp {
         port: u16,
@@ -1505,6 +1621,19 @@ mod tests {
         assert!(matches!(error, SnapshotError::InvalidInput(_)));
         assert!(error.to_string().contains("separately scoped"));
         assert!(!error.to_string().contains("unavailable"));
+    }
+
+    #[test]
+    fn snapshot_git_processes_observe_cancellation() {
+        let repo = repository();
+        let error = GitSnapshotter::default()
+            .create_cancellable(
+                &SourceSpec::LocalDirectory(repo.path().to_owned()),
+                SnapshotOptions::default(),
+                &AlwaysCancelled,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled or timed out"));
     }
 
     #[cfg(unix)]

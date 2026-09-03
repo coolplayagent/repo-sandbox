@@ -29,6 +29,8 @@ pub struct ExecutionPlan {
     pub template: TemplatePlan,
     pub request: ExecutionRequest,
     pub digest: String,
+    /// Runtime-only deadline; deliberately excluded from deterministic identity.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl ExecutionPlan {
@@ -132,6 +134,7 @@ impl ExecutionPlan {
             template,
             request,
             digest: format!("sha256:{:x}", hasher.finalize()),
+            deadline: None,
         }
     }
 }

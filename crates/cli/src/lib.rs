@@ -18,6 +18,9 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write as IoWrite};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+const REMOTE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -178,7 +181,10 @@ pub fn run_with_probe(cli: Cli, probe: &impl DoctorProbe) -> Result<RunOutput, A
         });
     }
     if let Commands::Plan(arguments) = command {
-        let execution = prepare_execution(arguments)?;
+        let cancellation = repo_sandbox_adapters::cancellation::DeadlineCancellation::new(
+            REMOTE_PREPARATION_TIMEOUT,
+        );
+        let execution = prepare_execution_cancellable(arguments, &cancellation)?;
         return Ok(RunOutput {
             message: Some(render_plan(&execution.template)),
             exit_code: ExitCode::Success,
@@ -279,13 +285,17 @@ fn run_runtime(
     verify: bool,
     workflow: &SystemWorkflow,
 ) -> Result<RunOutput, AppError> {
+    let started = Instant::now();
+    let preparation_cancellation = repo_sandbox_adapters::cancellation::DeadlineCancellation::at(
+        started + REMOTE_PREPARATION_TIMEOUT,
+    );
     let requested_report = arguments.report.clone();
     let report_reservation = requested_report
         .as_deref()
         .map(repo_sandbox_adapters::workflow::OutputReservation::report)
         .transpose()?;
-    let prepared = prepare_execution(arguments);
-    let execution = match prepared {
+    let prepared = prepare_execution_cancellable(arguments, &preparation_cancellation);
+    let mut execution = match prepared {
         Ok(execution) => execution,
         Err(error) => {
             if let Some(path) = requested_report.as_deref()
@@ -296,6 +306,9 @@ fn run_runtime(
             return Err(error);
         }
     };
+    execution.deadline = Some(
+        started + Duration::from_secs(u64::from(execution.template.execution.timeout_seconds)),
+    );
     // Preparation failures are protected by the CLI reservation. The workflow
     // immediately acquires the same cross-process reservation for execution.
     drop(report_reservation);
@@ -321,7 +334,15 @@ fn run_runtime(
     })
 }
 
-fn prepare_execution(mut arguments: RuntimeArgs) -> Result<ExecutionPlan, AppError> {
+#[cfg(test)]
+fn prepare_execution(arguments: RuntimeArgs) -> Result<ExecutionPlan, AppError> {
+    prepare_execution_cancellable(arguments, &repo_sandbox_adapters::buildkit::NeverCancelled)
+}
+
+fn prepare_execution_cancellable(
+    mut arguments: RuntimeArgs,
+    cancellation: &dyn repo_sandbox_adapters::buildkit::Cancellation,
+) -> Result<ExecutionPlan, AppError> {
     if arguments.recurse_submodules && arguments.git_https_token_env.is_some() {
         return Err(AppError::Configuration(
             "--recurse-submodules with --git-https-token-env requires separately scoped submodule credentials, which are not supported in v1".into(),
@@ -338,7 +359,7 @@ fn prepare_execution(mut arguments: RuntimeArgs) -> Result<ExecutionPlan, AppErr
     let source = if let Some(repository) = arguments
         .repository
         .as_deref()
-        .filter(|value| value.contains("://") || value.starts_with("git@"))
+        .filter(|value| repo_sandbox_adapters::workflow::is_remote_repository(value))
     {
         let materialized = GitSnapshotter::default()
             .with_authentication(
@@ -347,7 +368,7 @@ fn prepare_execution(mut arguments: RuntimeArgs) -> Result<ExecutionPlan, AppErr
                     &remote_auth,
                 )?,
             )
-            .create(
+            .create_cancellable(
                 &SourceSpec::RemoteGit {
                     repository: repository.to_owned(),
                     git_ref: arguments.git_ref.clone().unwrap_or_else(|| "HEAD".into()),
@@ -356,6 +377,7 @@ fn prepare_execution(mut arguments: RuntimeArgs) -> Result<ExecutionPlan, AppErr
                     recurse_submodules: arguments.recurse_submodules,
                     cleanup: CleanupPolicy::Delete,
                 },
+                cancellation,
             )
             .map_err(|error| AppError::Environment(error.to_string()))?;
         if let SnapshotOrigin::RemoteGit { commit, .. } = &materialized.snapshot.origin {
