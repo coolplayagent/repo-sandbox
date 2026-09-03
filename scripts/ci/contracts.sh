@@ -5,7 +5,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 ci="$root/.github/workflows/ci.yml"
 release="$root/.github/workflows/release.yml"
 adapters_build="$root/crates/adapters/BUILD.bazel"
-cli_build="$root/crates/cli/BUILD.bazel"
+cli_build="$root/apps/cli/BUILD.bazel"
 
 for required in "$ci" "$release" "$root/scripts/ci/workspace-version.sh" \
   "$root/scripts/ci/download-release-artifacts.sh" \
@@ -43,18 +43,32 @@ grep -Fq '[[ $libstdcxx != libstdc++.so && -f $libstdcxx ]]' \
 grep -Fq '^(gcc-c\+\+|libstdc\+\+-devel)-' "$root/scripts/ci/verify-rocky-cxx.sh"
 ! grep -Fq 'cargo build' "$release"
 grep -Fq 'binary=$(bazelisk cquery --config=release //:repo-sandbox --output=files' "$release"
-grep -Fq 'verify-glibc-baseline.sh" "$binary" 2.28' "$root/scripts/ci/package-cli.sh"
+grep -Fq 'tools/release/package_cli.py' "$root/scripts/ci/package-cli.sh"
+grep -Fq 'check_glibc(binary)' "$root/tools/release/package_cli.py"
 grep -Fq 'verify-glibc-baseline.sh" "$temporary/repo-sandbox" 2.28' \
   "$root/scripts/ci/verify-release.sh"
-grep -Fq 'raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ci/verify-glibc-baseline.sh' \
+grep -Fq 'raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_COMMIT}/scripts/ci/verify-glibc-baseline.sh' \
   "$release"
 grep -Fq 'version=$(scripts/ci/workspace-version.sh)' "$ci"
 ! grep -Fq "grep -Fx 'repo-sandbox 0.1.0'" "$ci"
 grep -Fq 'bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh' "$ci"
-grep -Fq 'publish-release.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" release "$GITHUB_SHA"' "$release"
+grep -Fq 'publish-release.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" release "${{ needs.prepare.outputs.commit }}"' "$release"
+publish_line=$(grep -nF 'publish-release.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" release "${{ needs.prepare.outputs.commit }}"' "$release" | cut -d: -f1)
+attest_line=$(grep -nF 'uses: actions/attest-build-provenance@' "$release" | cut -d: -f1)
+(( publish_line < attest_line ))
 grep -Fq 'actions: read' "$release"
-grep -Fq 'download-release-artifacts.sh "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release' "$release"
-[[ $(grep -c 'validate-release-inputs.sh "$GITHUB_REF_NAME"' "$release") -eq 2 ]]
+grep -Fq 'download-release-artifacts.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" release' "$release"
+[[ $(grep -c 'validate-release-inputs.sh' "$release") -eq 3 ]]
+grep -Fq 'workflow_dispatch:' "$release"
+grep -Fq "group: release-\${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}" "$release"
+grep -Fq 'ref: refs/tags/${{ steps.requested.outputs.tag }}' "$release"
+grep -Fq '[[ $GITHUB_EVENT_NAME == workflow_dispatch && $GITHUB_SHA != "$commit" ]]' "$release"
+grep -Fq 'manual release must be dispatched with --ref $RELEASE_TAG' "$release"
+grep -Fq 'merge-base --is-ancestor "$commit" origin/main' "$release"
+grep -Fq 'uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0' "$release"
+grep -Fq 'subject-path: release/repo-sandbox-*.tar.gz' "$release"
+grep -Fq 'artifact-metadata: write' "$release"
+grep -Fq 'cmp "release-a/$archive" "release-b/$archive"' "$release"
 ! grep -Fq 'git merge-base --is-ancestor "$GITHUB_SHA" origin/main' "$release"
 grep -Fq 'git -C "$root" -c "safe.directory=$root"' \
   "$root/scripts/ci/validate-release-inputs.sh"

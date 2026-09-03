@@ -51,6 +51,7 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh
+          python3 -m unittest discover -s tools/release -p 'test_*.py' -v
       - name: Configuration sample and executable integration
         run: |
           binary=$(bazelisk cquery //:repo-sandbox --output=files | tail -n 1)

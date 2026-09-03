@@ -1,3 +1,5 @@
 /bazel-*
 /.distdir/
 /target/
+/.worktrees/
+/tools/release/__pycache__/
