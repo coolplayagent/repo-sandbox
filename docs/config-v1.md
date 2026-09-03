@@ -34,6 +34,11 @@ Remote failures are reported separately as authentication, network, repository
 not found, or permission denied. Raw remote diagnostics are not copied into
 errors because servers frequently echo URLs or credentials.
 
+When no credential option is selected, remote Git runs in an explicitly
+unauthenticated mode: configured credential helpers and inherited askpass
+programs are disabled, and SSH is configured with no agent or default identity.
+Access to operator credentials is enabled only by the corresponding CLI option.
+
 ## Schema
 
 Every field shown in the example is required. Unknown fields are errors.
@@ -99,6 +104,12 @@ the central image, component graph, or build contexts.
 | `11` | test failed |
 
 Build-step failures map to `10`; test-step failures map to `11`.
+Before building, `build` and `verify` perform an offline, task-owned Docker
+image import/container-create probe using the configured temporary-storage
+limit. A daemon that cannot enforce `--storage-opt size=...` fails as an
+environment prerequisite (`3`); the probe container and image are removed on
+both success and failure. Registry preflight runs through Docker itself so it
+uses the selected `DOCKER_HOST`, daemon network, proxy, and credential context.
 For `clean`, dry-run, policy-excluded, and already-absent resources are a
 successful result. An active workflow lease, operator cancellation, or an owned
 image that is still referenced is unfinished work and exits `3`; inspection or

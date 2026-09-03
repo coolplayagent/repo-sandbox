@@ -857,7 +857,10 @@ impl AuthenticationContext {
         repository: &str,
     ) -> Result<Self, SnapshotError> {
         match authentication {
-            GitAuthentication::None => Ok(Self::default()),
+            GitAuthentication::None => Ok(Self {
+                environment: unauthenticated_environment(temporary_root)?,
+                secrets: Vec::new(),
+            }),
             GitAuthentication::SshAgent { known_hosts } => {
                 require_ssh_repository(repository)?;
                 let environment = ssh_environment(None, known_hosts.as_deref(), temporary_root)?;
@@ -1010,6 +1013,32 @@ fn ssh_environment(
     // untrusted path is expanded from the environment inside double quotes,
     // and expansion results are not parsed again as shell syntax.
     Ok(vec![
+        (
+            "GIT_SSH_COMMAND".into(),
+            "ssh -F \"$REPO_SANDBOX_SSH_CONFIG\"".into(),
+        ),
+        (
+            "REPO_SANDBOX_SSH_CONFIG".into(),
+            ssh_config_path(&config)?.into(),
+        ),
+        ("GIT_SSH_VARIANT".into(), "ssh".into()),
+    ])
+}
+
+fn unauthenticated_environment(
+    temporary_root: &Path,
+) -> Result<Vec<(OsString, OsString)>, SnapshotError> {
+    let config = temporary_root.join("ssh-no-credentials-config");
+    fs::write(
+        &config,
+        "Host *\n  BatchMode yes\n  IdentitiesOnly yes\n  IdentityAgent none\n  IdentityFile none\n  StrictHostKeyChecking yes\n",
+    )
+    .map_err(io_error("write unauthenticated SSH configuration"))?;
+    restrict_file(&config)?;
+    Ok(vec![
+        ("GIT_CONFIG_COUNT".into(), "1".into()),
+        ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
+        ("GIT_CONFIG_VALUE_0".into(), "".into()),
         (
             "GIT_SSH_COMMAND".into(),
             "ssh -F \"$REPO_SANDBOX_SSH_CONFIG\"".into(),
@@ -1272,6 +1301,10 @@ where
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
+        // Never inherit interactive helpers from the caller. Explicit auth
+        // modes install only the narrowly scoped mechanisms they need.
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
         .envs(environment.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2402,6 +2435,35 @@ mod tests {
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), token);
         assert!(!root.path().join("unexpected-side-effect").exists());
+    }
+
+    #[test]
+    fn unauthenticated_remote_disables_implicit_helpers_and_ssh_identities() {
+        let root = tempfile::tempdir().unwrap();
+        let context = AuthenticationContext::prepare(
+            &GitAuthentication::None,
+            root.path(),
+            "https://example.test/org/repo.git",
+        )
+        .unwrap();
+        let values = context
+            .environment
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(values.get("GIT_CONFIG_KEY_0").unwrap(), "credential.helper");
+        assert_eq!(values.get("GIT_CONFIG_VALUE_0").unwrap(), "");
+        let ssh_config =
+            fs::read_to_string(values.get("REPO_SANDBOX_SSH_CONFIG").unwrap()).unwrap();
+        assert!(ssh_config.contains("IdentitiesOnly yes"));
+        assert!(ssh_config.contains("IdentityAgent none"));
+        assert!(ssh_config.contains("IdentityFile none"));
+        assert!(!values.contains_key("GIT_ASKPASS"));
     }
 
     #[test]

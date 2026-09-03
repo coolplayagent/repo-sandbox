@@ -27,7 +27,8 @@ repo-sandbox plan --repository .
 Private Git snapshots support SSH agent/key references and HTTPS token/credential
 helper authentication without storing credentials. See
 [`docs/config-v1.md`](docs/config-v1.md#private-git-authentication) for the
-security contract.
+security contract. With no credential flag, implicit helpers, askpass programs,
+SSH agents, and default SSH identities are disabled.
 
 `doctor` checks the host OS/CPU, Docker daemon, BuildKit, buildx,
 cross-architecture QEMU/binfmt support, repository filesystem space, and Docker

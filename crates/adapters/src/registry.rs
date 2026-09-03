@@ -5,6 +5,7 @@
 //! values sent on stdin.
 
 use crate::buildkit::{Cancellation, NeverCancelled};
+use crate::snapshot::{ProcessTree, configure_process_tree};
 use repo_sandbox_core::build::{ImageDigest, ImageRef, PlatformDigest};
 use repo_sandbox_core::config::Platform;
 use repo_sandbox_core::registry::{
@@ -56,7 +57,8 @@ impl RegistryExecutor for SystemRegistryExecutor {
         stdin: Option<&[u8]>,
         cancellation: &dyn Cancellation,
     ) -> io::Result<RegistryOutput> {
-        let mut child = Command::new(&invocation.program)
+        let mut command = Command::new(&invocation.program);
+        command
             .args(&invocation.args)
             .current_dir(
                 invocation
@@ -70,8 +72,13 @@ impl RegistryExecutor for SystemRegistryExecutor {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn()?;
+        let process_tree = ProcessTree::attach(&mut child).inspect_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
         if let Some(secret) = stdin {
             child.stdin.take().expect("piped stdin").write_all(secret)?;
         }
@@ -81,7 +88,7 @@ impl RegistryExecutor for SystemRegistryExecutor {
         let stderr_reader = thread::spawn(move || read_output(stderr));
         let (status, interrupted) = loop {
             if cancellation.is_cancelled() {
-                child.kill()?;
+                process_tree.terminate();
                 break (child.wait()?, true);
             }
             if let Some(status) = child.try_wait()? {
@@ -89,6 +96,9 @@ impl RegistryExecutor for SystemRegistryExecutor {
             }
             thread::sleep(Duration::from_millis(25));
         };
+        // A registry CLI can exit while its Buildx plugin or credential helper
+        // still owns the pipes. Terminate the creation-time tree before joining.
+        process_tree.terminate();
         Ok(RegistryOutput {
             exit_code: status.code(),
             stdout: join_output(stdout_reader)?,
@@ -834,6 +844,41 @@ mod tests {
     const ROOT: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const AMD: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const ARM: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    struct ImmediatelyCancelled;
+
+    impl Cancellation for ImmediatelyCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn system_registry_executor_bounds_helpers_that_inherit_output_pipes() {
+        #[cfg(unix)]
+        let invocation = RegistryInvocation {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 30 & wait".into()],
+            current_dir: None,
+        };
+        #[cfg(windows)]
+        let invocation = RegistryInvocation {
+            program: "cmd".into(),
+            args: vec![
+                "/d".into(),
+                "/s".into(),
+                "/c".into(),
+                "start \"\" /b cmd /d /s /c \"ping -n 30 127.0.0.1 >NUL\"".into(),
+            ],
+            current_dir: None,
+        };
+        let started = std::time::Instant::now();
+        let output = SystemRegistryExecutor
+            .execute(&invocation, None, &ImmediatelyCancelled)
+            .unwrap();
+        assert!(output.interrupted);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     struct FakeExecutor {
         outputs: Mutex<VecDeque<RegistryOutput>>,

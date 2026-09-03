@@ -1580,7 +1580,7 @@ fn export_verified_oci(
         }
         layouts.push((platform, layout));
     }
-    merge_oci_layouts(&layouts, output, temporary.path())
+    merge_oci_layouts(&layouts, output, temporary.path(), cancellation)
 }
 
 fn verify_primary_digest(
@@ -1601,14 +1601,17 @@ fn merge_oci_layouts(
     layouts: &[(Platform, PathBuf)],
     output: &Path,
     temporary_root: &Path,
+    cancellation: &dyn Cancellation,
 ) -> Result<(), AppError> {
+    ensure_oci_not_cancelled(cancellation)?;
     let merged = temporary_root.join("merged");
     fs::create_dir(&merged).map_err(environment("create merged OCI layout"))?;
     let blobs = merged.join("blobs");
     fs::create_dir(&blobs).map_err(environment("create merged OCI blobs"))?;
     let mut manifests = Vec::new();
     for (platform, layout) in layouts {
-        copy_tree(&layout.join("blobs"), &blobs)?;
+        ensure_oci_not_cancelled(cancellation)?;
+        copy_tree(&layout.join("blobs"), &blobs, cancellation)?;
         let index: serde_json::Value = serde_json::from_slice(
             &fs::read(layout.join("index.json")).map_err(environment("read OCI index"))?,
         )
@@ -1736,8 +1739,23 @@ fn rename_directory_no_replace(source: &Path, destination: &Path) -> std::io::Re
     fs::rename(source, destination)
 }
 
-fn copy_tree(source: &Path, destination: &Path) -> Result<(), AppError> {
+fn ensure_oci_not_cancelled(cancellation: &dyn Cancellation) -> Result<(), AppError> {
+    if cancellation.is_cancelled() {
+        Err(AppError::Environment(
+            "OCI publication cancelled or timed out".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn copy_tree(
+    source: &Path,
+    destination: &Path,
+    cancellation: &dyn Cancellation,
+) -> Result<(), AppError> {
     for entry in fs::read_dir(source).map_err(environment("read OCI blobs"))? {
+        ensure_oci_not_cancelled(cancellation)?;
         let entry = entry.map_err(environment("read OCI blob entry"))?;
         let target = destination.join(entry.file_name());
         if entry
@@ -1746,9 +1764,28 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), AppError> {
             .is_dir()
         {
             fs::create_dir_all(&target).map_err(environment("create OCI blob directory"))?;
-            copy_tree(&entry.path(), &target)?;
+            copy_tree(&entry.path(), &target, cancellation)?;
         } else if !target.exists() {
-            fs::copy(entry.path(), target).map_err(environment("copy OCI blob"))?;
+            let mut input = fs::File::open(entry.path()).map_err(environment("open OCI blob"))?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target)
+                .map_err(environment("create OCI blob"))?;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                ensure_oci_not_cancelled(cancellation)?;
+                let count = input
+                    .read(&mut buffer)
+                    .map_err(environment("read OCI blob"))?;
+                if count == 0 {
+                    break;
+                }
+                output
+                    .write_all(&buffer[..count])
+                    .map_err(environment("write OCI blob"))?;
+            }
+            output.sync_all().map_err(environment("sync OCI blob"))?;
         }
     }
     Ok(())
@@ -1806,6 +1843,11 @@ fn preflight(
             "disk preflight requires {required} bytes free, found {free} bytes"
         )));
     }
+    preflight_writable_layer_quota(
+        &SystemProcessExecutor,
+        plan.template.execution.resources.temporary_storage_mb,
+        cancellation,
+    )?;
     if plan.request.push {
         let policy = plan
             .template
@@ -1813,35 +1855,148 @@ fn preflight(
             .registry
             .as_ref()
             .expect("validated before preflight");
-        let registry = policy.repository.split('/').next().unwrap_or("");
-        let (host, port) = registry
-            .rsplit_once(':')
-            .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
-            .unwrap_or((registry, 443));
-        SystemDoctorProbe
-            .connect_registry(host, port, std::time::Duration::from_secs(3))
-            .map_err(environment("registry preflight"))?;
-        let probe_ref = format!(
-            "{}:repo-sandbox-preflight-{}",
-            policy.repository,
-            std::process::id()
-        );
+        preflight_registry_with(&SystemProcessExecutor, &policy.repository, cancellation)?;
+    }
+    Ok(())
+}
+
+fn preflight_registry_with(
+    executor: &impl ProcessExecutor,
+    repository: &str,
+    cancellation: &DeadlineCancellation,
+) -> Result<(), AppError> {
+    // This intentionally runs through Docker rather than opening a socket from
+    // the CLI host. Docker therefore applies DOCKER_HOST, daemon networking,
+    // credential helpers, and proxy configuration exactly as publication does.
+    let probe_ref = format!("{repository}:repo-sandbox-preflight-{}", std::process::id());
+    let invocation = ProcessInvocation {
+        program: "docker".into(),
+        args: vec!["manifest".into(), "inspect".into(), probe_ref],
+        current_dir: None,
+    };
+    let output = executor
+        .execute(&invocation, cancellation)
+        .map_err(|error| bounded_error("registry /v2/ preflight", error, cancellation))?;
+    if registry_probe_authenticated(&output) {
+        Ok(())
+    } else {
+        Err(AppError::Environment(format!(
+            "registry /v2/ preflight authentication or reachability failed: {}",
+            output.stderr.trim()
+        )))
+    }
+}
+
+fn preflight_writable_layer_quota(
+    executor: &impl ProcessExecutor,
+    storage_mb: u32,
+    cancellation: &dyn Cancellation,
+) -> Result<(), AppError> {
+    let temporary = tempfile::Builder::new()
+        .prefix("repo-sandbox-quota-preflight-")
+        .tempdir()
+        .map_err(environment("create quota preflight directory"))?;
+    // Two zero tar blocks are a valid empty archive, so this probe never needs
+    // a network pull or a caller-controlled image.
+    let archive = temporary.path().join("empty-rootfs.tar");
+    fs::write(&archive, [0_u8; 1024]).map_err(environment("write quota probe rootfs"))?;
+    let identity = task_id();
+    let image = format!("repo-sandbox-quota-probe:{identity}");
+    let container = format!("repo-sandbox-quota-probe-{identity}");
+    let owner = format!("repo-sandbox.quota-probe={identity}");
+    let run = |args: Vec<String>, token: &dyn Cancellation| -> Result<(), AppError> {
         let invocation = ProcessInvocation {
             program: "docker".into(),
-            args: vec!["manifest".into(), "inspect".into(), probe_ref],
+            args,
             current_dir: None,
         };
-        let output = SystemProcessExecutor
-            .execute(&invocation, cancellation)
-            .map_err(|error| bounded_error("registry /v2/ preflight", error, cancellation))?;
-        if !registry_probe_authenticated(&output) {
+        let output = executor
+            .execute(&invocation, token)
+            .map_err(environment("execute writable-layer quota preflight"))?;
+        if output.interrupted || token.is_cancelled() {
+            return Err(AppError::Environment(
+                "writable-layer quota preflight was cancelled or timed out".into(),
+            ));
+        }
+        if output.exit_code != Some(0) {
             return Err(AppError::Environment(format!(
-                "registry /v2/ preflight authentication or reachability failed: {}",
+                "Docker daemon does not support the required writable-layer quota: {}",
                 output.stderr.trim()
             )));
         }
+        Ok(())
+    };
+    let primary = (|| {
+        run(
+            vec![
+                "image".into(),
+                "import".into(),
+                "--change".into(),
+                format!("LABEL {owner}"),
+                docker_host_path(&archive),
+                image.clone(),
+            ],
+            cancellation,
+        )?;
+        run(
+            vec![
+                "container".into(),
+                "create".into(),
+                "--name".into(),
+                container.clone(),
+                "--label".into(),
+                owner,
+                "--storage-opt".into(),
+                format!("size={storage_mb}m"),
+                image.clone(),
+                "/bin/true".into(),
+            ],
+            cancellation,
+        )
+    })();
+
+    let cleanup_deadline = DeadlineCancellation::new(std::time::Duration::from_secs(30));
+    let mut cleanup_errors = Vec::new();
+    for (args, absent) in [
+        (
+            vec!["container".into(), "rm".into(), "--force".into(), container],
+            "no such container",
+        ),
+        (
+            vec!["image".into(), "rm".into(), "--force".into(), image],
+            "no such image",
+        ),
+    ] {
+        let invocation = ProcessInvocation {
+            program: "docker".into(),
+            args,
+            current_dir: None,
+        };
+        match executor.execute(&invocation, &cleanup_deadline) {
+            Ok(output)
+                if output.exit_code == Some(0)
+                    || output.stderr.to_ascii_lowercase().contains(absent) => {}
+            Ok(output) => cleanup_errors.push(format!(
+                "Docker quota probe cleanup failed: {}",
+                output.stderr.trim()
+            )),
+            Err(error) => cleanup_errors.push(format!(
+                "execute Docker quota probe cleanup failed: {error}"
+            )),
+        }
     }
-    Ok(())
+    match (primary, cleanup_errors.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Err(error), true) => Err(error),
+        (Ok(()), false) => Err(AppError::Environment(format!(
+            "quota preflight cleanup failed: {}",
+            cleanup_errors.join("; ")
+        ))),
+        (Err(error), false) => Err(AppError::Environment(format!(
+            "{error}; quota preflight cleanup failed: {}",
+            cleanup_errors.join("; ")
+        ))),
+    }
 }
 
 #[cfg(not(windows))]
@@ -2923,7 +3078,12 @@ struct ExternalOciGuard {
 
 impl ExternalOciGuard {
     fn prepare(output: &Path) -> Result<Self, AppError> {
-        let output = resolved_future_path(output)?;
+        let output = resolved_future_path(output).map_err(|error| {
+            AppError::Configuration(format!(
+                "invalid OCI layout destination parent for {}: {error}",
+                output.display()
+            ))
+        })?;
         if output.exists() {
             return Err(AppError::Configuration(format!(
                 "OCI layout already exists: {}",
@@ -3009,7 +3169,12 @@ impl Drop for ExternalOciGuard {
 
 impl ExternalReportGuard {
     fn prepare(report: &Path) -> Result<Self, AppError> {
-        let report = resolved_future_path(report)?;
+        let report = resolved_future_path(report).map_err(|error| {
+            AppError::Configuration(format!(
+                "invalid report destination parent for {}: {error}",
+                report.display()
+            ))
+        })?;
         let report = report.as_path();
         let parent = report.parent().ok_or_else(|| {
             AppError::Configuration(format!("report path has no parent: {}", report.display()))
@@ -4110,6 +4275,26 @@ mod tests {
         calls: std::sync::Mutex<Vec<ProcessInvocation>>,
     }
 
+    struct SequenceExecutor {
+        calls: std::sync::Mutex<Vec<ProcessInvocation>>,
+        outputs: std::sync::Mutex<std::collections::VecDeque<crate::buildkit::ProcessOutput>>,
+    }
+
+    impl ProcessExecutor for SequenceExecutor {
+        fn execute(
+            &self,
+            invocation: &ProcessInvocation,
+            _cancellation: &dyn Cancellation,
+        ) -> std::io::Result<crate::buildkit::ProcessOutput> {
+            self.calls.lock().unwrap().push(invocation.clone());
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| std::io::Error::other("missing sequence output"))
+        }
+    }
+
     impl DockerExecutor for CleanupExecutor {
         fn execute(
             &self,
@@ -4193,6 +4378,7 @@ mod tests {
             &[(Platform::LinuxAmd64, amd64), (Platform::LinuxArm64, arm64)],
             &output,
             &staging,
+            &NeverCancelled,
         )
         .unwrap();
 
@@ -4216,11 +4402,52 @@ mod tests {
         fs::write(output.join("sentinel"), "unchanged").unwrap();
         let staging = temporary.path().join("staging");
         fs::create_dir(&staging).unwrap();
-        assert!(merge_oci_layouts(&[(Platform::LinuxAmd64, amd64)], &output, &staging).is_err());
+        assert!(
+            merge_oci_layouts(
+                &[(Platform::LinuxAmd64, amd64)],
+                &output,
+                &staging,
+                &NeverCancelled,
+            )
+            .is_err()
+        );
         assert_eq!(
             fs::read_to_string(output.join("sentinel")).unwrap(),
             "unchanged"
         );
+    }
+
+    #[test]
+    fn oci_blob_copy_observes_cancellation_and_never_publishes_partial_layout() {
+        struct CancelDuringBlob(std::sync::atomic::AtomicUsize);
+        impl Cancellation for CancelDuringBlob {
+            fn is_cancelled(&self) -> bool {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 5
+            }
+        }
+        let source_root = tempfile::tempdir().unwrap();
+        let layout = source_root.path().join("amd64");
+        fake_layout(&layout, &"a".repeat(64));
+        fs::write(
+            layout.join("blobs/sha256").join("a".repeat(64)),
+            vec![b'x'; 256 * 1024],
+        )
+        .unwrap();
+        let destination_root = tempfile::tempdir().unwrap();
+        let output = destination_root.path().join("layout");
+        let staging = tempfile::tempdir().unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let error = merge_oci_layouts(
+            &[(Platform::LinuxAmd64, layout)],
+            &output,
+            staging.path(),
+            &CancelDuringBlob(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("OCI publication cancelled"));
+        assert!(!output.exists());
+        drop(staging);
+        assert!(!staging_path.exists());
     }
 
     #[test]
@@ -4252,12 +4479,9 @@ mod tests {
             parent.canonicalize().unwrap()
         );
         #[cfg(unix)]
-        assert!(
-            staging
-                .path()
-                .parent()
-                .unwrap()
-                .starts_with("/proc/self/fd")
+        assert_eq!(
+            state_identity(staging.path().parent().unwrap()).unwrap(),
+            state_identity(&parent).unwrap()
         );
     }
 
@@ -4955,6 +5179,82 @@ mod tests {
             Some(1),
             "unauthorized: manifest unknown"
         )));
+    }
+
+    #[test]
+    fn registry_preflight_uses_docker_network_context_without_host_socket_probe() {
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [crate::buildkit::ProcessOutput {
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: "manifest unknown".into(),
+                    interrupted: false,
+                }]
+                .into(),
+            ),
+        };
+        let deadline = DeadlineCancellation::new(std::time::Duration::from_secs(2));
+        preflight_registry_with(&executor, "localhost:5000/team/image", &deadline).unwrap();
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(&calls[0].args[..2], ["manifest", "inspect"]);
+        assert!(calls[0].args[2].starts_with("localhost:5000/team/image:"));
+    }
+
+    #[test]
+    fn writable_layer_quota_preflight_uses_an_offline_owned_image_and_cleans_it() {
+        let ok = || crate::buildkit::ProcessOutput {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            interrupted: false,
+        };
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new([ok(), ok(), ok(), ok()].into()),
+        };
+        preflight_writable_layer_quota(&executor, 384, &NeverCancelled).unwrap();
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(&calls[0].args[..2], ["image", "import"]);
+        assert!(
+            calls[0]
+                .args
+                .iter()
+                .any(|arg| arg.ends_with("empty-rootfs.tar"))
+        );
+        assert_eq!(&calls[1].args[..2], ["container", "create"]);
+        assert!(calls[1].args.contains(&"size=384m".into()));
+        assert_eq!(&calls[2].args[..3], ["container", "rm", "--force"]);
+        assert_eq!(&calls[3].args[..3], ["image", "rm", "--force"]);
+    }
+
+    #[test]
+    fn writable_layer_quota_rejection_is_environment_failure_and_still_cleans() {
+        let output = |code, stderr: &str| crate::buildkit::ProcessOutput {
+            exit_code: Some(code),
+            stdout: String::new(),
+            stderr: stderr.into(),
+            interrupted: false,
+        };
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [
+                    output(0, ""),
+                    output(1, "storage quota unsupported"),
+                    output(0, ""),
+                    output(0, ""),
+                ]
+                .into(),
+            ),
+        };
+        let error = preflight_writable_layer_quota(&executor, 512, &NeverCancelled).unwrap_err();
+        assert_eq!(error.exit_code().as_i32(), 3);
+        assert!(error.to_string().contains("writable-layer quota"));
+        assert_eq!(executor.calls.lock().unwrap().len(), 4);
     }
 
     #[cfg(not(windows))]
