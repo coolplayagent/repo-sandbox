@@ -3460,7 +3460,7 @@ mod tests {
         assert!(!result.complete());
         assert_eq!(result.absent, vec![missing.display().to_string()]);
         assert_eq!(result.failed.len(), 1);
-        assert!(result.failed[0].contains("state component changed"));
+        assert!(result.failed[0].contains("workflow state component"));
         assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unchanged");
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
         fs::remove_file(tasks).unwrap();
