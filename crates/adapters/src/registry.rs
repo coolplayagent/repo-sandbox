@@ -215,6 +215,11 @@ impl RegistryError {
     pub const fn kind(&self) -> RegistryErrorKind {
         self.kind
     }
+
+    pub fn is_manifest_absent(&self) -> bool {
+        let message = self.message.to_ascii_lowercase();
+        message.contains("manifest unknown") || message.contains("no such manifest")
+    }
 }
 
 impl Display for RegistryError {
@@ -268,13 +273,26 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
         expected_config: &ImageDigest,
         cancellation: &dyn Cancellation,
     ) -> Result<ImageDigest, RegistryError> {
-        let inspected = self.inspect_digest(image, &[], cancellation)?;
+        let digest_invocation = docker(&[
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            image.to_string(),
+        ]);
+        let described = self.run(
+            "inspect single-platform staging descriptor",
+            &digest_invocation,
+            None,
+            cancellation,
+        )?;
+        let digest = parse_descriptor_digest(&described.stdout)?;
+        let pinned = digest_ref(image, &digest)?;
         let raw_invocation = docker(&[
             "buildx".into(),
             "imagetools".into(),
             "inspect".into(),
             "--raw".into(),
-            image.to_string(),
+            pinned,
         ]);
         let raw = self.run(
             "inspect single-platform staging manifest",
@@ -299,7 +317,7 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
             message,
         })?;
         ensure_digest(expected_config, &config, "single-platform staging config")?;
-        Ok(inspected.digest)
+        Ok(digest)
     }
 
     /// Publish while reporting only remote references whose manifest copy and
@@ -1418,11 +1436,7 @@ mod tests {
         let remote = root_digest();
         let local_config = ImageDigest::new(AMD).unwrap();
         let raw = single_manifest_with_config(AMD);
-        let registry = DockerRegistry::new(FakeExecutor::new(vec![
-            ok(described()),
-            ok(raw.clone()),
-            ok(raw),
-        ]));
+        let registry = DockerRegistry::new(FakeExecutor::new(vec![ok(described()), ok(raw)]));
         let resolved = registry
             .resolve_single_source_digest(
                 &ImageRef::new("registry.test/team/image:task-staging").unwrap(),
@@ -1431,10 +1445,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resolved, remote);
+        let calls = registry.executor.invocations.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].0.args.last().unwrap(),
+            &format!("registry.test/team/image:task-staging@{ROOT}")
+        );
+        drop(calls);
 
         let foreign = DockerRegistry::new(FakeExecutor::new(vec![
             ok(described()),
-            ok(single_manifest_with_config(ARM)),
             ok(single_manifest_with_config(ARM)),
         ]));
         assert_eq!(

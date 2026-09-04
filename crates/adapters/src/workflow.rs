@@ -9,7 +9,7 @@ use crate::cancellation::{DeadlineCancellation, ProcessCancellation};
 use crate::docker_runner::{DockerExecutor, DockerRunner, SystemClock, SystemDockerExecutor};
 #[cfg(windows)]
 use crate::doctor::{DoctorProbe, SystemDoctorProbe};
-use crate::registry::{DockerRegistry, SystemRegistryExecutor};
+use crate::registry::{DockerRegistry, RegistryErrorKind, SystemRegistryExecutor};
 use crate::snapshot::GitSnapshotter;
 use crate::task_image::{TaskImageBuilder, TaskImageOptions, TaskImageRequest};
 use repo_sandbox_core::AppError;
@@ -447,7 +447,12 @@ impl WorkflowPort for SystemWorkflow {
                         &task_image.image.image,
                         &repository,
                         &task_image.image.digest,
+                        &task_id,
                         &cancellation,
+                        |progress| {
+                            report.publication_progress.push(progress);
+                            completed_report = Some(report.clone());
+                        },
                     )?;
                     let reference = seeded.reference.clone();
                     let remote_digest = seeded.digest.clone();
@@ -464,19 +469,6 @@ impl WorkflowPort for SystemWorkflow {
                         },
                     )
                 };
-                if plan.request.platforms.len() == 1 {
-                    // A daemon push can re-serialize a loaded OCI manifest. Keep that
-                    // task-unique source explicit as staging; final immutable and alias
-                    // references are reported only by the registry publisher below.
-                    report.publication_progress.push(RemotePublicationFact {
-                        kind: PublicationFactKind::TaskStaging,
-                        reference: published_task.0.clone(),
-                        digest: published_task.1.digest.clone(),
-                        verified: true,
-                        finality: PublicationFinality::Staging,
-                    });
-                    completed_report = Some(report.clone());
-                }
                 let publish_request = PublishRequest {
                     source: published_task.0,
                     repository,
@@ -4432,9 +4424,11 @@ fn seed_registry(
     source: &ImageRef,
     repository: &RegistryRepository,
     digest: &repo_sandbox_core::build::ImageDigest,
+    task_id: &str,
     cancellation: &DeadlineCancellation,
+    mut on_progress: impl FnMut(RemotePublicationFact),
 ) -> Result<RegistrySeed, AppError> {
-    let content = registry_content_ref(repository, digest);
+    let content = registry_staging_ref(repository, task_id)?;
     let lease = OutputReservation::wait_identity(
         &format!("local-registry-content-tag:{content}"),
         Path::new(content.as_str()),
@@ -4446,7 +4440,7 @@ fn seed_registry(
     })?;
     let existing = inspect_local_image_id(&content, cancellation)?;
     let owned_local_tag = local_seed_tag_is_owned(&source_id, existing.as_deref(), &content)?;
-    let run = |args: Vec<&str>| -> Result<(), AppError> {
+    let run = |args: Vec<&str>| -> Result<crate::buildkit::ProcessOutput, AppError> {
         let invocation = ProcessInvocation {
             program: "docker".into(),
             args: args.into_iter().map(str::to_owned).collect(),
@@ -4460,50 +4454,56 @@ fn seed_registry(
                 "workflow timeout during registry seed push".into(),
             ));
         }
-        if output.exit_code != Some(0) {
-            return Err(AppError::Environment(format!(
-                "registry seed push failed: {}",
-                output.stderr.trim()
-            )));
-        }
-        Ok(())
+        Ok(output)
     };
-    if owned_local_tag
-        && let Err(primary) = run(vec!["image", "tag", source.as_str(), content.as_str()])
-    {
-        let cleanup = remove_local_registry_tag_after_cancellation(&content);
-        return Err(match cleanup {
-            Ok(()) => primary,
-            Err(cleanup) => AppError::Environment(format!(
-                "{primary}; reconcile ambiguous registry seed tag {content}: {cleanup}"
-            )),
-        });
-    }
-    if let Err(primary) = run(vec!["push", content.as_str()]) {
-        if owned_local_tag {
+    if owned_local_tag {
+        let tagged = run(vec!["image", "tag", source.as_str(), content.as_str()]);
+        let primary = match tagged {
+            Ok(output) if output.exit_code == Some(0) => None,
+            Ok(output) => Some(AppError::Environment(format!(
+                "registry seed tag failed: {}",
+                output.stderr.trim()
+            ))),
+            Err(error) => Some(error),
+        };
+        if let Some(primary) = primary {
             let cleanup = remove_local_registry_tag_after_cancellation(&content);
             return Err(match cleanup {
                 Ok(()) => primary,
                 Err(cleanup) => AppError::Environment(format!(
-                    "{primary}; remove failed registry seed tag {content}: {cleanup}"
+                    "{primary}; reconcile ambiguous registry seed tag {content}: {cleanup}"
                 )),
             });
         }
-        return Err(AppError::Environment(format!(
-            "{primary}; pre-existing shared local content tag {content} was safely retained"
-        )));
     }
+    let push = run(vec!["push", content.as_str()]);
+    let mut primary = match &push {
+        Ok(output) if output.exit_code == Some(0) => None,
+        Ok(output) => Some(AppError::Environment(format!(
+            "registry seed push failed: {}",
+            output.stderr.trim()
+        ))),
+        Err(error) => Some(AppError::Environment(format!(
+            "registry seed push failed: {error}"
+        ))),
+    };
     let expected_config = ImageDigest::new(source_id).map_err(|error| {
         AppError::Environment(format!("invalid local registry seed image ID: {error}"))
     })?;
-    let digest = match DockerRegistry::new(SystemRegistryExecutor).resolve_single_source_digest(
+    let reconciliation = PostCancellationDeadline::new(registry_reconciliation_timeout());
+    let registry = DockerRegistry::new(SystemRegistryExecutor);
+    let resolved = reconcile_registry_seed(
         &content,
-        &expected_config,
-        cancellation,
-    ) {
+        digest,
+        primary.take(),
+        &reconciliation,
+        || registry.resolve_single_source_digest(&content, &expected_config, &reconciliation),
+        &mut on_progress,
+        std::thread::sleep,
+    );
+    let digest = match resolved {
         Ok(digest) => digest,
-        Err(error) => {
-            let primary = AppError::Environment(format!("verify pushed registry seed: {error}"));
+        Err(primary) => {
             if owned_local_tag {
                 return Err(
                     match remove_local_registry_tag_after_cancellation(&content) {
@@ -4515,7 +4515,7 @@ fn seed_registry(
                 );
             }
             return Err(AppError::Environment(format!(
-                "{primary}; pre-existing shared local content tag {content} was safely retained"
+                "{primary}; pre-existing shared local staging tag {content} was safely retained"
             )));
         }
     };
@@ -4527,11 +4527,79 @@ fn seed_registry(
     })
 }
 
+fn reconcile_registry_seed(
+    reference: &ImageRef,
+    intended_digest: &ImageDigest,
+    mut primary: Option<AppError>,
+    cancellation: &dyn Cancellation,
+    mut resolve: impl FnMut() -> Result<ImageDigest, crate::registry::RegistryError>,
+    mut on_progress: impl FnMut(RemotePublicationFact),
+    mut wait: impl FnMut(std::time::Duration),
+) -> Result<ImageDigest, AppError> {
+    on_progress(RemotePublicationFact {
+        kind: PublicationFactKind::TaskStaging,
+        reference: reference.clone(),
+        // The push command may have committed before losing its result. Until
+        // pinned descriptor/config verification succeeds this is only an
+        // explicitly unverified remote side-effect observation.
+        digest: intended_digest.clone(),
+        verified: false,
+        finality: PublicationFinality::Staging,
+    });
+    let mut delay = registry_reconciliation_initial_delay();
+    let remote_digest = loop {
+        match resolve() {
+            Ok(remote_digest) => break Some(remote_digest),
+            Err(error) if error.kind() == RegistryErrorKind::DigestMismatch => {
+                primary.get_or_insert_with(|| {
+                    AppError::Environment(format!("verify pushed registry seed: {error}"))
+                });
+                break None;
+            }
+            Err(error) if error.is_manifest_absent() => {}
+            Err(error) => {
+                primary.get_or_insert_with(|| {
+                    AppError::Environment(format!("verify pushed registry seed: {error}"))
+                });
+            }
+        }
+        if cancellation.is_cancelled() {
+            break None;
+        }
+        wait(delay);
+        delay = (delay * 2).min(std::time::Duration::from_secs(1));
+    };
+    if let Some(remote_digest) = &remote_digest {
+        on_progress(RemotePublicationFact {
+            kind: PublicationFactKind::TaskStaging,
+            reference: reference.clone(),
+            digest: remote_digest.clone(),
+            verified: true,
+            finality: PublicationFinality::Staging,
+        });
+    }
+    if let Some(primary) = primary {
+        return Err(primary);
+    }
+    remote_digest.ok_or_else(|| {
+        AppError::Environment("registry seed manifest did not become verifiably visible".into())
+    })
+}
+
 struct RegistrySeed {
     reference: ImageRef,
     digest: ImageDigest,
     owned_local_tag: bool,
     _lease: OutputReservation,
+}
+
+fn registry_staging_ref(
+    repository: &RegistryRepository,
+    task_id: &str,
+) -> Result<ImageRef, AppError> {
+    let tag =
+        RegistryTag::new(format!("task-staging-{task_id}")).map_err(AppError::Configuration)?;
+    Ok(repository.tagged(&tag))
 }
 
 fn local_seed_tag_is_owned(
@@ -4583,13 +4651,6 @@ fn inspect_local_image_id(
             output.stderr.trim()
         )))
     }
-}
-
-fn registry_content_ref(
-    repository: &RegistryRepository,
-    digest: &repo_sandbox_core::build::ImageDigest,
-) -> ImageRef {
-    repository.tagged(&RegistryTag::for_digest(digest))
 }
 
 fn remove_local_registry_tag(
@@ -6762,20 +6823,6 @@ mod tests {
     }
 
     #[test]
-    fn single_platform_seed_uses_the_final_content_tag_not_staging() {
-        let repository = RegistryRepository::new("registry.test/team/image").unwrap();
-        let digest =
-            repo_sandbox_core::build::ImageDigest::new(format!("sha256:{}", "a".repeat(64)))
-                .unwrap();
-        let target = registry_content_ref(&repository, &digest);
-        assert_eq!(
-            target.as_str(),
-            format!("registry.test/team/image:sha256-{}", "a".repeat(64))
-        );
-        assert!(!target.as_str().contains("staging"));
-    }
-
-    #[test]
     fn successful_single_publication_removes_its_local_content_tag() {
         let executor = InspectExecutor {
             calls: std::sync::Mutex::new(Vec::new()),
@@ -6789,6 +6836,129 @@ mod tests {
             calls[0].args,
             ["image", "rm", reference.as_str()].map(str::to_owned)
         );
+    }
+
+    #[test]
+    fn single_platform_seed_uses_a_task_unique_nonfinal_staging_tag() {
+        let repository = RegistryRepository::new("registry.test/team/image").unwrap();
+        let first = registry_staging_ref(&repository, "123-a-1").unwrap();
+        let second = registry_staging_ref(&repository, "123-b-2").unwrap();
+        assert_ne!(first, second);
+        assert!(first.as_str().ends_with(":task-staging-123-a-1"));
+        assert!(!first.as_str().contains(":sha256-"));
+    }
+
+    fn seed_digest(byte: char) -> ImageDigest {
+        ImageDigest::new(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
+    }
+
+    #[test]
+    fn committed_but_failed_seed_records_pinned_remote_fact_without_finalizing() {
+        let reference = ImageRef::new("registry.test/team/image:task-staging-task-1").unwrap();
+        let local = seed_digest('a');
+        let remote = seed_digest('b');
+        let mut answers = std::collections::VecDeque::from([
+            Err(crate::registry::RegistryError::new(
+                RegistryErrorKind::Manifest,
+                "manifest unknown",
+            )),
+            Ok(remote.clone()),
+        ]);
+        let mut facts = Vec::new();
+        let result = reconcile_registry_seed(
+            &reference,
+            &local,
+            Some(AppError::Environment(
+                "push result was lost after spawn".into(),
+            )),
+            &NeverCancelled,
+            || answers.pop_front().unwrap(),
+            |fact| facts.push(fact),
+            |_| {},
+        );
+        assert!(result.unwrap_err().to_string().contains("result was lost"));
+        assert_eq!(facts.len(), 2);
+        assert!(!facts[0].verified);
+        assert_eq!(facts[0].digest, local);
+        assert!(facts[1].verified);
+        assert_eq!(facts[1].digest, remote);
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.kind == PublicationFactKind::TaskStaging)
+        );
+    }
+
+    #[test]
+    fn foreign_or_uninspectable_seed_never_becomes_a_final_publication_fact() {
+        for (error, cancellation) in [
+            (
+                crate::registry::RegistryError::new(
+                    RegistryErrorKind::DigestMismatch,
+                    "foreign config",
+                ),
+                PollBudget {
+                    remaining: std::sync::atomic::AtomicUsize::new(10),
+                },
+            ),
+            (
+                crate::registry::RegistryError::new(
+                    RegistryErrorKind::Network,
+                    "inspect transport failed",
+                ),
+                PollBudget {
+                    remaining: std::sync::atomic::AtomicUsize::new(0),
+                },
+            ),
+        ] {
+            let reference = ImageRef::new("registry.test/team/image:task-staging-task-2").unwrap();
+            let mut error = Some(error);
+            let mut facts = Vec::new();
+            let result = reconcile_registry_seed(
+                &reference,
+                &seed_digest('a'),
+                None,
+                &cancellation,
+                || Err(error.take().unwrap()),
+                |fact| facts.push(fact),
+                |_| {},
+            );
+            assert!(result.is_err());
+            assert_eq!(facts.len(), 1);
+            assert!(!facts[0].verified);
+            assert_eq!(facts[0].finality, PublicationFinality::Staging);
+        }
+    }
+
+    #[test]
+    fn remote_rewrite_uses_only_remote_digest_for_the_final_content_namespace() {
+        let repository = RegistryRepository::new("registry.test/team/image").unwrap();
+        let reference = registry_staging_ref(&repository, "task-3").unwrap();
+        let local = seed_digest('a');
+        let remote = seed_digest('b');
+        let mut facts = Vec::new();
+        let resolved = reconcile_registry_seed(
+            &reference,
+            &local,
+            None,
+            &NeverCancelled,
+            || Ok(remote.clone()),
+            |fact| facts.push(fact),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(resolved, remote);
+        assert_eq!(
+            repository
+                .tagged(&RegistryTag::for_digest(&resolved))
+                .as_str(),
+            format!("registry.test/team/image:sha256-{}", "b".repeat(64))
+        );
+        assert_ne!(
+            repository.tagged(&RegistryTag::for_digest(&resolved)),
+            repository.tagged(&RegistryTag::for_digest(&local))
+        );
+        assert_eq!(facts.iter().filter(|fact| fact.verified).count(), 1);
     }
 
     #[test]
