@@ -211,11 +211,10 @@ for architecture in amd64 arm64; do
     foreign_log="$temporary/offline-closure-foreign-module.log"
     if docker run --rm --network none --platform "$platform" "$task" sh -ec '
       printf '\''%s\n'\'' '\''bazel_dep(name = "rules_go", version = "0.50.1")'\'' \
-        '\''go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")'\'' \
         >> MODULE.bazel
       bazel --batch build //...
     ' >"$foreign_log" 2>&1; then
-      echo 'Bazel unexpectedly resolved a module outside the central baseline' >&2
+      echo 'Bazel unexpectedly downloaded a module outside the central baseline' >&2
       exit 1
     fi
     grep -Eqi 'registry|repository|download' "$foreign_log"

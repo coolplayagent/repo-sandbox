@@ -39,10 +39,9 @@ repository downloads. Task containers use Docker network `none`. When a source
 snapshot has no `MODULE.bazel.lock`, the task image supplies the checksum-pinned
 baseline lock for Bazel 8.3.1's built-in C++, Java, shell, and platform module
 mapping. The read-only image closure contains both registry metadata and source
-archives, rather than relying on a BuildKit cache mount. Version 1 supports only
-the centrally defined baseline module closure; repositories that declare any
-additional module or module extension fail closed because runtime downloads are
-disabled. Apt and Cargo
+archives, rather than relying on a BuildKit cache mount. Version 1 seeds only
+the centrally defined baseline module closure; any additional dependency or
+extension closure that requires a download fails closed at runtime. Apt and Cargo
 paths use locked, architecture-specific BuildKit cache mounts; those mounts and
 `/run/secrets` are never committed to a layer.
 

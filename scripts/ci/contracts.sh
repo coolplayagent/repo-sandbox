@@ -137,8 +137,9 @@ grep -Fxq 'templates/rust-bazel/context/bazel text eol=lf' "$root/.gitattributes
 grep -Fxq 'templates/rust-bazel/context/offline-baseline/* text eol=lf' \
   "$root/.gitattributes"
 grep -Fq "Template: rust-bazel@1.0.1" "$ci"
-! grep -Rq -F 'rust-bazel@1.0.0' "$root/.github" "$root/scripts" "$root/docs"
-grep -Fq 'Bazel unexpectedly resolved a module outside the central baseline' \
+! grep -Rq -F --exclude=contracts.sh 'rust-bazel@1.0.0' \
+  "$root/.github" "$root/scripts" "$root/docs"
+grep -Fq 'Bazel unexpectedly downloaded a module outside the central baseline' \
   "$root/scripts/docker/multistage-acceptance.sh"
 grep -A5 -F 'name = "e2e_matrix_test"' "$adapters_build" | grep -Fq 'srcs = ["e2e/e2e_matrix.rs"]'
 grep -Fq 'bazelisk test --action_env=PATH //...' "$ci"
