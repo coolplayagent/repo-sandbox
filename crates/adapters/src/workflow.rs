@@ -6423,6 +6423,74 @@ mod tests {
     }
 
     #[test]
+    fn quota_resource_ids_reject_malformed_and_cross_kind_values() {
+        let image = format!("sha256:{}", "a".repeat(64));
+        let container = "b".repeat(64);
+        assert!(valid_quota_resource_id("image", &image));
+        assert!(valid_quota_resource_id("container", &container));
+
+        for (kind, id) in [
+            ("image", "a".repeat(64)),
+            ("container", format!("sha256:{}", "b".repeat(64))),
+            ("image", format!("sha256:{}", "a".repeat(63))),
+            ("image", format!("sha256:{}", "a".repeat(65))),
+            ("container", "b".repeat(63)),
+            ("container", "b".repeat(65)),
+            ("image", format!("sha256:{}", "A".repeat(64))),
+            ("container", "B".repeat(64)),
+            ("image", format!("sha256:{}g", "a".repeat(63))),
+            ("container", format!("{}g", "b".repeat(63))),
+            ("image", format!("sha256:{}|extra", "a".repeat(64))),
+            ("container", format!("{}|extra", "b".repeat(64))),
+            ("volume", "c".repeat(64)),
+        ] {
+            assert!(
+                !valid_quota_resource_id(kind, &id),
+                "accepted malformed {kind} ID {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn quota_reconciliation_refuses_matching_labels_with_malformed_id_without_removal() {
+        let malformed = format!("sha256:{}", "b".repeat(64));
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [crate::buildkit::ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: format!("{malformed}|quota-probe|fixture"),
+                    stderr: String::new(),
+                    interrupted: false,
+                }]
+                .into(),
+            ),
+        };
+
+        let error = reconcile_quota_resource(
+            &executor,
+            "container",
+            "repo-sandbox-quota-probe-fixture",
+            "quota-probe",
+            "io.repo-sandbox.kind",
+            "io.repo-sandbox.task-id",
+            "fixture",
+            &NeverCancelled,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("foreign quota probe container"));
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(&calls[0].args[..2], ["container", "inspect"]);
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.args.get(1) == Some(&"rm".into()))
+        );
+    }
+
+    #[test]
     fn writable_layer_quota_rejection_is_environment_failure_and_still_cleans() {
         let output = |code, stderr: &str| crate::buildkit::ProcessOutput {
             exit_code: Some(code),
