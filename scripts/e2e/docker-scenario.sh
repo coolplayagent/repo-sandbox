@@ -6,6 +6,15 @@ valid_task_id_value() {
   [[ -n $value && ${#value} -le 48 && $value =~ ^[a-z0-9_-]+$ ]]
 }
 
+task_source_rebuilt_stream() {
+  awk '
+    /\[(task )?[0-9]+\/[0-9]+\] COPY .*source/ { vertex=$1 }
+    vertex != "" && $1 == vertex && /[[:space:]]CACHED$/ { cached=1 }
+    vertex != "" && $1 == vertex && /[[:space:]]DONE/ { done=1 }
+    END { exit !done || cached }
+  '
+}
+
 if [[ ${1-} == --self-test-task-id ]]; then
   [[ $# == 1 ]]
   valid_task_id_value '1234-0123456789abcdef-987654321'
@@ -13,6 +22,12 @@ if [[ ${1-} == --self-test-task-id ]]; then
     '1234567890123456789012345678901234567890123456789'; do
     ! valid_task_id_value "$malformed"
   done
+  printf '%s\n' '#8 [task 1/4] COPY --link source/ /workspace/' '#8 DONE 0.1s' | \
+    task_source_rebuilt_stream
+  printf '%s\n' '#8 [1/4] COPY --link source/ /workspace/' '#8 DONE 0.1s' | \
+    task_source_rebuilt_stream
+  ! printf '%s\n' '#8 [1/4] COPY --link source/ /workspace/' '#8 CACHED' | \
+    task_source_rebuilt_stream
   exit 0
 fi
 
@@ -60,9 +75,9 @@ report_snapshot_id() {
 assert_step() {
   local report=$1 phase=$2 name=$3 status=$4
   awk -v expected_phase="$phase" -v expected_name="$name" -v expected_status="$status" '
-    $0 ~ "\\\"phase\\\": \\\"" expected_phase "\\\"" { phase_found = 1 }
-    phase_found && $0 ~ "\\\"name\\\": \\\"" expected_name "\\\"" { name_found = 1 }
-    phase_found && name_found && $0 ~ "\\\"status\\\": \\\"" expected_status "\\\"" { found = 1 }
+    index($0, "\"phase\": \"" expected_phase "\"") { phase_found = 1 }
+    phase_found && index($0, "\"name\": \"" expected_name "\"") { name_found = 1 }
+    phase_found && name_found && index($0, "\"status\": \"" expected_status "\"") { found = 1 }
     phase_found && /}/ { phase_found = 0; name_found = 0 }
     END { exit !found }
   ' "$report"
@@ -82,18 +97,39 @@ run_expect_status() {
 }
 
 assert_oci_manifest_platform() {
-  local layout=$1 architecture=$2 document compact
-  while IFS= read -r document; do
-    compact=$(tr -d '\r\n' <"$document")
-    if grep -Eq '"mediaType"[[:space:]]*:[[:space:]]*"application/vnd\.(oci\.image\.manifest|docker\.distribution\.manifest)\.[^\"]*"' \
-        <<<"$compact" \
-      && grep -Eq "\"platform\"[[:space:]]*:[[:space:]]*\\{[^}]*\"architecture\"[[:space:]]*:[[:space:]]*\"$architecture\"[^}]*\"os\"[[:space:]]*:[[:space:]]*\"linux\"|\"platform\"[[:space:]]*:[[:space:]]*\\{[^}]*\"os\"[[:space:]]*:[[:space:]]*\"linux\"[^}]*\"architecture\"[[:space:]]*:[[:space:]]*\"$architecture\"" \
-        <<<"$compact"; then
-      return 0
-    fi
-  done < <(find "$layout" -type f \( -name index.json -o -path '*/blobs/sha256/*' \) -print)
-  echo "OCI layout has no image manifest descriptor for linux/$architecture" >&2
-  return 1
+  local layout=$1 architecture=$2
+  python3 - "$layout" "$architecture" <<'PY'
+import json
+import pathlib
+import sys
+
+layout = pathlib.Path(sys.argv[1])
+architecture = sys.argv[2]
+document = json.loads((layout / "index.json").read_text(encoding="utf-8"))
+seen = set()
+
+def descriptors(value):
+    for descriptor in value.get("manifests", []):
+        platform = descriptor.get("platform", {})
+        media_type = descriptor.get("mediaType", "")
+        if (platform.get("os"), platform.get("architecture")) == ("linux", architecture) \
+                and ("image.manifest" in media_type or "distribution.manifest" in media_type):
+            return True
+        digest = descriptor.get("digest", "")
+        if digest.startswith("sha256:") and digest not in seen:
+            seen.add(digest)
+            blob = layout / "blobs" / "sha256" / digest.removeprefix("sha256:")
+            try:
+                nested = json.loads(blob.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if descriptors(nested):
+                return True
+    return False
+
+if not descriptors(document):
+    raise SystemExit(f"OCI layout has no image manifest descriptor for linux/{architecture}")
+PY
 }
 
 assert_oci_blob_digests() {
@@ -146,12 +182,7 @@ assert_environment_cache_hit() {
 
 assert_task_source_rebuilt() {
   local log=$1
-  awk '
-    /\[task [0-9]+\/[0-9]+\] COPY .*source/ { vertex=$1 }
-    vertex != "" && $1 == vertex && /[[:space:]]CACHED$/ { cached=1 }
-    vertex != "" && $1 == vertex && /[[:space:]]DONE/ { done=1 }
-    END { exit !done || cached }
-  ' "$log"
+  task_source_rebuilt_stream <"$log"
 }
 
 case "$scenario" in
@@ -431,7 +462,7 @@ EOF
         [[ $primary_descriptor == "$report_image_digest" ]]
         grep -Eq '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' \
           "$layout/index.json"
-        echo 'multi_platform=linux/amd64,linux/arm64 output=oci-layout primary_digest=runner-verified'
+        echo 'multi_platform=linux/amd64,linux/arm64 output=oci-layout runner=verified'
         ;;
       cli-registry-publish)
         "$cli" verify --repository "$fixture" --report-path "$report" --push
@@ -627,7 +658,28 @@ EOF
       esac
       run_expect_status "$expected_exit" "$cli" verify --repository "$repository" \
         --report-path "$report"
-      assert_report_common "$report" "$expected_cleanup"
+      if [[ $profile == architecture ]]; then
+        [[ -s $report ]]
+        architecture_task_id=$(python3 - "$report" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    report = json.load(stream)
+task_id = report.get("task_id")
+if not isinstance(task_id, str):
+    raise SystemExit("report task_id is not a string")
+if report.get("source_snapshot") is not None or report.get("image") is not None \
+        or report.get("image_digest") is not None:
+    raise SystemExit("environment preflight report unexpectedly contains source/image identity")
+print(task_id)
+PY
+        )
+        valid_task_id_value "$architecture_task_id"
+        grep -Fq '"cleanup": "not_needed"' "$report"
+      else
+        assert_report_common "$report" "$expected_cleanup"
+      fi
       grep -Fq "\"status\": \"$expected_status\"" "$report"
       assert_report_phase "$report" "$expected_phase" "$expected_exit"
       if [[ -n $expected_step_status ]]; then

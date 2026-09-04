@@ -18,11 +18,11 @@ use repo_sandbox_core::application::{
     ResourceState, WorkflowFailureReport, WorkflowFailureStatus, WorkflowMode, WorkflowPort,
     WorkflowResult, configuration_source_digest, write_failure_report,
 };
-use repo_sandbox_core::build::{BuiltImage, ImageRef};
+use repo_sandbox_core::build::{BuiltImage, ImageDigest, ImageRef, PlatformDigest};
 use repo_sandbox_core::config::{Platform, RemoteAuthentication};
 use repo_sandbox_core::registry::{
-    PublicationFactKind, PublicationFinality, PublishRequest, PublishedImage, RegistryRepository,
-    RegistryTag, RemotePublicationFact,
+    PublicationFactKind, PublicationFinality, PublishRequest, RegistryRepository, RegistryTag,
+    RemotePublicationFact,
 };
 use repo_sandbox_core::runner::{
     ConfigSummary, RunResources, RunSpec, RunStatus, SecretMount, StepPhase, write_report_json,
@@ -450,14 +450,31 @@ impl WorkflowPort for SystemWorkflow {
                         &cancellation,
                     )?;
                     let reference = seeded.reference.clone();
+                    let remote_digest = seeded.digest.clone();
                     local_seed = Some(seeded);
-                    (reference, task_image.image.clone())
+                    (
+                        reference,
+                        BuiltImage {
+                            image: task_image.image.image.clone(),
+                            digest: remote_digest.clone(),
+                            platform_digests: vec![PlatformDigest {
+                                platform: plan.request.platforms[0],
+                                digest: remote_digest,
+                            }],
+                        },
+                    )
                 };
                 if plan.request.platforms.len() == 1 {
-                    // The seed push is already an irreversible remote fact. Record it
-                    // before alias publication/verification so a later failure report
-                    // never denies that the immutable content tag exists.
-                    report.published = Some(seeded_publication(&published_task));
+                    // A daemon push can re-serialize a loaded OCI manifest. Keep that
+                    // task-unique source explicit as staging; final immutable and alias
+                    // references are reported only by the registry publisher below.
+                    report.publication_progress.push(RemotePublicationFact {
+                        kind: PublicationFactKind::TaskStaging,
+                        reference: published_task.0.clone(),
+                        digest: published_task.1.digest.clone(),
+                        verified: true,
+                        finality: PublicationFinality::Staging,
+                    });
                     completed_report = Some(report.clone());
                 }
                 let publish_request = PublishRequest {
@@ -4476,8 +4493,35 @@ fn seed_registry(
             "{primary}; pre-existing shared local content tag {content} was safely retained"
         )));
     }
+    let expected_config = ImageDigest::new(source_id).map_err(|error| {
+        AppError::Environment(format!("invalid local registry seed image ID: {error}"))
+    })?;
+    let digest = match DockerRegistry::new(SystemRegistryExecutor).resolve_single_source_digest(
+        &content,
+        &expected_config,
+        cancellation,
+    ) {
+        Ok(digest) => digest,
+        Err(error) => {
+            let primary = AppError::Environment(format!("verify pushed registry seed: {error}"));
+            if owned_local_tag {
+                return Err(
+                    match remove_local_registry_tag_after_cancellation(&content) {
+                        Ok(()) => primary,
+                        Err(cleanup) => AppError::Environment(format!(
+                            "{primary}; remove failed registry seed tag {content}: {cleanup}"
+                        )),
+                    },
+                );
+            }
+            return Err(AppError::Environment(format!(
+                "{primary}; pre-existing shared local content tag {content} was safely retained"
+            )));
+        }
+    };
     Ok(RegistrySeed {
         reference: content,
+        digest,
         owned_local_tag,
         _lease: lease,
     })
@@ -4485,6 +4529,7 @@ fn seed_registry(
 
 struct RegistrySeed {
     reference: ImageRef,
+    digest: ImageDigest,
     owned_local_tag: bool,
     _lease: OutputReservation,
 }
@@ -4545,15 +4590,6 @@ fn registry_content_ref(
     digest: &repo_sandbox_core::build::ImageDigest,
 ) -> ImageRef {
     repository.tagged(&RegistryTag::for_digest(digest))
-}
-
-fn seeded_publication(seed: &(ImageRef, BuiltImage)) -> PublishedImage {
-    PublishedImage {
-        immutable: seed.0.clone(),
-        aliases: Vec::new(),
-        digest: seed.1.digest.clone(),
-        platform_digests: seed.1.platform_digests.clone(),
-    }
 }
 
 fn remove_local_registry_tag(
@@ -6737,25 +6773,6 @@ mod tests {
             format!("registry.test/team/image:sha256-{}", "a".repeat(64))
         );
         assert!(!target.as_str().contains("staging"));
-    }
-
-    #[test]
-    fn seeded_publication_records_the_irreversible_remote_fact_without_aliases() {
-        let digest =
-            repo_sandbox_core::build::ImageDigest::new(format!("sha256:{}", "a".repeat(64)))
-                .unwrap();
-        let seed = (
-            ImageRef::new("registry.test/team/task:sha256-content").unwrap(),
-            BuiltImage {
-                image: ImageRef::new("repo-sandbox-task:local").unwrap(),
-                digest: digest.clone(),
-                platform_digests: Vec::new(),
-            },
-        );
-        let publication = seeded_publication(&seed);
-        assert_eq!(publication.immutable, seed.0);
-        assert_eq!(publication.digest, digest);
-        assert!(publication.aliases.is_empty());
     }
 
     #[test]

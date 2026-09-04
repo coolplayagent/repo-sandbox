@@ -258,6 +258,50 @@ impl<E> DockerRegistry<E> {
 }
 
 impl<E: RegistryExecutor> DockerRegistry<E> {
+    /// Resolve a daemon-pushed single-platform staging tag to its registry
+    /// manifest digest while proving it still names the locally verified
+    /// image configuration. Docker may re-serialize a loaded OCI manifest on
+    /// push, so its remote manifest digest need not equal the BuildKit digest.
+    pub fn resolve_single_source_digest(
+        &self,
+        image: &ImageRef,
+        expected_config: &ImageDigest,
+        cancellation: &dyn Cancellation,
+    ) -> Result<ImageDigest, RegistryError> {
+        let inspected = self.inspect_digest(image, &[], cancellation)?;
+        let raw_invocation = docker(&[
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            "--raw".into(),
+            image.to_string(),
+        ]);
+        let raw = self.run(
+            "inspect single-platform staging manifest",
+            &raw_invocation,
+            None,
+            cancellation,
+        )?;
+        let document: serde_json::Value =
+            serde_json::from_str(&raw.stdout).map_err(|error| RegistryError {
+                kind: RegistryErrorKind::Manifest,
+                message: format!("parse single-platform staging manifest: {error}"),
+            })?;
+        let config = document
+            .pointer("/config/digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| RegistryError {
+                kind: RegistryErrorKind::Manifest,
+                message: "single-platform staging manifest has no config digest".into(),
+            })?;
+        let config = ImageDigest::new(config).map_err(|message| RegistryError {
+            kind: RegistryErrorKind::Manifest,
+            message,
+        })?;
+        ensure_digest(expected_config, &config, "single-platform staging config")?;
+        Ok(inspected.digest)
+    }
+
     /// Publish while reporting only remote references whose manifest copy and
     /// digest/platform verification have both completed successfully.
     pub fn publish_with_progress(
@@ -1023,6 +1067,12 @@ mod tests {
         "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{},\"layers\":[]}\n".into()
     }
 
+    fn single_manifest_with_config(config: &str) -> String {
+        format!(
+            "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{{\"digest\":\"{config}\"}},\"layers\":[]}}\n"
+        )
+    }
+
     fn platform_digests() -> Vec<PlatformDigest> {
         vec![
             PlatformDigest {
@@ -1361,6 +1411,43 @@ mod tests {
         };
         let published = registry.publish(&request, &NeverCancelled).unwrap();
         assert_eq!(published.platform_digests, request.platform_digests);
+    }
+
+    #[test]
+    fn daemon_push_uses_remote_manifest_digest_after_verifying_local_config_identity() {
+        let remote = root_digest();
+        let local_config = ImageDigest::new(AMD).unwrap();
+        let raw = single_manifest_with_config(AMD);
+        let registry = DockerRegistry::new(FakeExecutor::new(vec![
+            ok(described()),
+            ok(raw.clone()),
+            ok(raw),
+        ]));
+        let resolved = registry
+            .resolve_single_source_digest(
+                &ImageRef::new("registry.test/team/image:task-staging").unwrap(),
+                &local_config,
+                &NeverCancelled,
+            )
+            .unwrap();
+        assert_eq!(resolved, remote);
+
+        let foreign = DockerRegistry::new(FakeExecutor::new(vec![
+            ok(described()),
+            ok(single_manifest_with_config(ARM)),
+            ok(single_manifest_with_config(ARM)),
+        ]));
+        assert_eq!(
+            foreign
+                .resolve_single_source_digest(
+                    &ImageRef::new("registry.test/team/image:task-staging").unwrap(),
+                    &local_config,
+                    &NeverCancelled,
+                )
+                .unwrap_err()
+                .kind(),
+            RegistryErrorKind::DigestMismatch
+        );
     }
 
     /// Configurable end-to-end coverage against an operator-provided disposable repository.
