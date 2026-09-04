@@ -21,7 +21,11 @@ RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,s
     apt-get update; \
     apt-get install --yes --no-install-recommends ca-certificates curl; \
     mkdir -p /toolchain/bin; \
-    case "$TARGETARCH" in amd64) bazel_arch=x86_64 ;; arm64) bazel_arch=arm64 ;; *) exit 64 ;; esac; \
+    case "$TARGETARCH" in \
+      amd64) bazel_arch=x86_64; bazel_sha=17247e8a84245f59d3bc633d0cfe0a840992a7760a11af1a30012d03da31604c; bazelisk_sha=e1508323f347ad1465a887bc5d2bfb91cffc232d11e8e997b623227c6b32fb76 ;; \
+      arm64) bazel_arch=arm64; bazel_sha=52bb74f0880ee87b17e3a1aa41257d0dba9e9cb92df4e83f8f6c656a46df152d; bazelisk_sha=bb608519a440d45d10304eb684a73a2b6bb7699c5b0e5434361661b25f113a5d ;; \
+      *) exit 64 ;; \
+    esac; \
     if [ -n "$token_header" ]; then header_args="--header=$token_header"; else header_args=''; fi; \
     bazelisk_download="/toolchain-downloads/bazelisk-${BAZELISK_VERSION}-${TARGETARCH}"; \
     bazel_download="/toolchain-downloads/bazel-${BAZEL_VERSION}-${bazel_arch}"; \
@@ -35,6 +39,8 @@ RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,s
         "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-linux-${bazel_arch}" \
         --output "$bazel_download"; \
     fi; \
+    printf '%s  %s\n' "$bazelisk_sha" "$bazelisk_download" | sha256sum --check --strict; \
+    printf '%s  %s\n' "$bazel_sha" "$bazel_download" | sha256sum --check --strict; \
     install -m 0755 "$bazel_download" /toolchain/bin/bazel; \
     install -m 0755 "$bazelisk_download" /toolchain/bin/bazelisk; \
     rustc --version; \
@@ -59,6 +65,7 @@ COPY --from=toolchain-build /toolchain/bin/bazel /usr/local/bin/bazel
 COPY --from=toolchain-build /toolchain/bin/bazelisk /usr/local/bin/bazelisk
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
+    REPO_SANDBOX_BAZEL_VERSION=8.3.1 \
     PATH=/usr/local/cargo/bin:${PATH}
 
 # Cargo and Bazel network state are reusable BuildKit caches, never image

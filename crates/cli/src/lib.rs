@@ -876,7 +876,7 @@ template:
         assert!(message.contains("[0] base-tools@1.0.0 <- (root)"));
         assert!(message.contains("[1] bazel@1.0.0 <- base-tools"));
         assert!(message.contains("[2] rust@1.0.0 <- base-tools"));
-        assert!(message.contains("build bazel-build: bazelisk build //..."));
+        assert!(message.contains("build bazel-build: bazel build //..."));
     }
 
     #[test]

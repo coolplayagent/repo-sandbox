@@ -648,6 +648,17 @@ build_context: templates/components/base
         };
         let plan = catalog.plan(&selection, Platform::LinuxAmd64).unwrap();
         assert_eq!(plan.base_image, "docker.io/library/rust:1.97.0-bookworm");
+        assert!(!plan.parameters.contains_key("bazel_version"));
+        assert!(plan.execution.environment_allow.is_empty());
+        assert_eq!(plan.execution.build[0].command, "bazel build //...");
+        assert_eq!(plan.execution.test[0].command, "bazel test //...");
+        assert!(
+            plan.execution
+                .build
+                .iter()
+                .chain(&plan.execution.test)
+                .all(|step| !step.command.contains("bazelisk") && !step.command.contains("latest"))
+        );
         assert_eq!(
             plan.stages
                 .iter()
@@ -657,6 +668,13 @@ build_context: templates/components/base
         );
         let arm_plan = catalog.plan(&selection, Platform::LinuxArm64).unwrap();
         assert_eq!(arm_plan.platform, Platform::LinuxArm64);
+
+        let mut injected = selection.clone();
+        injected
+            .parameters
+            .insert("bazel_version".into(), "latest".into());
+        let error = catalog.plan(&injected, Platform::LinuxAmd64).unwrap_err();
+        assert_eq!(error.path(), "$.template.parameters.bazel_version");
     }
 
     #[test]

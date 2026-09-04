@@ -16,18 +16,16 @@ parameters:
     default: "1.97.0"
   bazelisk_version:
     default: "1.27.0"
-  bazel_version:
-    default: "8.3.1"
   registry_repository:
     default: ""
 execution:
   version: 1
   build:
     - name: bazel-build
-      command: bazelisk build //...
+      command: bazel build //...
   test:
     - name: bazel-test
-      command: bazelisk test //...
+      command: bazel test //...
   resources:
     cpu: 2
     memory_mb: 4096

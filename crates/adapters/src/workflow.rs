@@ -7595,6 +7595,15 @@ mod tests {
         );
         assert!(dockerfile.contains("io.repo-sandbox.owner"));
         assert!(dockerfile.contains("io.repo-sandbox.repository-id"));
+        assert!(dockerfile.contains("ARG BAZEL_VERSION=8.3.1"));
+        assert!(dockerfile.contains("REPO_SANDBOX_BAZEL_VERSION=8.3.1"));
+        assert!(dockerfile.contains("sha256sum --check --strict"));
+        assert!(
+            dockerfile.contains("17247e8a84245f59d3bc633d0cfe0a840992a7760a11af1a30012d03da31604c")
+        );
+        assert!(
+            dockerfile.contains("52bb74f0880ee87b17e3a1aa41257d0dba9e9cb92df4e83f8f6c656a46df152d")
+        );
     }
 
     #[test]
