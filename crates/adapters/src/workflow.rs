@@ -7,6 +7,7 @@ use crate::buildkit::{
 };
 use crate::cancellation::{DeadlineCancellation, ProcessCancellation};
 use crate::docker_runner::{DockerExecutor, DockerRunner, SystemClock, SystemDockerExecutor};
+#[cfg(windows)]
 use crate::doctor::{DoctorProbe, SystemDoctorProbe};
 use crate::registry::{DockerRegistry, SystemRegistryExecutor};
 use crate::snapshot::GitSnapshotter;
@@ -2529,7 +2530,7 @@ fn reconcile_quota_resource(
             if identity.next().is_some()
                 || actual_kind != expected_kind
                 || actual_owner != owner
-                || !id.starts_with("sha256:")
+                || !valid_quota_resource_id(kind, id)
             {
                 return Err(AppError::Environment(format!(
                     "refuse to remove foreign quota probe {kind} named {name}"
@@ -2558,6 +2559,20 @@ fn reconcile_quota_resource(
     Err(AppError::Environment(format!(
         "quota probe {kind} reconciliation did not stabilize"
     )))
+}
+
+fn valid_quota_resource_id(kind: &str, id: &str) -> bool {
+    let hex = match kind {
+        "image" => id.strip_prefix("sha256:").unwrap_or_default(),
+        // Docker container inspect renders `.Id` as the raw 64-hex object ID,
+        // unlike image inspect which includes the algorithm prefix.
+        "container" => id,
+        _ => return false,
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(not(windows))]
@@ -5195,6 +5210,7 @@ mod tests {
         let parent = temporary.path().join("reports/task-oci");
         let guard = ExternalOciGuard::prepare(&parent.join("layout")).unwrap();
         let staging = create_oci_staging(&guard.bound_path().unwrap()).unwrap();
+        assert!(staging.path().is_dir());
         assert!(parent.is_dir());
         #[cfg(windows)]
         assert_eq!(
@@ -6373,16 +6389,23 @@ mod tests {
             stderr: String::new(),
             interrupted: false,
         };
-        let owned = |kind: char| crate::buildkit::ProcessOutput {
-            stdout: format!(
-                "sha256:{}|quota-probe|fixture\n",
-                kind.to_string().repeat(64)
-            ),
+        let owned = |id: String| crate::buildkit::ProcessOutput {
+            stdout: format!("{id}|quota-probe|fixture\n"),
             ..ok()
         };
         let executor = SequenceExecutor {
             calls: std::sync::Mutex::new(Vec::new()),
-            outputs: std::sync::Mutex::new([ok(), owned('a'), ok(), owned('b'), ok(), ok()].into()),
+            outputs: std::sync::Mutex::new(
+                [
+                    ok(),
+                    owned(format!("sha256:{}", "a".repeat(64))),
+                    ok(),
+                    owned("b".repeat(64)),
+                    ok(),
+                    ok(),
+                ]
+                .into(),
+            ),
         };
         preflight_writable_layer_quota_with_identity(&executor, 384, &NeverCancelled, "fixture")
             .unwrap();
@@ -6395,7 +6418,7 @@ mod tests {
         assert!(calls[2].args.contains(&"size=384m".into()));
         assert_eq!(&calls[3].args[..2], ["container", "inspect"]);
         assert_eq!(&calls[4].args[..3], ["container", "rm", "--force"]);
-        assert!(calls[4].args[3].starts_with("sha256:"));
+        assert_eq!(calls[4].args[3], "b".repeat(64));
         assert_eq!(&calls[5].args[..3], ["image", "rm", "--force"]);
     }
 
@@ -6446,7 +6469,7 @@ mod tests {
             interrupted: false,
         };
         let image_id = format!("sha256:{}", "a".repeat(64));
-        let foreign_id = format!("sha256:{}", "b".repeat(64));
+        let foreign_id = "b".repeat(64);
         let executor = SequenceExecutor {
             calls: std::sync::Mutex::new(Vec::new()),
             outputs: std::sync::Mutex::new(
@@ -6485,7 +6508,7 @@ mod tests {
             interrupted: false,
         };
         let image_id = format!("sha256:{}", "a".repeat(64));
-        let container_id = format!("sha256:{}", "b".repeat(64));
+        let container_id = "b".repeat(64);
         let executor = SequenceExecutor {
             calls: std::sync::Mutex::new(Vec::new()),
             outputs: std::sync::Mutex::new(
@@ -6563,7 +6586,7 @@ mod tests {
             interrupted: false,
         };
         let image_id = format!("sha256:{}", "a".repeat(64));
-        let container_id = format!("sha256:{}", "b".repeat(64));
+        let container_id = "b".repeat(64);
         let executor = FallibleSequenceExecutor {
             calls: std::sync::Mutex::new(Vec::new()),
             outputs: std::sync::Mutex::new(
