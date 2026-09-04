@@ -83,6 +83,16 @@ jobs:
         with:
           platforms: amd64,arm64
           cache-image: false
+      - name: Install the minimum supported Buildx
+        run: |
+          install -d "$HOME/.docker/cli-plugins"
+          curl --fail --location --show-error \
+            https://github.com/docker/buildx/releases/download/v0.15.1/buildx-v0.15.1.linux-amd64 \
+            --output "$HOME/.docker/cli-plugins/docker-buildx"
+          echo '8d486f0088b7407a90ad675525ba4a17d0a537741b9b33fe3391a88cafa2dd0b  '"$HOME/.docker/cli-plugins/docker-buildx" | sha256sum --check --strict
+          chmod 0755 "$HOME/.docker/cli-plugins/docker-buildx"
+          docker buildx version | grep -F 'v0.15.1'
+          docker buildx imagetools create --help | grep -F -- '--prefer-index'
       - name: Install XFS quota tooling
         run: sudo apt-get update && sudo apt-get install --yes xfsprogs
       - name: Start task-owned XFS pquota Docker daemon and BuildKit namespace

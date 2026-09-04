@@ -329,6 +329,7 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
         mut progress: impl FnMut(&PublishedImage),
     ) -> Result<PublishedImage, RegistryError> {
         validate_publish(request)?;
+        self.require_carbon_copy_capability(cancellation)?;
         let content_tag = RegistryTag::for_digest(&request.digest);
         let immutable = request.repository.tagged(&content_tag);
         let source = digest_ref(&request.source, &request.digest)?;
@@ -359,6 +360,32 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
             progress(&published);
         }
         Ok(published)
+    }
+
+    fn require_carbon_copy_capability(
+        &self,
+        cancellation: &dyn Cancellation,
+    ) -> Result<(), RegistryError> {
+        let invocation = docker(&[
+            "buildx".into(),
+            "imagetools".into(),
+            "create".into(),
+            "--help".into(),
+        ]);
+        let help = self.run(
+            "check Buildx immutable-manifest capability",
+            &invocation,
+            None,
+            cancellation,
+        )?;
+        if help.stdout.contains("--prefer-index") || help.stderr.contains("--prefer-index") {
+            Ok(())
+        } else {
+            Err(RegistryError::new(
+                RegistryErrorKind::Command,
+                "Docker Buildx lacks `imagetools create --prefer-index`; install Buildx v0.15.1 or newer before publishing",
+            ))
+        }
     }
 }
 
@@ -1173,6 +1200,7 @@ mod tests {
     #[test]
     fn publish_creates_content_tag_then_alias_and_verifies_multiarch_digests() {
         let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
             ok(""),
             ok(described()),
             ok(multiarch()),
@@ -1202,10 +1230,14 @@ mod tests {
             "registry.test/team/image:latest"
         );
         let calls = registry.executor.invocations.lock().unwrap();
-        assert_eq!(calls[0].0.args[0..3], ["buildx", "imagetools", "create"]);
-        assert_eq!(calls[0].0.args[3], "--prefer-index=false");
+        assert_eq!(
+            calls[0].0.args,
+            ["buildx", "imagetools", "create", "--help"]
+        );
+        assert_eq!(calls[1].0.args[0..3], ["buildx", "imagetools", "create"]);
+        assert_eq!(calls[1].0.args[3], "--prefer-index=false");
         assert!(
-            calls[0]
+            calls[1]
                 .0
                 .args
                 .iter()
@@ -1216,6 +1248,7 @@ mod tests {
     #[test]
     fn single_manifest_publication_progress_retains_verified_immutable_on_alias_failure() {
         let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
             ok(""),
             ok(described()),
             ok(single_manifest()),
@@ -1247,6 +1280,7 @@ mod tests {
     #[test]
     fn multi_manifest_publication_progress_retains_each_verified_alias_before_later_failure() {
         let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
             ok(""),
             ok(described()),
             ok(multiarch()),
@@ -1292,7 +1326,11 @@ mod tests {
 
     #[test]
     fn immutable_copy_fact_is_reported_even_when_its_verification_transport_fails() {
-        let executor = FakeExecutor::new(vec![ok(""), failed("inspect timed out")]);
+        let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
+            ok(""),
+            failed("inspect timed out"),
+        ]);
         let registry = DockerRegistry::new(executor);
         let request = PublishRequest {
             source: ImageRef::new("registry.test/source/image:build").unwrap(),
@@ -1420,7 +1458,12 @@ mod tests {
 
     #[test]
     fn publication_accepts_an_exact_single_platform_manifest() {
-        let executor = FakeExecutor::new(vec![ok(""), ok(described()), ok(single_manifest())]);
+        let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
+            ok(""),
+            ok(described()),
+            ok(single_manifest()),
+        ]);
         let registry = DockerRegistry::new(executor);
         let request = PublishRequest {
             source: ImageRef::new("registry.test/team/image:source").unwrap(),
@@ -1436,7 +1479,7 @@ mod tests {
         assert_eq!(published.platform_digests, request.platform_digests);
         let calls = registry.executor.invocations.lock().unwrap();
         assert_eq!(
-            &calls[0].0.args[..5],
+            &calls[1].0.args[..5],
             [
                 "buildx",
                 "imagetools",
@@ -1446,13 +1489,40 @@ mod tests {
             ]
         );
         assert!(
-            calls[0]
+            calls[1]
                 .0
                 .args
                 .last()
                 .unwrap()
                 .ends_with(&format!("@{}", root_digest()))
         );
+    }
+
+    #[test]
+    fn publication_requires_carbon_copy_capability_before_remote_side_effects() {
+        let registry = DockerRegistry::new(FakeExecutor::new(vec![ok(
+            "Usage: docker buildx imagetools create [OPTIONS]",
+        )]));
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/team/image:source").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: vec![PlatformDigest {
+                platform: Platform::LinuxAmd64,
+                digest: root_digest(),
+            }],
+            aliases: vec![RegistryTag::new("latest").unwrap()],
+        };
+        let error = registry.publish(&request, &NeverCancelled).unwrap_err();
+        assert_eq!(error.kind(), RegistryErrorKind::Command);
+        assert!(error.to_string().contains("Buildx v0.15.1 or newer"));
+        let calls = registry.executor.invocations.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0.args,
+            ["buildx", "imagetools", "create", "--help"]
+        );
+        assert!(!calls[0].0.args.iter().any(|arg| arg == "--tag"));
     }
 
     #[test]

@@ -9,6 +9,8 @@ cli_build="$root/apps/cli/BUILD.bazel"
 environment_dockerfile="$root/templates/rust-bazel/context/Dockerfile"
 bazel_wrapper="$root/templates/rust-bazel/context/bazel"
 baseline_lock="$root/templates/rust-bazel/context/offline-baseline/MODULE.bazel.lock"
+euleros_installer="$root/scripts/wsl/install-euleros.sh"
+yum_installer="$root/scripts/vm/install-yum.sh"
 
 for required in "$ci" "$release" "$root/scripts/ci/workspace-version.sh" \
   "$root/scripts/ci/download-release-artifacts.sh" \
@@ -55,6 +57,15 @@ grep -Fq 'raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_COMMIT}/scrip
 grep -Fq 'version=$(scripts/ci/workspace-version.sh)' "$ci"
 grep -Fq 'docker buildx inspect "$builder" --bootstrap' "$ci"
 grep -Fq "Platforms:.*linux/amd64" "$ci"
+grep -Fq 'v0.15.1/buildx-v0.15.1.linux-amd64' "$euleros_installer"
+grep -Fq '8d486f0088b7407a90ad675525ba4a17d0a537741b9b33fe3391a88cafa2dd0b' \
+  "$euleros_installer" "$yum_installer"
+grep -Fq 'readonly BUILDX_VERSION=v0.15.1' "$yum_installer"
+grep -Fq '13f4ffd2b6922e941d6b6a9faee73ec9b8cab5b309ef90dfadf48142c2a47f34' \
+  "$yum_installer"
+grep -Fq 'v0.15.1/buildx-v0.15.1.linux-amd64' "$ci"
+grep -Fq '8d486f0088b7407a90ad675525ba4a17d0a537741b9b33fe3391a88cafa2dd0b' "$ci"
+grep -Fq "imagetools create --help | grep -F -- '--prefer-index'" "$ci"
 grep -Fq 'REPO_SANDBOX_E2E_PROFILE_SECRET: repo-sandbox-ci-profile-secret-not-a-credential' "$ci"
 ! grep -Fq "grep -Fx 'repo-sandbox 0.1.0'" "$ci"
 grep -Fq 'bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh' "$ci"

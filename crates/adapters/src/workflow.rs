@@ -1915,7 +1915,7 @@ fn preflight(
             .registry
             .as_ref()
             .expect("validated before preflight");
-        preflight_registry_with(
+        preflight_registry_publication_with(
             &SystemProcessExecutor,
             &policy.repository,
             task_id,
@@ -1925,6 +1925,54 @@ fn preflight(
         )?;
     }
     Ok(())
+}
+
+fn preflight_registry_publication_with(
+    executor: &impl ProcessExecutor,
+    repository: &str,
+    task_id: &str,
+    buildx_boundary: bool,
+    cancellation: &DeadlineCancellation,
+    on_publication: impl FnMut(RemotePublicationFact),
+) -> Result<(), AppError> {
+    require_registry_carbon_copy_capability(executor, cancellation)?;
+    preflight_registry_with(
+        executor,
+        repository,
+        task_id,
+        buildx_boundary,
+        cancellation,
+        on_publication,
+    )
+}
+
+fn require_registry_carbon_copy_capability(
+    executor: &impl ProcessExecutor,
+    cancellation: &DeadlineCancellation,
+) -> Result<(), AppError> {
+    let output = quota_command(
+        executor,
+        vec![
+            "buildx".into(),
+            "imagetools".into(),
+            "create".into(),
+            "--help".into(),
+        ],
+        cancellation,
+    )
+    .map_err(|error| bounded_error("check registry publication capability", error, cancellation))?;
+    quota_command_result(
+        "check registry publication capability",
+        &output,
+        cancellation,
+    )?;
+    if output.stdout.contains("--prefer-index") || output.stderr.contains("--prefer-index") {
+        Ok(())
+    } else {
+        Err(AppError::Environment(
+            "Docker Buildx lacks `imagetools create --prefer-index`; install Buildx v0.15.1 or newer before registry publication".into(),
+        ))
+    }
 }
 
 fn preflight_registry_with(
@@ -6233,6 +6281,44 @@ mod tests {
         assert!(!facts[0].verified);
         assert!(facts[1].verified);
         assert_eq!(facts[1].kind, PublicationFactKind::RegistryPreflightStaging);
+    }
+
+    #[test]
+    fn registry_capability_failure_precedes_every_remote_write_probe() {
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [crate::buildkit::ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: "Usage: docker buildx imagetools create [OPTIONS]".into(),
+                    stderr: String::new(),
+                    interrupted: false,
+                }]
+                .into(),
+            ),
+        };
+        let error = preflight_registry_publication_with(
+            &executor,
+            "registry.test/team/image",
+            "fixture",
+            false,
+            &DeadlineCancellation::new(std::time::Duration::from_secs(2)),
+            |_| panic!("capability failure must not report a remote side effect"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Buildx v0.15.1 or newer"));
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].args,
+            ["buildx", "imagetools", "create", "--help"].map(str::to_owned)
+        );
+        assert!(
+            !calls[0]
+                .args
+                .iter()
+                .any(|arg| arg == "push" || arg == "build")
+        );
     }
 
     #[test]
