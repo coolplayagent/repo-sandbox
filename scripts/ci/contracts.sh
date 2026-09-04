@@ -148,7 +148,7 @@ grep -Fq 'COPY offline-baseline/' "$root/tests/multistage/Dockerfile.single-stag
 grep -Fq '/usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock' \
   "$root/tests/multistage/Dockerfile.single-stage"
 grep -Fq 'rm -rf /tmp/repo-sandbox-bazel-check' "$environment_dockerfile"
-"$root/scripts/e2e/docker-scenario.sh" --self-test-task-id
+bash "$root/scripts/e2e/docker-scenario.sh" --self-test-task-id
 grep -A5 -F 'name = "e2e_matrix_test"' "$adapters_build" | grep -Fq 'srcs = ["e2e/e2e_matrix.rs"]'
 grep -Fq 'bazelisk test --action_env=PATH //...' "$ci"
 grep -Fq -- '- name: Release Bazel target selection' "$ci"
