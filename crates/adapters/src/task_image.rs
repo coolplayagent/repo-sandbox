@@ -343,7 +343,8 @@ ARG TASK_IDENTITY
 ARG TASK_REPOSITORY_ID
 COPY --link source/ /workspace/
 WORKDIR /workspace
-RUN if [ ! -e MODULE.bazel.lock ]; then \
+RUN if [ ! -e MODULE.bazel.lock ] \
+      && [ -s /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock ]; then \
       cp /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock MODULE.bazel.lock; \
     fi
 LABEL org.opencontainers.image.created="${TASK_CREATED}" \
@@ -506,6 +507,9 @@ mod tests {
                     )
                 );
                 assert!(dockerfile.contains("if [ ! -e MODULE.bazel.lock ]"));
+                assert!(dockerfile.contains(
+                    "[ -s /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock ]"
+                ));
                 assert!(dockerfile.contains("io.repo-sandbox.owner=\"${TASK_IDENTITY}\""));
                 assert!(!dockerfile.contains("ENTRYPOINT"));
                 let context = value_after(&invocation.args, "--build-context");

@@ -123,6 +123,7 @@ grep -Fq 'COPY --from=offline-seed /toolchain/bazel-seed/cache/repos/' \
 ! sed -n '/FROM environment-base AS offline-seed/,/FROM environment-base AS environment/p' \
   "$environment_dockerfile" | grep -Fq 'github_token'
 grep -Fq '/usr/local/libexec/repo-sandbox/bazel-8.3.1' "$bazel_wrapper"
+grep -Fq -- '--output_user_root=/var/cache/repo-sandbox/bazel' "$bazel_wrapper"
 grep -Fq -- '--ignore_all_rc_files' "$bazel_wrapper"
 grep -Fq -- '--repository_disable_download' "$bazel_wrapper"
 grep -Fq '"https://bcr.bazel.build/modules/platforms/0.0.7/MODULE.bazel"' \
@@ -141,6 +142,13 @@ grep -Fq "Template: rust-bazel@1.0.1" "$ci"
   "$root/.github" "$root/scripts" "$root/docs"
 grep -Fq 'Bazel unexpectedly downloaded a module outside the central baseline' \
   "$root/scripts/docker/multistage-acceptance.sh"
+grep -Fq 'templates/rust-bazel/context/offline-baseline' \
+  "$root/scripts/docker/multistage-acceptance.sh"
+grep -Fq 'COPY offline-baseline/' "$root/tests/multistage/Dockerfile.single-stage"
+grep -Fq '/usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock' \
+  "$root/tests/multistage/Dockerfile.single-stage"
+grep -Fq 'rm -rf /tmp/repo-sandbox-bazel-check' "$environment_dockerfile"
+"$root/scripts/e2e/docker-scenario.sh" --self-test-task-id
 grep -A5 -F 'name = "e2e_matrix_test"' "$adapters_build" | grep -Fq 'srcs = ["e2e/e2e_matrix.rs"]'
 grep -Fq 'bazelisk test --action_env=PATH //...' "$ci"
 grep -Fq -- '- name: Release Bazel target selection' "$ci"

@@ -501,7 +501,7 @@ pub fn plan(spec: &RunSpec) -> Result<DockerRunPlan, PlanError> {
                 "exec",
                 &name,
                 "/bin/sh",
-                "-lc",
+                "-c",
                 &if spec.secret_mounts.is_empty() { step.command.clone() } else {
                     format!("for f in /run/repo-sandbox-secrets/*; do n=${{f##*/}}; v=; IFS= read -r v < \"$f\" || [ -n \"$v\" ]; export \"$n=$v\"; done; {}", step.command)
                 },
@@ -1493,6 +1493,13 @@ mod tests {
         ] {
             assert!(args.windows(2).any(|actual| actual == pair));
         }
+        assert!(plan.steps.iter().all(|step| {
+            step.invocation
+                .args
+                .windows(2)
+                .any(|args| args == ["/bin/sh", "-c"])
+                && !step.invocation.args.iter().any(|arg| arg == "-lc")
+        }));
         assert!(
             args.windows(2).any(|pair| {
                 pair[0] == "--tmpfs" && pair[1] == "/tmp:rw,nosuid,nodev,size=512m"

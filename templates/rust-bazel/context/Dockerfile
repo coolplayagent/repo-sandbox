@@ -78,7 +78,8 @@ RUN --mount=type=cache,id=repo-sandbox-cargo-registry-${TARGETARCH},target=/usr/
     ln -sf "$(rustup which --toolchain "$RUST_VERSION" rustdoc)" /usr/local/cargo/bin/rustdoc; \
     rustc --version; \
     cargo --version; \
-    bazel --help >/dev/null
+    bazel --output_user_root=/tmp/repo-sandbox-bazel-check --help >/dev/null; \
+    rm -rf /tmp/repo-sandbox-bazel-check
 
 # Resolve only this centrally owned fixture. Its lock pins every BCR metadata
 # byte and every selected source archive carries an integrity hash. The GitHub
@@ -110,7 +111,7 @@ RUN set -eu; \
     mv /usr/local/bin/bazel /usr/local/libexec/repo-sandbox/bazel-8.3.1; \
     install -m 0755 /tmp/repo-sandbox-bazel-wrapper /usr/local/bin/bazel; \
     rm /tmp/repo-sandbox-bazel-wrapper; \
-    bazel --version | grep -Fx 'bazel 8.3.1'
+    bazel version | grep -Fx 'Build label: 8.3.1'
 
 # These values are part of the final image configuration. BuildKit can reuse
 # unchanged installation layers, while a template, component, or parameter

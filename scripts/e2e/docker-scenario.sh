@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+valid_task_id_value() {
+  local value=${1-}
+  [[ -n $value && ${#value} -le 48 && $value =~ ^[a-z0-9_-]+$ ]]
+}
+
+if [[ ${1-} == --self-test-task-id ]]; then
+  [[ $# == 1 ]]
+  valid_task_id_value '1234-0123456789abcdef-987654321'
+  for malformed in '' 'UPPERCASE' 'contains/slash' 'contains space' \
+    '1234567890123456789012345678901234567890123456789'; do
+    ! valid_task_id_value "$malformed"
+  done
+  exit 0
+fi
+
 [[ $# == 2 ]] || { echo "usage: $0 SCENARIO RESULT_DIRECTORY" >&2; exit 64; }
 scenario=$1
 result_directory=$2
@@ -18,9 +33,20 @@ assert_report_digest() {
 }
 
 assert_report_common() {
-  local report=$1 expected_cleanup=$2
+  local report=$1 expected_cleanup=$2 task_id
   [[ -s $report ]]
-  grep -Eq '"task_id": "[0-9]+-[0-9]+"' "$report"
+  task_id=$(python3 - "$report" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream).get("task_id")
+if not isinstance(value, str):
+    raise SystemExit("report task_id is not a string")
+print(value)
+PY
+  )
+  valid_task_id_value "$task_id"
   assert_report_digest "$report" plan_digest
   assert_report_digest "$report" image_digest
   grep -Eq '"id": "[0-9a-f]{64}"' "$report"

@@ -23,6 +23,31 @@ RUN apt-get update \
     && ln -sf "$(rustup which --toolchain "$RUST_VERSION" rustc)" /usr/local/cargo/bin/rustc \
     && ln -sf "$(rustup which --toolchain "$RUST_VERSION" rustdoc)" /usr/local/cargo/bin/rustdoc \
     && rm -rf /var/lib/apt/lists/*
+COPY offline-baseline/ /opt/repo-sandbox/offline-baseline/
+RUN set -eu; \
+    cd /opt/repo-sandbox/offline-baseline; \
+    cp BUILD.seed BUILD.bazel; \
+    mkdir -p /var/cache/repo-sandbox/bazel /usr/local/share/repo-sandbox/offline-baseline; \
+    cp MODULE.bazel.lock /tmp/repo-sandbox-baseline.lock; \
+    bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel mod graph >/dev/null; \
+    sed -n '/^  "registryFileHashes": {$/,/^  },$/p' \
+      /tmp/repo-sandbox-baseline.lock >/tmp/repo-sandbox-expected-hashes; \
+    sed -n '/^  "registryFileHashes": {$/,/^  },$/p' \
+      MODULE.bazel.lock >/tmp/repo-sandbox-actual-hashes; \
+    test -s /tmp/repo-sandbox-expected-hashes; \
+    cmp /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes; \
+    bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel test //...; \
+    cp MODULE.bazel.lock /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock; \
+    find /var/cache/repo-sandbox/bazel -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
+    find /var/cache/repo-sandbox/bazel/cache -mindepth 1 -maxdepth 1 ! -name repos -exec rm -rf '{}' +; \
+    rm -rf /opt/repo-sandbox /tmp/repo-sandbox-baseline.lock \
+      /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes
+COPY bazel /tmp/repo-sandbox-bazel-wrapper
+RUN set -eu; \
+    mkdir -p /usr/local/libexec/repo-sandbox; \
+    mv /usr/local/bin/bazel /usr/local/libexec/repo-sandbox/bazel-8.3.1; \
+    install -m 0755 /tmp/repo-sandbox-bazel-wrapper /usr/local/bin/bazel; \
+    rm /tmp/repo-sandbox-bazel-wrapper
 COPY --link source/ /workspace/
 WORKDIR /workspace
 RUN cp BUILD.seed BUILD.bazel
@@ -30,4 +55,4 @@ LABEL io.repo-sandbox.source.digest="${SOURCE_DIGEST}"
 
 FROM task AS acceptance
 RUN cargo test --locked \
-    && bazel --batch --bazelrc=/dev/null build //:rust_binary
+    && bazel --batch --ignore_all_rc_files build //:rust_binary

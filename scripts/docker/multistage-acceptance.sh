@@ -38,6 +38,8 @@ retry_external_build() {
 }
 
 cp -R "$repo_root/tests/multistage/." "$temporary/context"
+cp -R "$repo_root/templates/rust-bazel/context/offline-baseline" "$temporary/context/"
+cp "$repo_root/templates/rust-bazel/context/bazel" "$temporary/context/bazel"
 cp "$temporary/context/source/src/main.rs" "$temporary/main.rs.original"
 printf '%s\n' 'issue1-secret-marker-must-not-leak' >"$temporary/github-token"
 
@@ -180,7 +182,7 @@ for architecture in amd64 arm64; do
   docker run --rm --network none --platform "$platform" \
     --env USE_BAZEL_VERSION=latest --env BAZEL_OPTS=--bazelrc=/workspace/.bazelrc \
     "$task" sh -ec '
-      test "$(bazel --version)" = "bazel 8.3.1"
+      bazel version | grep -Fx "Build label: 8.3.1"
       bazel --batch build //:rust_binary
       bazel --batch test //...
     '
