@@ -3,3 +3,5 @@
 /target/
 /.repo-sandbox/
 /.e2e-results/
+/.worktrees/
+/tools/release/__pycache__/

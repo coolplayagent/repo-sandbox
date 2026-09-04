@@ -36,7 +36,7 @@ module_match = re.search(
 if not module_match or module_match.group(1) != version:
     raise SystemExit("Cargo workspace version does not match MODULE.bazel")
 
-cli_build = (root / "crates/cli/BUILD.bazel").read_text(encoding="utf-8")
+cli_build = (root / "apps/cli/BUILD.bazel").read_text(encoding="utf-8")
 declared = re.findall(r'^\s*version\s*=\s*"([^"]+)"', cli_build, re.MULTILINE)
 if not declared or any(item != version for item in declared):
     raise SystemExit("Cargo workspace version does not match every CLI Bazel target")

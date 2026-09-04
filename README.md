@@ -16,6 +16,29 @@ bazelisk run //:repo-sandbox -- --help
 bazelisk run //:repo-sandbox -- --version
 ```
 
+The CLI application lives under `apps/cli`; reusable domain and infrastructure
+packages remain under `crates`. The root `//:repo-sandbox` Bazel target is the
+stable build and run entrypoint.
+
+## Binary releases
+
+Version tags publish native `linux-amd64` and `linux-arm64` archives on the
+GitHub Releases page. Each `.tar.gz` intentionally contains exactly one file,
+the `repo-sandbox` executable. Download the archive and its checksum, verify it,
+then extract the command and optionally copy it to a directory on `PATH`:
+
+```console
+sha256sum --check repo-sandbox-0.1.0-linux-amd64.tar.gz.sha256
+tar -xzf repo-sandbox-0.1.0-linux-amd64.tar.gz
+./repo-sandbox --version
+```
+
+Release binaries support GLIBC 2.28 or newer. They do not install Docker,
+Buildx, QEMU, or other host prerequisites; use `repo-sandbox doctor` to inspect
+the host. Source-based WSL and VM deployment remain available for environments
+that need the checked-in bootstrap process. See [`docs/releasing.md`](docs/releasing.md)
+for the maintainer contract and artifact verification details.
+
 Run the read-only prerequisite inspection in a terminal or CI job:
 
 ```console
