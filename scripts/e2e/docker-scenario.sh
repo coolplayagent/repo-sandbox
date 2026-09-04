@@ -658,28 +658,10 @@ EOF
       esac
       run_expect_status "$expected_exit" "$cli" verify --repository "$repository" \
         --report-path "$report"
-      if [[ $profile == architecture ]]; then
-        [[ -s $report ]]
-        architecture_task_id=$(python3 - "$report" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as stream:
-    report = json.load(stream)
-task_id = report.get("task_id")
-if not isinstance(task_id, str):
-    raise SystemExit("report task_id is not a string")
-if report.get("source_snapshot") is not None or report.get("image") is not None \
-        or report.get("image_digest") is not None:
-    raise SystemExit("environment preflight report unexpectedly contains source/image identity")
-print(task_id)
-PY
-        )
-        valid_task_id_value "$architecture_task_id"
-        grep -Fq '"cleanup": "not_needed"' "$report"
-      else
-        assert_report_common "$report" "$expected_cleanup"
-      fi
+      # Architecture fails at runner infrastructure validation, after snapshot
+      # and immutable task-image construction, so its identities remain part of
+      # the same auditable report schema as the other execution failures.
+      assert_report_common "$report" "$expected_cleanup"
       grep -Fq "\"status\": \"$expected_status\"" "$report"
       assert_report_phase "$report" "$expected_phase" "$expected_exit"
       if [[ -n $expected_step_status ]]; then

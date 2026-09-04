@@ -547,6 +547,10 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
             "buildx".into(),
             "imagetools".into(),
             "create".into(),
+            // The default promotes a single image manifest to an index and
+            // therefore changes its digest. Immutable publication requires a
+            // byte-identical copy of the already pinned source descriptor.
+            "--prefer-index=false".into(),
             "--tag".into(),
             target.to_string(),
             source.into(),
@@ -1199,6 +1203,7 @@ mod tests {
         );
         let calls = registry.executor.invocations.lock().unwrap();
         assert_eq!(calls[0].0.args[0..3], ["buildx", "imagetools", "create"]);
+        assert_eq!(calls[0].0.args[3], "--prefer-index=false");
         assert!(
             calls[0]
                 .0
@@ -1429,6 +1434,25 @@ mod tests {
         };
         let published = registry.publish(&request, &NeverCancelled).unwrap();
         assert_eq!(published.platform_digests, request.platform_digests);
+        let calls = registry.executor.invocations.lock().unwrap();
+        assert_eq!(
+            &calls[0].0.args[..5],
+            [
+                "buildx",
+                "imagetools",
+                "create",
+                "--prefer-index=false",
+                "--tag"
+            ]
+        );
+        assert!(
+            calls[0]
+                .0
+                .args
+                .last()
+                .unwrap()
+                .ends_with(&format!("@{}", root_digest()))
+        );
     }
 
     #[test]
