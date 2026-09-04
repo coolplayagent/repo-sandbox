@@ -11,4 +11,3 @@ execution:
   resources: { cpu: 1, memory_mb: 256, temporary_storage_mb: 16 }
   timeout_seconds: 120
   fail_fast: true
-
