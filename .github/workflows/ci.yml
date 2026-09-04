@@ -61,7 +61,7 @@ jobs:
           "$RUNNER_TEMP/repo-sandbox" --version | grep -Fx "repo-sandbox $version"
           sample=$(mktemp -d)
           cp .repo-sandbox.yaml.example "$sample/.repo-sandbox.yaml"
-          "$RUNNER_TEMP/repo-sandbox" plan --repository "$sample" | grep -F 'Template: rust-bazel@1.0.0'
+          "$RUNNER_TEMP/repo-sandbox" plan --repository "$sample" | grep -F 'Template: rust-bazel@1.0.1'
       - name: CI and release security contracts
         run: scripts/ci/contracts.sh
 

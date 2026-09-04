@@ -132,6 +132,14 @@ grep -Fq '"https://bcr.bazel.build/modules/rules_shell/0.2.0/MODULE.bazel"' \
 grep -Fq '"https://bcr.bazel.build/modules/rules_java/8.12.0/MODULE.bazel"' \
   "$baseline_lock"
 grep -Fq '["--network", "none"]' "$root/crates/adapters/src/docker_runner.rs"
+grep -Fxq 'templates/rust-bazel/context/Dockerfile text eol=lf' "$root/.gitattributes"
+grep -Fxq 'templates/rust-bazel/context/bazel text eol=lf' "$root/.gitattributes"
+grep -Fxq 'templates/rust-bazel/context/offline-baseline/* text eol=lf' \
+  "$root/.gitattributes"
+grep -Fq "Template: rust-bazel@1.0.1" "$ci"
+! grep -Rq -F 'rust-bazel@1.0.0' "$root/.github" "$root/scripts" "$root/docs"
+grep -Fq 'Bazel unexpectedly resolved a module outside the central baseline' \
+  "$root/scripts/docker/multistage-acceptance.sh"
 grep -A5 -F 'name = "e2e_matrix_test"' "$adapters_build" | grep -Fq 'srcs = ["e2e/e2e_matrix.rs"]'
 grep -Fq 'bazelisk test --action_env=PATH //...' "$ci"
 grep -Fq -- '- name: Release Bazel target selection' "$ci"
