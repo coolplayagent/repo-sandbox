@@ -151,7 +151,7 @@ case "$scenario" in
       done
       curl --fail --silent "http://127.0.0.1:$registry_port/v2/" >/dev/null
       registry_repository="127.0.0.1:$registry_port/repo-sandbox/e2e"
-      sed -i "s|bazelisk_version: \"1.27.0\"|bazelisk_version: \"1.27.0\"\n    registry_repository: \"$registry_repository\"|" \
+      sed -i "s|rust_version: \"1.97.0\"|rust_version: \"1.97.0\"\n    registry_repository: \"$registry_repository\"|" \
         "$fixture/.repo-sandbox.yaml"
     fi
     printf '.repo-sandbox/\nreport*.json\n.*.repo-sandbox-reservation\n' >"$fixture/.gitignore"
@@ -239,7 +239,7 @@ EOF
         push_args=()
         if [[ -n ${REPO_SANDBOX_E2E_REGISTRY_REPOSITORY:-} ]]; then
           [[ $REPO_SANDBOX_E2E_REGISTRY_REPOSITORY =~ ^[A-Za-z0-9._:/-]+$ ]]
-          sed -i "s|bazelisk_version: \"1.27.0\"|bazelisk_version: \"1.27.0\"\n    registry_repository: \"${REPO_SANDBOX_E2E_REGISTRY_REPOSITORY}\"|" \
+          sed -i "s|rust_version: \"1.97.0\"|rust_version: \"1.97.0\"\n    registry_repository: \"${REPO_SANDBOX_E2E_REGISTRY_REPOSITORY}\"|" \
             "$fixture/.repo-sandbox.yaml"
           git -C "$fixture" add .repo-sandbox.yaml
           git -C "$fixture" commit -qm registry-policy

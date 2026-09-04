@@ -25,8 +25,10 @@ and transient installation state. `environment` starts from Debian slim,
 installs only task-runtime build dependencies, and copies the Rust/Cargo,
 fixed Bazel, and optional Bazelisk executables across an explicit
 `COPY --from=toolchain-build` boundary. The actual Bazel binary is pinned by
-the `bazel_version` template parameter, so the normal `bazel` command does not
-need Bazelisk to download a second executable at task runtime. Apt,
+the trusted central template to Bazel 8.3.1, so repositories cannot override
+`bazel_version` or `bazelisk_version`, and the normal `bazel` command does not
+need Bazelisk to resolve `latest` or download a second executable at task
+runtime. Apt,
 Cargo and Bazel paths use locked, architecture-specific BuildKit cache mounts;
 those mounts and `/run/secrets` are never committed to a layer.
 

@@ -14,8 +14,6 @@ build_context: templates/rust-bazel/context
 parameters:
   rust_version:
     default: "1.97.0"
-  bazelisk_version:
-    default: "1.27.0"
   registry_repository:
     default: ""
 execution:

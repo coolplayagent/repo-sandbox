@@ -6,13 +6,13 @@ ARG BASE_IMAGE=docker.io/library/rust:1.97.0-bookworm
 FROM ${BASE_IMAGE} AS toolchain-build
 
 ARG TARGETARCH
-ARG BAZELISK_VERSION=1.27.0
-ARG BAZEL_VERSION=8.3.1
 RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,sharing=locked \
     --mount=type=cache,id=repo-sandbox-apt-lists-${TARGETARCH},target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,id=repo-sandbox-toolchain-downloads-${TARGETARCH},target=/toolchain-downloads,sharing=locked \
     --mount=type=secret,id=github_token,required=false \
     set -eu; \
+    bazelisk_version=1.27.0; \
+    bazel_version=8.3.1; \
     token_header=''; \
     if [ -s /run/secrets/github_token ]; then \
       token=$(cat /run/secrets/github_token); \
@@ -27,16 +27,16 @@ RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,s
       *) exit 64 ;; \
     esac; \
     if [ -n "$token_header" ]; then header_args="--header=$token_header"; else header_args=''; fi; \
-    bazelisk_download="/toolchain-downloads/bazelisk-${BAZELISK_VERSION}-${TARGETARCH}"; \
-    bazel_download="/toolchain-downloads/bazel-${BAZEL_VERSION}-${bazel_arch}"; \
+    bazelisk_download="/toolchain-downloads/bazelisk-${bazelisk_version}-${TARGETARCH}"; \
+    bazel_download="/toolchain-downloads/bazel-${bazel_version}-${bazel_arch}"; \
     if [ ! -s "$bazelisk_download" ]; then \
       curl --fail --location --show-error $header_args \
-        "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-${TARGETARCH}" \
+        "https://github.com/bazelbuild/bazelisk/releases/download/v${bazelisk_version}/bazelisk-linux-${TARGETARCH}" \
         --output "$bazelisk_download"; \
     fi; \
     if [ ! -s "$bazel_download" ]; then \
       curl --fail --location --show-error $header_args \
-        "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-linux-${bazel_arch}" \
+        "https://github.com/bazelbuild/bazel/releases/download/${bazel_version}/bazel-${bazel_version}-linux-${bazel_arch}" \
         --output "$bazel_download"; \
     fi; \
     printf '%s  %s\n' "$bazelisk_sha" "$bazelisk_download" | sha256sum --check --strict; \
