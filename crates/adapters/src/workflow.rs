@@ -4438,6 +4438,9 @@ fn seed_registry(
     let source_id = inspect_local_image_id(source, cancellation)?.ok_or_else(|| {
         AppError::Environment(format!("registry seed source image is absent: {source}"))
     })?;
+    // Validate the daemon-provided identity before either the local tag or the
+    // remote push can have side effects.
+    let expected_config = parse_registry_seed_source_id(&source_id)?;
     let existing = inspect_local_image_id(&content, cancellation)?;
     let owned_local_tag = local_seed_tag_is_owned(&source_id, existing.as_deref(), &content)?;
     let run = |args: Vec<&str>| -> Result<crate::buildkit::ProcessOutput, AppError> {
@@ -4477,24 +4480,23 @@ fn seed_registry(
         }
     }
     let push = run(vec!["push", content.as_str()]);
-    let mut primary = match &push {
-        Ok(output) if output.exit_code == Some(0) => None,
-        Ok(output) => Some(AppError::Environment(format!(
-            "registry seed push failed: {}",
-            output.stderr.trim()
-        ))),
-        Err(error) => Some(AppError::Environment(format!(
-            "registry seed push failed: {error}"
-        ))),
-    };
-    let expected_config = ImageDigest::new(source_id).map_err(|error| {
-        AppError::Environment(format!("invalid local registry seed image ID: {error}"))
-    })?;
+    // Nothing fallible may occur between the push returning and this durable
+    // observation of its potentially irreversible remote side effect.
+    let mut primary = observe_registry_seed_push(
+        push,
+        RemotePublicationFact {
+            kind: PublicationFactKind::TaskStaging,
+            reference: content.clone(),
+            digest: digest.clone(),
+            verified: false,
+            finality: PublicationFinality::Staging,
+        },
+        &mut on_progress,
+    );
     let reconciliation = PostCancellationDeadline::new(registry_reconciliation_timeout());
     let registry = DockerRegistry::new(SystemRegistryExecutor);
     let resolved = reconcile_registry_seed(
         &content,
-        digest,
         primary.take(),
         &reconciliation,
         || registry.resolve_single_source_digest(&content, &expected_config, &reconciliation),
@@ -4529,23 +4531,12 @@ fn seed_registry(
 
 fn reconcile_registry_seed(
     reference: &ImageRef,
-    intended_digest: &ImageDigest,
     mut primary: Option<AppError>,
     cancellation: &dyn Cancellation,
     mut resolve: impl FnMut() -> Result<ImageDigest, crate::registry::RegistryError>,
     mut on_progress: impl FnMut(RemotePublicationFact),
     mut wait: impl FnMut(std::time::Duration),
 ) -> Result<ImageDigest, AppError> {
-    on_progress(RemotePublicationFact {
-        kind: PublicationFactKind::TaskStaging,
-        reference: reference.clone(),
-        // The push command may have committed before losing its result. Until
-        // pinned descriptor/config verification succeeds this is only an
-        // explicitly unverified remote side-effect observation.
-        digest: intended_digest.clone(),
-        verified: false,
-        finality: PublicationFinality::Staging,
-    });
     let mut delay = registry_reconciliation_initial_delay();
     let remote_digest = loop {
         match resolve() {
@@ -4584,6 +4575,33 @@ fn reconcile_registry_seed(
     remote_digest.ok_or_else(|| {
         AppError::Environment("registry seed manifest did not become verifiably visible".into())
     })
+}
+
+fn parse_registry_seed_source_id(source_id: &str) -> Result<ImageDigest, AppError> {
+    ImageDigest::new(source_id.to_owned()).map_err(|error| {
+        AppError::Environment(format!("invalid local registry seed image ID: {error}"))
+    })
+}
+
+fn observe_registry_seed_push(
+    push: Result<crate::buildkit::ProcessOutput, AppError>,
+    unverified: RemotePublicationFact,
+    mut on_progress: impl FnMut(RemotePublicationFact),
+) -> Option<AppError> {
+    // This callback deliberately precedes even interpretation/formatting of
+    // the outcome: an executor error or nonzero status can follow a committed
+    // registry write.
+    on_progress(unverified);
+    match push {
+        Ok(output) if output.exit_code == Some(0) => None,
+        Ok(output) => Some(AppError::Environment(format!(
+            "registry seed push failed: {}",
+            output.stderr.trim()
+        ))),
+        Err(error) => Some(AppError::Environment(format!(
+            "registry seed push failed: {error}"
+        ))),
+    }
 }
 
 struct RegistrySeed {
@@ -6853,6 +6871,54 @@ mod tests {
     }
 
     #[test]
+    fn malformed_local_seed_id_is_rejected_before_any_tag_or_push_action() {
+        let actions = std::cell::Cell::new(0);
+        let result = parse_registry_seed_source_id("sha256:not-a-daemon-image-id").map(|_| {
+            actions.set(actions.get() + 1);
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid local registry seed image ID")
+        );
+        assert_eq!(actions.get(), 0);
+    }
+
+    #[test]
+    fn every_returned_push_outcome_records_unverified_staging_first() {
+        let outputs = [
+            Ok(crate::buildkit::ProcessOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                interrupted: false,
+            }),
+            Ok(crate::buildkit::ProcessOutput {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "push failed after commit".into(),
+                interrupted: false,
+            }),
+            Err(AppError::Environment("executor lost result".into())),
+        ];
+        for push in outputs {
+            let mut events = Vec::new();
+            let fact = RemotePublicationFact {
+                kind: PublicationFactKind::TaskStaging,
+                reference: ImageRef::new("registry.test/team/image:task-staging-timing").unwrap(),
+                digest: seed_digest('a'),
+                verified: false,
+                finality: PublicationFinality::Staging,
+            };
+            let _primary =
+                observe_registry_seed_push(push, fact.clone(), |observed| events.push(observed));
+            assert_eq!(events, vec![fact]);
+            assert!(!events[0].verified);
+        }
+    }
+
+    #[test]
     fn committed_but_failed_seed_records_pinned_remote_fact_without_finalizing() {
         let reference = ImageRef::new("registry.test/team/image:task-staging-task-1").unwrap();
         let local = seed_digest('a');
@@ -6865,12 +6931,22 @@ mod tests {
             Ok(remote.clone()),
         ]);
         let mut facts = Vec::new();
-        let result = reconcile_registry_seed(
-            &reference,
-            &local,
-            Some(AppError::Environment(
+        let primary = observe_registry_seed_push(
+            Err(AppError::Environment(
                 "push result was lost after spawn".into(),
             )),
+            RemotePublicationFact {
+                kind: PublicationFactKind::TaskStaging,
+                reference: reference.clone(),
+                digest: local.clone(),
+                verified: false,
+                finality: PublicationFinality::Staging,
+            },
+            |fact| facts.push(fact),
+        );
+        let result = reconcile_registry_seed(
+            &reference,
+            primary,
             &NeverCancelled,
             || answers.pop_front().unwrap(),
             |fact| facts.push(fact),
@@ -6914,10 +6990,25 @@ mod tests {
             let reference = ImageRef::new("registry.test/team/image:task-staging-task-2").unwrap();
             let mut error = Some(error);
             let mut facts = Vec::new();
+            let primary = observe_registry_seed_push(
+                Ok(crate::buildkit::ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    interrupted: false,
+                }),
+                RemotePublicationFact {
+                    kind: PublicationFactKind::TaskStaging,
+                    reference: reference.clone(),
+                    digest: seed_digest('a'),
+                    verified: false,
+                    finality: PublicationFinality::Staging,
+                },
+                |fact| facts.push(fact),
+            );
             let result = reconcile_registry_seed(
                 &reference,
-                &seed_digest('a'),
-                None,
+                primary,
                 &cancellation,
                 || Err(error.take().unwrap()),
                 |fact| facts.push(fact),
@@ -6937,10 +7028,25 @@ mod tests {
         let local = seed_digest('a');
         let remote = seed_digest('b');
         let mut facts = Vec::new();
+        let primary = observe_registry_seed_push(
+            Ok(crate::buildkit::ProcessOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                interrupted: false,
+            }),
+            RemotePublicationFact {
+                kind: PublicationFactKind::TaskStaging,
+                reference: reference.clone(),
+                digest: local.clone(),
+                verified: false,
+                finality: PublicationFinality::Staging,
+            },
+            |fact| facts.push(fact),
+        );
         let resolved = reconcile_registry_seed(
             &reference,
-            &local,
-            None,
+            primary,
             &NeverCancelled,
             || Ok(remote.clone()),
             |fact| facts.push(fact),
