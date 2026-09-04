@@ -66,6 +66,8 @@ grep -Fq '13f4ffd2b6922e941d6b6a9faee73ec9b8cab5b309ef90dfadf48142c2a47f34' \
 grep -Fq 'v0.15.1/buildx-v0.15.1.linux-amd64' "$ci"
 grep -Fq '8d486f0088b7407a90ad675525ba4a17d0a537741b9b33fe3391a88cafa2dd0b' "$ci"
 grep -Fq "imagetools create --help | grep -F -- '--prefer-index'" "$ci"
+grep -Fq 'ensure_buildx_carbon_copy_capability' "$euleros_installer" "$yum_installer"
+bash "$root/scripts/tests/buildx-capability.sh"
 grep -Fq 'REPO_SANDBOX_E2E_PROFILE_SECRET: repo-sandbox-ci-profile-secret-not-a-credential' "$ci"
 ! grep -Fq "grep -Fx 'repo-sandbox 0.1.0'" "$ci"
 grep -Fq 'bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh' "$ci"

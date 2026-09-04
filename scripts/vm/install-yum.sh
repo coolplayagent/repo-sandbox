@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=../lib/buildx-capability.sh
+source "$SCRIPT_DIR/../lib/buildx-capability.sh"
+
 readonly BAZELISK_VERSION=v1.29.0
 readonly BAZELISK_AMD64_SHA256=5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992
 readonly BAZELISK_ARM64_SHA256=e20e8b0f4f240091b7a55bf17b9398bd4f40ee70ae0208dff95dd4c445fb4010
@@ -129,13 +133,9 @@ if ! command -v bazelisk >/dev/null 2>&1; then
 fi
 [[ -e /usr/local/bin/bazel ]] || ln -s bazelisk /usr/local/bin/bazel
 
-if ! docker buildx version >/dev/null 2>&1; then
-  install -d -m 0755 /usr/local/lib/docker/cli-plugins
-  install_verified_binary \
-    "https://github.com/docker/buildx/releases/download/$BUILDX_VERSION/buildx-$BUILDX_VERSION.linux-$artifact_arch" \
-    "$buildx_sha" /usr/local/lib/docker/cli-plugins/docker-buildx
-fi
-docker buildx version >/dev/null
+ensure_buildx_carbon_copy_capability \
+  "https://github.com/docker/buildx/releases/download/$BUILDX_VERSION/buildx-$BUILDX_VERSION.linux-$artifact_arch" \
+  "$buildx_sha" /usr/local/lib/docker/cli-plugins/docker-buildx
 
 # doctor requires the opposite architecture to be executable. Use only a
 # package already exposed by the operator-configured repositories.

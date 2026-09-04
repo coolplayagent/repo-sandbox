@@ -1,5 +1,6 @@
 Cargo.toml text eol=lf
 Cargo.lock text eol=lf
+scripts/**/*.sh text eol=lf
 templates/rust-bazel/context/Dockerfile text eol=lf
 templates/rust-bazel/context/bazel text eol=lf
 templates/rust-bazel/context/offline-baseline/* text eol=lf
