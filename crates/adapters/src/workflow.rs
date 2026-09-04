@@ -4426,24 +4426,55 @@ fn seed_registry(
     digest: &repo_sandbox_core::build::ImageDigest,
     task_id: &str,
     cancellation: &DeadlineCancellation,
-    mut on_progress: impl FnMut(RemotePublicationFact),
+    on_progress: impl FnMut(RemotePublicationFact),
 ) -> Result<RegistrySeed, AppError> {
-    let content = registry_staging_ref(repository, task_id)?;
-    let lease = OutputReservation::wait_identity(
-        &format!("local-registry-content-tag:{content}"),
-        Path::new(content.as_str()),
-        "local registry content tag",
+    seed_registry_with(
+        &SystemRegistrySeedIo,
+        source,
+        repository,
+        digest,
+        task_id,
         cancellation,
-    )?;
-    let source_id = inspect_local_image_id(source, cancellation)?.ok_or_else(|| {
-        AppError::Environment(format!("registry seed source image is absent: {source}"))
-    })?;
-    // Validate the daemon-provided identity before either the local tag or the
-    // remote push can have side effects.
-    let expected_config = parse_registry_seed_source_id(&source_id)?;
-    let existing = inspect_local_image_id(&content, cancellation)?;
-    let owned_local_tag = local_seed_tag_is_owned(&source_id, existing.as_deref(), &content)?;
-    let run = |args: Vec<&str>| -> Result<crate::buildkit::ProcessOutput, AppError> {
+        on_progress,
+    )
+}
+
+trait RegistrySeedIo {
+    fn inspect(
+        &self,
+        reference: &ImageRef,
+        cancellation: &dyn Cancellation,
+    ) -> Result<Option<String>, AppError>;
+    fn run(
+        &self,
+        args: Vec<&str>,
+        cancellation: &DeadlineCancellation,
+    ) -> Result<crate::buildkit::ProcessOutput, AppError>;
+    fn resolve(
+        &self,
+        reference: &ImageRef,
+        expected_config: &ImageDigest,
+        cancellation: &dyn Cancellation,
+    ) -> Result<ImageDigest, crate::registry::RegistryError>;
+    fn cleanup(&self, reference: &ImageRef) -> Result<(), AppError>;
+}
+
+struct SystemRegistrySeedIo;
+
+impl RegistrySeedIo for SystemRegistrySeedIo {
+    fn inspect(
+        &self,
+        reference: &ImageRef,
+        cancellation: &dyn Cancellation,
+    ) -> Result<Option<String>, AppError> {
+        inspect_local_image_id(reference, cancellation)
+    }
+
+    fn run(
+        &self,
+        args: Vec<&str>,
+        cancellation: &DeadlineCancellation,
+    ) -> Result<crate::buildkit::ProcessOutput, AppError> {
         let invocation = ProcessInvocation {
             program: "docker".into(),
             args: args.into_iter().map(str::to_owned).collect(),
@@ -4458,9 +4489,55 @@ fn seed_registry(
             ));
         }
         Ok(output)
-    };
+    }
+
+    fn resolve(
+        &self,
+        reference: &ImageRef,
+        expected_config: &ImageDigest,
+        cancellation: &dyn Cancellation,
+    ) -> Result<ImageDigest, crate::registry::RegistryError> {
+        DockerRegistry::new(SystemRegistryExecutor).resolve_single_source_digest(
+            reference,
+            expected_config,
+            cancellation,
+        )
+    }
+
+    fn cleanup(&self, reference: &ImageRef) -> Result<(), AppError> {
+        remove_local_registry_tag_after_cancellation(reference)
+    }
+}
+
+fn seed_registry_with(
+    io: &impl RegistrySeedIo,
+    source: &ImageRef,
+    repository: &RegistryRepository,
+    digest: &ImageDigest,
+    task_id: &str,
+    cancellation: &DeadlineCancellation,
+    mut on_progress: impl FnMut(RemotePublicationFact),
+) -> Result<RegistrySeed, AppError> {
+    let content = registry_staging_ref(repository, task_id)?;
+    let lease = OutputReservation::wait_identity(
+        &format!("local-registry-content-tag:{content}"),
+        Path::new(content.as_str()),
+        "local registry content tag",
+        cancellation,
+    )?;
+    let source_id = io.inspect(source, cancellation)?.ok_or_else(|| {
+        AppError::Environment(format!("registry seed source image is absent: {source}"))
+    })?;
+    // Validate the daemon-provided identity before either the local tag or the
+    // remote push can have side effects.
+    let expected_config = parse_registry_seed_source_id(&source_id)?;
+    let existing = io.inspect(&content, cancellation)?;
+    let owned_local_tag = local_seed_tag_is_owned(&source_id, existing.as_deref(), &content)?;
     if owned_local_tag {
-        let tagged = run(vec!["image", "tag", source.as_str(), content.as_str()]);
+        let tagged = io.run(
+            vec!["image", "tag", source.as_str(), content.as_str()],
+            cancellation,
+        );
         let primary = match tagged {
             Ok(output) if output.exit_code == Some(0) => None,
             Ok(output) => Some(AppError::Environment(format!(
@@ -4470,7 +4547,7 @@ fn seed_registry(
             Err(error) => Some(error),
         };
         if let Some(primary) = primary {
-            let cleanup = remove_local_registry_tag_after_cancellation(&content);
+            let cleanup = io.cleanup(&content);
             return Err(match cleanup {
                 Ok(()) => primary,
                 Err(cleanup) => AppError::Environment(format!(
@@ -4479,7 +4556,7 @@ fn seed_registry(
             });
         }
     }
-    let push = run(vec!["push", content.as_str()]);
+    let push = io.run(vec!["push", content.as_str()], cancellation);
     // Nothing fallible may occur between the push returning and this durable
     // observation of its potentially irreversible remote side effect.
     let mut primary = observe_registry_seed_push(
@@ -4494,12 +4571,11 @@ fn seed_registry(
         &mut on_progress,
     );
     let reconciliation = PostCancellationDeadline::new(registry_reconciliation_timeout());
-    let registry = DockerRegistry::new(SystemRegistryExecutor);
     let resolved = reconcile_registry_seed(
         &content,
         primary.take(),
         &reconciliation,
-        || registry.resolve_single_source_digest(&content, &expected_config, &reconciliation),
+        || io.resolve(&content, &expected_config, &reconciliation),
         &mut on_progress,
         std::thread::sleep,
     );
@@ -4507,14 +4583,12 @@ fn seed_registry(
         Ok(digest) => digest,
         Err(primary) => {
             if owned_local_tag {
-                return Err(
-                    match remove_local_registry_tag_after_cancellation(&content) {
-                        Ok(()) => primary,
-                        Err(cleanup) => AppError::Environment(format!(
-                            "{primary}; remove failed registry seed tag {content}: {cleanup}"
-                        )),
-                    },
-                );
+                return Err(match io.cleanup(&content) {
+                    Ok(()) => primary,
+                    Err(cleanup) => AppError::Environment(format!(
+                        "{primary}; remove failed registry seed tag {content}: {cleanup}"
+                    )),
+                });
             }
             return Err(AppError::Environment(format!(
                 "{primary}; pre-existing shared local staging tag {content} was safely retained"
@@ -4992,6 +5066,89 @@ mod tests {
 
     struct CountingAbsentExecutor {
         calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SeedPushOutcome {
+        Success,
+        Nonzero,
+        ExecutorError,
+    }
+
+    struct RecordingSeedIo {
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        source: ImageRef,
+        source_id: String,
+        remote_digest: ImageDigest,
+        push: SeedPushOutcome,
+    }
+
+    impl RegistrySeedIo for RecordingSeedIo {
+        fn inspect(
+            &self,
+            reference: &ImageRef,
+            _cancellation: &dyn Cancellation,
+        ) -> Result<Option<String>, AppError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(if reference == &self.source {
+                    "inspect-source"
+                } else {
+                    "inspect-staging"
+                });
+            Ok((reference == &self.source).then(|| self.source_id.clone()))
+        }
+
+        fn run(
+            &self,
+            args: Vec<&str>,
+            _cancellation: &DeadlineCancellation,
+        ) -> Result<crate::buildkit::ProcessOutput, AppError> {
+            if args.first() == Some(&"push") {
+                self.events.lock().unwrap().push("push-return");
+                return match self.push {
+                    SeedPushOutcome::Success => Ok(crate::buildkit::ProcessOutput {
+                        exit_code: Some(0),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        interrupted: false,
+                    }),
+                    SeedPushOutcome::Nonzero => Ok(crate::buildkit::ProcessOutput {
+                        exit_code: Some(1),
+                        stdout: String::new(),
+                        stderr: "push failed after commit".into(),
+                        interrupted: false,
+                    }),
+                    SeedPushOutcome::ExecutorError => {
+                        Err(AppError::Environment("executor lost push result".into()))
+                    }
+                };
+            }
+            assert_eq!(args.get(0..2), Some(["image", "tag"].as_slice()));
+            self.events.lock().unwrap().push("tag-return");
+            Ok(crate::buildkit::ProcessOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                interrupted: false,
+            })
+        }
+
+        fn resolve(
+            &self,
+            _reference: &ImageRef,
+            _expected_config: &ImageDigest,
+            _cancellation: &dyn Cancellation,
+        ) -> Result<ImageDigest, crate::registry::RegistryError> {
+            self.events.lock().unwrap().push("resolve");
+            Ok(self.remote_digest.clone())
+        }
+
+        fn cleanup(&self, _reference: &ImageRef) -> Result<(), AppError> {
+            self.events.lock().unwrap().push("cleanup");
+            Ok(())
+        }
     }
 
     impl ProcessExecutor for CountingAbsentExecutor {
@@ -6872,49 +7029,88 @@ mod tests {
 
     #[test]
     fn malformed_local_seed_id_is_rejected_before_any_tag_or_push_action() {
-        let actions = std::cell::Cell::new(0);
-        let result = parse_registry_seed_source_id("sha256:not-a-daemon-image-id").map(|_| {
-            actions.set(actions.get() + 1);
-        });
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let source = ImageRef::new("repo-sandbox-task:malformed-seed").unwrap();
+        let io = RecordingSeedIo {
+            events: events.clone(),
+            source: source.clone(),
+            source_id: "sha256:not-a-daemon-image-id".into(),
+            remote_digest: seed_digest('b'),
+            push: SeedPushOutcome::Success,
+        };
+        let result = seed_registry_with(
+            &io,
+            &source,
+            &RegistryRepository::new("registry.test/team/malformed-seed").unwrap(),
+            &seed_digest('a'),
+            "malformed-seed",
+            &DeadlineCancellation::new(std::time::Duration::from_secs(2)),
+            |_| panic!("malformed source identity must not report remote progress"),
+        );
+        let error = match result {
+            Ok(_) => panic!("malformed source identity was accepted"),
+            Err(error) => error,
+        };
         assert!(
-            result
-                .unwrap_err()
+            error
                 .to_string()
                 .contains("invalid local registry seed image ID")
         );
-        assert_eq!(actions.get(), 0);
+        assert_eq!(*events.lock().unwrap(), ["inspect-source"]);
     }
 
     #[test]
-    fn every_returned_push_outcome_records_unverified_staging_first() {
-        let outputs = [
-            Ok(crate::buildkit::ProcessOutput {
-                exit_code: Some(0),
-                stdout: String::new(),
-                stderr: String::new(),
-                interrupted: false,
-            }),
-            Ok(crate::buildkit::ProcessOutput {
-                exit_code: Some(1),
-                stdout: String::new(),
-                stderr: "push failed after commit".into(),
-                interrupted: false,
-            }),
-            Err(AppError::Environment("executor lost result".into())),
-        ];
-        for push in outputs {
-            let mut events = Vec::new();
-            let fact = RemotePublicationFact {
-                kind: PublicationFactKind::TaskStaging,
-                reference: ImageRef::new("registry.test/team/image:task-staging-timing").unwrap(),
-                digest: seed_digest('a'),
-                verified: false,
-                finality: PublicationFinality::Staging,
+    fn actual_seed_flow_records_unverified_progress_immediately_after_every_push_outcome() {
+        for (index, outcome) in [
+            SeedPushOutcome::Success,
+            SeedPushOutcome::Nonzero,
+            SeedPushOutcome::ExecutorError,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let source = ImageRef::new(format!("repo-sandbox-task:seed-order-{index}")).unwrap();
+            let io = RecordingSeedIo {
+                events: events.clone(),
+                source: source.clone(),
+                source_id: seed_digest('a').to_string(),
+                remote_digest: seed_digest('b'),
+                push: outcome,
             };
-            let _primary =
-                observe_registry_seed_push(push, fact.clone(), |observed| events.push(observed));
-            assert_eq!(events, vec![fact]);
-            assert!(!events[0].verified);
+            let callback_events = events.clone();
+            let result = seed_registry_with(
+                &io,
+                &source,
+                &RegistryRepository::new(format!("registry.test/team/seed-order-{index}")).unwrap(),
+                &seed_digest('c'),
+                &format!("seed-order-{index}"),
+                &DeadlineCancellation::new(std::time::Duration::from_secs(2)),
+                |fact| {
+                    callback_events.lock().unwrap().push(if fact.verified {
+                        "verified-progress"
+                    } else {
+                        "unverified-progress"
+                    });
+                },
+            );
+            assert_eq!(result.is_ok(), matches!(outcome, SeedPushOutcome::Success));
+            let events = events.lock().unwrap();
+            let push = events
+                .iter()
+                .position(|event| *event == "push-return")
+                .unwrap();
+            assert_eq!(events.get(push + 1), Some(&"unverified-progress"));
+            assert_eq!(events.get(push + 2), Some(&"resolve"));
+            assert_eq!(
+                &events[..=push],
+                [
+                    "inspect-source",
+                    "inspect-staging",
+                    "tag-return",
+                    "push-return"
+                ]
+            );
         }
     }
 
