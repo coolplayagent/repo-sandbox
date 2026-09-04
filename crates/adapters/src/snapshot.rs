@@ -1690,9 +1690,15 @@ mod tests {
 
         fn stop(&mut self) {
             self.shutdown();
-            assert!(
-                TcpStream::connect(("127.0.0.1", self.port)).is_err(),
-                "task-owned public Git HTTP port {} remained open",
+            let address = std::net::SocketAddr::from(([127, 0, 0, 1], self.port));
+            for _ in 0..20 {
+                if TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "task-owned public Git HTTP port {} remained open after server join",
                 self.port
             );
         }
@@ -1704,7 +1710,6 @@ mod tests {
         fn shutdown(&mut self) {
             if let Some(server) = self.server.take() {
                 self.stop.store(true, Ordering::Release);
-                let _ = TcpStream::connect(("127.0.0.1", self.port));
                 server.join().expect("task-owned public Git HTTP thread");
             }
         }
@@ -1713,6 +1718,15 @@ mod tests {
     impl Drop for LocalPublicGitHttp {
         fn drop(&mut self) {
             self.shutdown();
+        }
+    }
+
+    #[test]
+    fn local_public_git_http_shutdown_closes_each_listener_after_join() {
+        let repository = tempfile::tempdir().unwrap();
+        for _ in 0..20 {
+            let mut server = LocalPublicGitHttp::start(repository.path());
+            server.stop();
         }
     }
 
