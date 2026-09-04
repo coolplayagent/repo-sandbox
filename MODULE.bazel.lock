@@ -499,10 +499,10 @@
           "REPO_MAPPING:rules_rust+,bazel_tools bazel_tools",
           "REPO_MAPPING:rules_rust+,rules_cc rules_cc+",
           "FILE:@@//Cargo.lock ea15dd6f7360714221578e8765659b65880f1de064a7498bccfe06b5785609d0",
-          "FILE:@@//Cargo.toml 30efec128ca8af6dbf80802dc962bb4f4899fb62dd8ccde094b586b5607f5511",
-          "FILE:@@//crates/adapters/Cargo.toml b10a9e63841c7f02b0d9122d26fc274873709090a8afa3ec9eacfa6937255687",
-          "FILE:@@//crates/core/Cargo.toml 5851fc0eaa8cbbdd5d9e733e60f9bedbcc97135941fa123e0f473b85b8f71220",
-          "FILE:@@//apps/cli/Cargo.toml 5b3004c5134c2ac1b06ff567a437aea62fff77a27d93df1cf8bb6f5017221839"
+          "FILE:@@//Cargo.toml ffc68e3e82ffc2d58cd4275d7b2e91ed53e9ff7bea639e1d5f7df2dbfa4ecabd",
+          "FILE:@@//crates/adapters/Cargo.toml eb6de7762dca8fc198a783b8cc9d95527da49b6703266a4d5935acef42241c68",
+          "FILE:@@//crates/core/Cargo.toml d9d105f1d82c6b943e1868207c37a004a78524919c114d62ab1fe5c2af38ec8c",
+          "FILE:@@//apps/cli/Cargo.toml ed11e0a8f2392ab6ea4405ad040fdd5e17f4998ee61fc5357e2c78819e18a2a0"
         ],
         "generatedRepoSpecs": {
           "crates": {
