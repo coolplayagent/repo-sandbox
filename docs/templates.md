@@ -13,24 +13,37 @@ dependency selections, platform mismatches, and dependency cycles are reported
 with YAML-style paths. Topological sorting uses component IDs to break ties, so
 the same inputs always produce the same `TemplatePlan` stage order.
 
-The bootstrap catalog contains `rust-bazel@1.0.0` and the `base-tools`, `bazel`,
+The bootstrap catalog contains `rust-bazel@1.0.1` and the `base-tools`, `bazel`,
 and `rust` components. Its manifests and Dockerfiles are Bazel compile inputs,
 and core tests statically parse and plan the embedded catalog. Central paths are
 ordinary checked-in files; no symlinks or init-dev-compatible filename
 conventions are required.
 
-The central Rust+Bazel Dockerfile has two named stages. `toolchain-build` owns
+The central Rust+Bazel Dockerfile has four named stages. `toolchain-build` owns
 the large upstream assembly image, the downloader, optional BuildKit secret,
-and transient installation state. `environment` starts from Debian slim,
+and transient installation state. `environment-base` starts from Debian slim,
 installs only task-runtime build dependencies, and copies the Rust/Cargo,
 fixed Bazel, and optional Bazelisk executables across an explicit
-`COPY --from=toolchain-build` boundary. The actual Bazel binary is pinned by
+`COPY --from=toolchain-build` boundary. `offline-seed` resolves a fixed,
+centrally owned `genrule` plus `cc_test` fixture without access to repository
+source or the optional GitHub token. The final `environment` copies only the
+resulting content-addressed Bazel repository closure. The actual Bazel binary is pinned by
 the trusted central template to Bazel 8.3.1, so repositories cannot override
 `bazel_version` or `bazelisk_version`, and the normal `bazel` command does not
 need Bazelisk to resolve `latest` or download a second executable at task
-runtime. Apt,
-Cargo and Bazel paths use locked, architecture-specific BuildKit cache mounts;
-those mounts and `/run/secrets` are never committed to a layer.
+runtime.
+
+The root-owned `bazel` wrapper ignores repository, user, and system rc files,
+clears Bazelisk override variables, selects the fixed binary, and disables all
+repository downloads. Task containers use Docker network `none`. When a source
+snapshot has no `MODULE.bazel.lock`, the task image supplies the checksum-pinned
+baseline lock for Bazel 8.3.1's built-in C++, Java, shell, and platform module
+mapping. The read-only image closure contains both registry metadata and source
+archives, rather than relying on a BuildKit cache mount. Repositories needing
+additional modules must commit their own offline vendor/lock inputs; an absent
+archive fails closed instead of enabling runtime network access. Apt and Cargo
+paths use locked, architecture-specific BuildKit cache mounts; those mounts and
+`/run/secrets` are never committed to a layer.
 
 Inspect a repository selection without building or pulling an image:
 

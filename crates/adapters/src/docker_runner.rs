@@ -443,7 +443,7 @@ pub fn plan(spec: &RunSpec) -> Result<DockerRunPlan, PlanError> {
         "--label",
         &repository_label,
         "--network",
-        "bridge",
+        "none",
         "--cpus",
         &cpu,
         "--memory",
@@ -1484,7 +1484,7 @@ mod tests {
         assert_eq!(plan.create.program, "docker");
         let args = &plan.create.args;
         for pair in [
-            ["--network", "bridge"],
+            ["--network", "none"],
             ["--cpus", "2"],
             ["--memory", "2048m"],
             ["--memory-swap", "2048m"],

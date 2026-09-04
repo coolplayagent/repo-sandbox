@@ -9,6 +9,7 @@ rust_library(
         "//scripts/docker:multistage-acceptance",
         "//templates:component-dockerfiles",
         "//templates:rust-bazel-dockerfile",
+        "//templates:rust-bazel-offline-baseline",
     ],
     crate_name = "repo_sandbox_adapters",
     deps = all_crate_deps(normal = True) + ["//crates/core:core"],

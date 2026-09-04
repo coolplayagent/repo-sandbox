@@ -1,5 +1,5 @@
 id: rust-bazel-acceptance-architecture
-version: "1.0.0"
+version: "1.0.1"
 base_image: docker.io/library/rust:1.97.0-bookworm
 components: [{ id: base-tools }, { id: bazel, depends_on: [base-tools] }, { id: rust, depends_on: [base-tools] }]
 target_platforms: [linux/amd64, linux/arm64]

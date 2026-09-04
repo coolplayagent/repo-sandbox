@@ -1,5 +1,5 @@
 id: rust-bazel
-version: "1.0.0"
+version: "1.0.1"
 base_image: docker.io/library/rust:${rust_version}-bookworm
 components:
   - id: base-tools

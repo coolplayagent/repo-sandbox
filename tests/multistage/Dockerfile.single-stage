@@ -25,8 +25,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --link source/ /workspace/
 WORKDIR /workspace
+RUN cp BUILD.seed BUILD.bazel
 LABEL io.repo-sandbox.source.digest="${SOURCE_DIGEST}"
 
 FROM task AS acceptance
 RUN cargo test --locked \
-    && bazel --batch build //:rust_binary
+    && bazel --batch --bazelrc=/dev/null build //:rust_binary

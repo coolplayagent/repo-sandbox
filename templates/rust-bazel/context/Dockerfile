@@ -46,7 +46,7 @@ RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,s
     rustc --version; \
     cargo --version
 
-FROM debian:bookworm-slim AS environment
+FROM debian:bookworm-slim AS environment-base
 
 ARG TARGETARCH
 ARG RUST_VERSION=1.97.0
@@ -68,11 +68,10 @@ ENV CARGO_HOME=/usr/local/cargo \
     REPO_SANDBOX_BAZEL_VERSION=8.3.1 \
     PATH=/usr/local/cargo/bin:${PATH}
 
-# Cargo and Bazel network state are reusable BuildKit caches, never image
-# layers. This step validates the copied tools without downloading project data.
+# Cargo network state is a reusable BuildKit cache, never an image layer. This
+# step validates the copied tools without downloading project data.
 RUN --mount=type=cache,id=repo-sandbox-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=repo-sandbox-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=repo-sandbox-bazel-${TARGETARCH},target=/root/.cache/bazel,sharing=locked \
     set -eu; \
     rustup default "$RUST_VERSION"; \
     ln -sf "$(rustup which --toolchain "$RUST_VERSION" rustc)" /usr/local/cargo/bin/rustc; \
@@ -80,6 +79,38 @@ RUN --mount=type=cache,id=repo-sandbox-cargo-registry-${TARGETARCH},target=/usr/
     rustc --version; \
     cargo --version; \
     bazel --help >/dev/null
+
+# Resolve only this centrally owned fixture. Its lock pins every BCR metadata
+# byte and every selected source archive carries an integrity hash. The GitHub
+# token is intentionally unavailable in this stage. After pruning workspace and
+# install state, the remaining global repository CAS is architecture-neutral.
+FROM environment-base AS offline-seed
+COPY offline-baseline/ /opt/repo-sandbox/offline-baseline/
+RUN set -eu; \
+    cd /opt/repo-sandbox/offline-baseline; \
+    cp BUILD.seed BUILD.bazel; \
+    mkdir -p /toolchain/bazel-seed; \
+    cp MODULE.bazel.lock /tmp/repo-sandbox-baseline.lock; \
+    bazel --batch --output_user_root=/toolchain/bazel-seed mod graph >/dev/null; \
+    sed -n '/^  "registryFileHashes": {$/,/^  },$/p' /tmp/repo-sandbox-baseline.lock > /tmp/repo-sandbox-expected-hashes; \
+    sed -n '/^  "registryFileHashes": {$/,/^  },$/p' MODULE.bazel.lock > /tmp/repo-sandbox-actual-hashes; \
+    test -s /tmp/repo-sandbox-expected-hashes; \
+    cmp /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes; \
+    bazel --batch --output_user_root=/toolchain/bazel-seed test //...; \
+    rm /tmp/repo-sandbox-baseline.lock /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes; \
+    find /toolchain/bazel-seed -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
+    find /toolchain/bazel-seed/cache -mindepth 1 -maxdepth 1 ! -name repos -exec rm -rf '{}' +
+
+FROM environment-base AS environment
+COPY --from=offline-seed /toolchain/bazel-seed/cache/repos/ /var/cache/repo-sandbox/bazel/cache/repos/
+COPY offline-baseline/MODULE.bazel.lock /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock
+COPY bazel /tmp/repo-sandbox-bazel-wrapper
+RUN set -eu; \
+    mkdir -p /usr/local/libexec/repo-sandbox; \
+    mv /usr/local/bin/bazel /usr/local/libexec/repo-sandbox/bazel-8.3.1; \
+    install -m 0755 /tmp/repo-sandbox-bazel-wrapper /usr/local/bin/bazel; \
+    rm /tmp/repo-sandbox-bazel-wrapper; \
+    bazel --version | grep -Fx 'bazel 8.3.1'
 
 # These values are part of the final image configuration. BuildKit can reuse
 # unchanged installation layers, while a template, component, or parameter

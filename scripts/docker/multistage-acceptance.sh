@@ -81,12 +81,15 @@ for architecture in amd64 arm64; do
   printf '%s environment cold/warm identity: %s\n' \
     "$architecture" "$warm_environment_identity"
   assert_cached_step "$warm_log" '[toolchain-build 2/2] RUN'
-  assert_cached_step "$warm_log" '[environment 2/7] RUN'
-  assert_cached_step "$warm_log" '[environment 3/7] COPY --from=toolchain-build /usr/local/cargo/'
-  assert_cached_step "$warm_log" '[environment 4/7] COPY --from=toolchain-build /usr/local/rustup/'
-  assert_cached_step "$warm_log" '[environment 5/7] COPY --from=toolchain-build /toolchain/bin/bazel'
-  assert_cached_step "$warm_log" '[environment 6/7] COPY --from=toolchain-build /toolchain/bin/bazelisk'
-  assert_cached_step "$warm_log" '[environment 7/7] RUN'
+  assert_cached_step "$warm_log" '[environment-base 2/7] RUN'
+  assert_cached_step "$warm_log" '[environment-base 3/7] COPY --from=toolchain-build /usr/local/cargo/'
+  assert_cached_step "$warm_log" '[environment-base 4/7] COPY --from=toolchain-build /usr/local/rustup/'
+  assert_cached_step "$warm_log" '[environment-base 5/7] COPY --from=toolchain-build /toolchain/bin/bazel'
+  assert_cached_step "$warm_log" '[environment-base 6/7] COPY --from=toolchain-build /toolchain/bin/bazelisk'
+  assert_cached_step "$warm_log" '[environment-base 7/7] RUN'
+  assert_cached_step "$warm_log" '[offline-seed 2/2] RUN'
+  assert_cached_step "$warm_log" '[environment 1/4] COPY --from=offline-seed /toolchain/bazel-seed/cache/repos/'
+  assert_cached_step "$warm_log" '[environment 4/4] RUN'
 
   source_digest=$(tar -C "$temporary/context/source" --sort=name --mtime='UTC 1970-01-01' \
     --owner=0 --group=0 --numeric-owner -cf - . | sha256sum | awk '{print "sha256:"$1}')
@@ -154,7 +157,9 @@ for architecture in amd64 arm64; do
     test ! -e /toolchain
     test ! -e /run/secrets/github_token
     test -z "$(find /root/.cache -mindepth 1 -print -quit 2>/dev/null)"
-    test -z "$(find /var/cache/repo-sandbox -mindepth 1 -print -quit 2>/dev/null)"
+    test -d /var/cache/repo-sandbox/bazel/cache/repos/v1
+    test -s /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock
+    test -x /usr/local/libexec/repo-sandbox/bazel-8.3.1
     test ! -e /root/.cache/bazel
     test ! -e /root/.cache/bazelisk
     test ! -e /toolchain-downloads
@@ -167,8 +172,43 @@ for architecture in amd64 arm64; do
     command -v bazel >/dev/null
     command -v git >/dev/null
     command -v cc >/dev/null
+    ! grep -R -F issue1-secret-marker-must-not-leak \
+      /var/cache/repo-sandbox /usr/local/share/repo-sandbox >/dev/null 2>&1
   '
   printf '%s final-image history/filesystem security scan: passed\n' "$architecture"
+
+  docker run --rm --network none --platform "$platform" \
+    --env USE_BAZEL_VERSION=latest --env BAZEL_OPTS=--bazelrc=/workspace/.bazelrc \
+    "$task" sh -ec '
+      test "$(bazel --version)" = "bazel 8.3.1"
+      bazel --batch build //:rust_binary
+      bazel --batch test //...
+    '
+  printf '%s final-task Bazel closure: network=none pinned=8.3.1 rc=ignored passed\n' \
+    "$architecture"
+
+  if [[ $architecture == amd64 ]]; then
+    missing_log="$temporary/offline-closure-missing.log"
+    if docker run --rm --network none --platform "$platform" "$task" sh -ec '
+      rm -rf /var/cache/repo-sandbox/bazel/cache/repos
+      bazel --batch build //...
+    ' >"$missing_log" 2>&1; then
+      echo 'Bazel unexpectedly succeeded without the embedded repository closure' >&2
+      exit 1
+    fi
+    grep -Eqi 'registry|repository|download' "$missing_log"
+
+    corrupt_log="$temporary/offline-closure-corrupt.log"
+    if docker run --rm --network none --platform "$platform" "$task" sh -ec '
+      sed -i "0,/8a28e4a/{s/8a28e4a/ffffffff/}" MODULE.bazel.lock
+      bazel --batch build //...
+    ' >"$corrupt_log" 2>&1; then
+      echo 'Bazel unexpectedly accepted a corrupt registry-content pin' >&2
+      exit 1
+    fi
+    grep -Eqi 'registry|checksum|download|hash' "$corrupt_log"
+    echo 'amd64 missing/corrupt offline closure fail-closed: passed'
+  fi
 
   docker image save "$task" -o "$temporary/multi-$architecture.tar"
   docker image save "$baseline" -o "$temporary/single-$architecture.tar"

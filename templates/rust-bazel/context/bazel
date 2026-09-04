@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+# The template owns the Bazel binary and dependency boundary. Repository rc
+# files and Bazelisk environment overrides cannot replace either one.
+unset BAZELISK_HOME BAZEL_OPTS USE_BAZEL_VERSION
+case "${1-}" in
+  --help|--version|help|version)
+    exec /usr/local/libexec/repo-sandbox/bazel-8.3.1 "$@"
+    ;;
+esac
+exec /usr/local/libexec/repo-sandbox/bazel-8.3.1 \
+  --ignore_all_rc_files \
+  --output_user_root=/var/cache/repo-sandbox/bazel \
+  "$@" \
+  --repository_disable_download

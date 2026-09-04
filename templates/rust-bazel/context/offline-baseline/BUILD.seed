@@ -1,0 +1,2 @@
+genrule(name = "build_ok", outs = ["built.txt"], cmd = "echo built > $@")
+cc_test(name = "tests", srcs = ["test.cc"])

@@ -1349,8 +1349,13 @@ mod tests {
     fn central_dockerfile_confines_assembly_inputs_to_named_stages() {
         let dockerfile = include_str!("../../../templates/rust-bazel/context/Dockerfile");
         let toolchain = dockerfile.find(" AS toolchain-build").unwrap();
-        let environment = dockerfile.find(" AS environment").unwrap();
+        let environment_base = dockerfile.find(" AS environment-base").unwrap();
+        let offline_seed = dockerfile.find(" AS offline-seed").unwrap();
+        let environment = dockerfile.rfind(" AS environment").unwrap();
         assert!(toolchain < environment);
+        assert!(toolchain < environment_base);
+        assert!(environment_base < offline_seed);
+        assert!(offline_seed < environment);
         assert!(dockerfile.contains("COPY --from=toolchain-build /usr/local/cargo/"));
         assert!(dockerfile.contains("COPY --from=toolchain-build /usr/local/rustup/"));
         assert!(dockerfile.contains("COPY --from=toolchain-build /toolchain/bin/bazel"));
@@ -1360,7 +1365,6 @@ mod tests {
             "repo-sandbox-apt-",
             "repo-sandbox-cargo-registry-",
             "repo-sandbox-cargo-git-",
-            "repo-sandbox-bazel-",
             "repo-sandbox-toolchain-downloads-",
         ] {
             assert!(dockerfile.contains(cache), "missing cache mount {cache}");
@@ -1371,9 +1375,9 @@ mod tests {
                 .contains("apt-get install --yes --no-install-recommends ca-certificates curl")
         );
         assert!(!final_stage.contains("/run/secrets/github_token"));
-        assert!(final_stage.contains("target=/root/.cache/bazel"));
-        assert!(final_stage.contains("rustup default \"$RUST_VERSION\""));
-        assert!(final_stage.contains("rustup which --toolchain \"$RUST_VERSION\" rustc"));
+        assert!(final_stage.contains("/var/cache/repo-sandbox/bazel/cache/repos/"));
+        assert!(final_stage.contains("/usr/local/share/repo-sandbox/offline-baseline"));
+        assert!(final_stage.contains("/usr/local/libexec/repo-sandbox/bazel-8.3.1"));
         assert!(!final_stage.contains("/toolchain-downloads"));
         assert!(!final_stage.contains("BAZELISK_HOME="));
 

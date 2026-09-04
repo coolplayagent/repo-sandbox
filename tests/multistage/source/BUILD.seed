@@ -4,3 +4,8 @@ genrule(
     outs = ["multistage-smoke"],
     cmd = "rustc $(location src/main.rs) -o $@ && test \"$$($@)\" = 42",
 )
+
+cc_test(
+    name = "tests",
+    srcs = ["test.cc"],
+)

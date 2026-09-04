@@ -2666,6 +2666,28 @@ fn trusted_catalog() -> Result<tempfile::TempDir, AppError> {
             include_bytes!("../../../templates/rust-bazel/context/Dockerfile"),
         ),
         (
+            "templates/rust-bazel/context/bazel",
+            include_bytes!("../../../templates/rust-bazel/context/bazel"),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/MODULE.bazel",
+            include_bytes!("../../../templates/rust-bazel/context/offline-baseline/MODULE.bazel"),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/MODULE.bazel.lock",
+            include_bytes!(
+                "../../../templates/rust-bazel/context/offline-baseline/MODULE.bazel.lock"
+            ),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/BUILD.seed",
+            include_bytes!("../../../templates/rust-bazel/context/offline-baseline/BUILD.seed"),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/test.cc",
+            include_bytes!("../../../templates/rust-bazel/context/offline-baseline/test.cc"),
+        ),
+        (
             "templates/components/base-tools/context/Dockerfile",
             include_bytes!("../../../templates/components/base-tools/context/Dockerfile"),
         ),
@@ -7600,6 +7622,15 @@ mod tests {
         assert!(dockerfile.contains("bazel_version=8.3.1"));
         assert!(dockerfile.contains("bazelisk_version=1.27.0"));
         assert!(dockerfile.contains("REPO_SANDBOX_BAZEL_VERSION=8.3.1"));
+        assert!(dockerfile.contains(" AS offline-seed"));
+        assert!(dockerfile.contains("/toolchain/bazel-seed/cache/repos/"));
+        assert!(dockerfile.contains("--output_user_root=/toolchain/bazel-seed"));
+        assert!(dockerfile.contains("mod graph >/dev/null"));
+        assert!(
+            dockerfile
+                .contains("cmp /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes")
+        );
+        assert!(!dockerfile.contains("offline-seed,target=/"));
         assert!(dockerfile.contains("sha256sum --check --strict"));
         assert!(
             dockerfile.contains("17247e8a84245f59d3bc633d0cfe0a840992a7760a11af1a30012d03da31604c")
@@ -7607,6 +7638,30 @@ mod tests {
         assert!(
             dockerfile.contains("52bb74f0880ee87b17e3a1aa41257d0dba9e9cb92df4e83f8f6c656a46df152d")
         );
+        let wrapper =
+            fs::read_to_string(catalog.path().join("templates/rust-bazel/context/bazel")).unwrap();
+        assert!(wrapper.contains("/usr/local/libexec/repo-sandbox/bazel-8.3.1"));
+        assert!(wrapper.contains("--ignore_all_rc_files"));
+        assert!(wrapper.contains("--repository_disable_download"));
+        for variable in ["USE_BAZEL_VERSION", "BAZELISK_HOME", "BAZEL_OPTS"] {
+            assert!(wrapper.contains(variable));
+        }
+        let baseline = fs::read_to_string(
+            catalog
+                .path()
+                .join("templates/rust-bazel/context/offline-baseline/MODULE.bazel.lock"),
+        )
+        .unwrap();
+        let baseline: serde_json::Value = serde_json::from_str(&baseline).unwrap();
+        let hashes = baseline["registryFileHashes"].as_object().unwrap();
+        for required in [
+            "platforms/0.0.7/MODULE.bazel",
+            "rules_shell/0.2.0/MODULE.bazel",
+            "rules_java/8.12.0/MODULE.bazel",
+        ] {
+            assert!(hashes.keys().any(|key| key.ends_with(required)));
+        }
+        assert_eq!(baseline["moduleExtensions"], serde_json::json!({}));
     }
 
     #[test]

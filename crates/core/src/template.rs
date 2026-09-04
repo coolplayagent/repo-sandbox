@@ -653,6 +653,7 @@ build_context: templates/components/base
             ]),
         };
         let plan = catalog.plan(&selection, Platform::LinuxAmd64).unwrap();
+        assert_eq!(plan.template_version, "1.0.1");
         assert_eq!(plan.base_image, "docker.io/library/rust:1.97.0-bookworm");
         assert!(!plan.parameters.contains_key("bazel_version"));
         assert!(!plan.parameters.contains_key("bazelisk_version"));

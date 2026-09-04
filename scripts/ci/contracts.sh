@@ -6,6 +6,9 @@ ci="$root/.github/workflows/ci.yml"
 release="$root/.github/workflows/release.yml"
 adapters_build="$root/crates/adapters/BUILD.bazel"
 cli_build="$root/apps/cli/BUILD.bazel"
+environment_dockerfile="$root/templates/rust-bazel/context/Dockerfile"
+bazel_wrapper="$root/templates/rust-bazel/context/bazel"
+baseline_lock="$root/templates/rust-bazel/context/offline-baseline/MODULE.bazel.lock"
 
 for required in "$ci" "$release" "$root/scripts/ci/workspace-version.sh" \
   "$root/scripts/ci/download-release-artifacts.sh" \
@@ -105,8 +108,30 @@ grep -Fq 'gh api --method DELETE "repos/${repository}/releases/${release_id}"' \
 # The adapter's include_str! tests must stay hermetic without broad workspace data.
 grep -Fq '"//scripts/docker:multistage-acceptance"' "$adapters_build"
 grep -Fq '"//templates:rust-bazel-dockerfile"' "$adapters_build"
+grep -Fq '"//templates:rust-bazel-offline-baseline"' "$adapters_build"
 grep -Fq 'srcs = ["multistage-acceptance.sh"]' "$root/scripts/docker/BUILD.bazel"
 grep -Fq 'srcs = ["rust-bazel/context/Dockerfile"]' "$root/templates/BUILD.bazel"
+grep -Fq 'name = "rust-bazel-offline-baseline"' "$root/templates/BUILD.bazel"
+grep -Fq 'FROM environment-base AS offline-seed' "$environment_dockerfile"
+grep -Fq 'mod graph >/dev/null' "$environment_dockerfile"
+grep -Fq 'cmp /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes' \
+  "$environment_dockerfile"
+grep -Fq 'bazel --batch --output_user_root=/toolchain/bazel-seed test //...' \
+  "$environment_dockerfile"
+grep -Fq 'COPY --from=offline-seed /toolchain/bazel-seed/cache/repos/' \
+  "$environment_dockerfile"
+! sed -n '/FROM environment-base AS offline-seed/,/FROM environment-base AS environment/p' \
+  "$environment_dockerfile" | grep -Fq 'github_token'
+grep -Fq '/usr/local/libexec/repo-sandbox/bazel-8.3.1' "$bazel_wrapper"
+grep -Fq -- '--ignore_all_rc_files' "$bazel_wrapper"
+grep -Fq -- '--repository_disable_download' "$bazel_wrapper"
+grep -Fq '"https://bcr.bazel.build/modules/platforms/0.0.7/MODULE.bazel"' \
+  "$baseline_lock"
+grep -Fq '"https://bcr.bazel.build/modules/rules_shell/0.2.0/MODULE.bazel"' \
+  "$baseline_lock"
+grep -Fq '"https://bcr.bazel.build/modules/rules_java/8.12.0/MODULE.bazel"' \
+  "$baseline_lock"
+grep -Fq '["--network", "none"]' "$root/crates/adapters/src/docker_runner.rs"
 grep -A5 -F 'name = "e2e_matrix_test"' "$adapters_build" | grep -Fq 'srcs = ["e2e/e2e_matrix.rs"]'
 grep -Fq 'bazelisk test --action_env=PATH //...' "$ci"
 grep -Fq -- '- name: Release Bazel target selection' "$ci"

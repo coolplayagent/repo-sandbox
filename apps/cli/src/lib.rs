@@ -871,7 +871,7 @@ template:
 "#;
         let output = plan_from_source(source, RuntimeArgs::default()).unwrap();
         let message = output.message.unwrap();
-        assert!(message.contains("Template: rust-bazel@1.0.0"));
+        assert!(message.contains("Template: rust-bazel@1.0.1"));
         assert!(message.contains("Resolved dependency graph:"));
         assert!(message.contains("[0] base-tools@1.0.0 <- (root)"));
         assert!(message.contains("[1] bazel@1.0.0 <- base-tools"));
