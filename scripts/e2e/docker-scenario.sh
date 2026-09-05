@@ -53,6 +53,44 @@ assert any(artifact != root and artifact.is_relative_to(root) for root in roots)
 PYEXPORT
 }
 
+start_cache_boundary_builder() {
+  cache_boundary_builder="repo-sandbox-cache-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  cache_boundary_owned=
+  cache_boundary_saved_buildx=${BUILDX_BUILDER-}
+  cache_boundary_had_buildx=${BUILDX_BUILDER+x}
+  cache_boundary_saved_repo=${REPO_SANDBOX_BUILDER-}
+  cache_boundary_had_repo=${REPO_SANDBOX_BUILDER+x}
+  # Do not select this builder globally: other matrix scenarios retain the
+  # shared builder and its expensive ARM preparation cache.
+  docker buildx create --name "$cache_boundary_builder" --driver docker-container \
+    --driver-opt network=host >/dev/null || return
+  cache_boundary_owned=$cache_boundary_builder
+  export BUILDX_BUILDER=$cache_boundary_owned
+  export REPO_SANDBOX_BUILDER=$cache_boundary_owned
+  docker buildx inspect "$cache_boundary_owned" --bootstrap >/dev/null
+}
+
+prune_cache_boundary_builder() {
+  [[ -n ${cache_boundary_owned:-} ]] || return 1
+  docker buildx prune --builder "$cache_boundary_owned" --all --force >/dev/null
+}
+
+cleanup_cache_boundary_builder() {
+  [[ -n ${cache_boundary_owned:-} ]] || return 0
+  docker buildx rm --force "$cache_boundary_owned" >/dev/null 2>&1 || true
+  cache_boundary_owned=
+  if [[ $cache_boundary_had_buildx ]]; then
+    export BUILDX_BUILDER=$cache_boundary_saved_buildx
+  else
+    unset BUILDX_BUILDER
+  fi
+  if [[ $cache_boundary_had_repo ]]; then
+    export REPO_SANDBOX_BUILDER=$cache_boundary_saved_repo
+  else
+    unset REPO_SANDBOX_BUILDER
+  fi
+}
+
 if [[ ${1-} == --self-test-task-id ]]; then
   [[ $# == 1 ]]
   valid_task_id_value '1234-0123456789abcdef-987654321'
@@ -99,6 +137,42 @@ PYFIXTURE
       exit 1
     fi
   done
+  builder_calls="$selection_fixture/builders.log"
+  builder_failure=
+  docker() {
+    printf '%s\n' "$*" >>"$builder_calls"
+    [[ ${2-} != "$builder_failure" ]]
+  }
+  export BUILDX_BUILDER=shared-buildx REPO_SANDBOX_BUILDER=shared-repo
+  start_cache_boundary_builder
+  owned=$cache_boundary_owned
+  [[ $owned == repo-sandbox-cache-* && $owned != shared-buildx ]]
+  [[ $BUILDX_BUILDER == "$owned" && $REPO_SANDBOX_BUILDER == "$owned" ]]
+  prune_cache_boundary_builder
+  cleanup_cache_boundary_builder
+  [[ $BUILDX_BUILDER == shared-buildx && $REPO_SANDBOX_BUILDER == shared-repo ]]
+  grep -Fxq "buildx create --name $owned --driver docker-container --driver-opt network=host" "$builder_calls"
+  grep -Fxq "buildx inspect $owned --bootstrap" "$builder_calls"
+  grep -Fxq "buildx prune --builder $owned --all --force" "$builder_calls"
+  grep -Fxq "buildx rm --force $owned" "$builder_calls"
+  [[ $(wc -l <"$builder_calls") -eq 4 ]]
+
+  : >"$builder_calls"
+  builder_failure=create
+  if start_cache_boundary_builder; then exit 1; fi
+  cleanup_cache_boundary_builder
+  [[ $(wc -l <"$builder_calls") -eq 1 ]]
+  [[ $BUILDX_BUILDER == shared-buildx && $REPO_SANDBOX_BUILDER == shared-repo ]]
+
+  : >"$builder_calls"
+  builder_failure=inspect
+  if start_cache_boundary_builder; then exit 1; fi
+  owned=$cache_boundary_owned
+  [[ -n $owned ]]
+  cleanup_cache_boundary_builder
+  grep -Fxq "buildx rm --force $owned" "$builder_calls"
+  [[ $(wc -l <"$builder_calls") -eq 3 ]]
+  [[ $BUILDX_BUILDER == shared-buildx && $REPO_SANDBOX_BUILDER == shared-repo ]]
   exit 0
 fi
 
@@ -260,7 +334,9 @@ case "$scenario" in
   cli-build-success|cli-verify-success|cli-build-failure|cli-test-failure|cli-clean-owned-only|cli-interrupt-cleanup|cli-multi-platform-oci|cli-registry-publish)
     fixture=$(mktemp -d)
     registry_container=
+    cache_boundary_owned=
     cleanup_cli_fixture() {
+      cleanup_cache_boundary_builder
       [[ -z ${foreign:-} ]] || docker rm --force "$foreign" >/dev/null 2>&1 || true
       [[ -z ${owned_image_reference:-} ]] || docker rm --force "$owned_image_reference" >/dev/null 2>&1 || true
       [[ -z ${registry_container:-} ]] || docker rm --force "$registry_container" >/dev/null 2>&1 || true
@@ -311,6 +387,7 @@ EOF
     report="$fixture/report.json"
     case "$scenario" in
       cli-build-success)
+        start_cache_boundary_builder
         cache_index="$fixture/.repo-sandbox/cache/environment/index.json"
         [[ ! -e $cache_index ]]
         "$cli" build --repository "$fixture" --report-path "$report"
@@ -322,7 +399,7 @@ EOF
         [[ -n $first_source ]]
         # Remove the builder's internal cache: the warm run can now succeed as cached
         # only by importing the repository-owned local cache exported above.
-        docker buildx prune --all --force >/dev/null
+        prune_cache_boundary_builder
 
         warm_report="$fixture/report-warm.json"
         warm_log="$result_directory/cli-build-warm.log"

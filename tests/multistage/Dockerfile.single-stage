@@ -83,7 +83,3 @@ COPY --link source/ /workspace/
 WORKDIR /workspace
 RUN cp BUILD.seed BUILD.bazel
 LABEL io.repo-sandbox.source.digest="${SOURCE_DIGEST}"
-
-FROM task AS acceptance
-RUN cargo test --locked \
-    && bazel --batch --ignore_all_rc_files build //:rust_binary

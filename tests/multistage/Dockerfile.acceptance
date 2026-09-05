@@ -1,0 +1,6 @@
+# Consume the already loaded comparison image. This stage only runs acceptance
+# commands; dependency seeding remains part of the image measured by the gate.
+ARG ACCEPTANCE_IMAGE
+FROM ${ACCEPTANCE_IMAGE} AS acceptance
+RUN cargo test --locked \
+    && bazel --batch --ignore_all_rc_files build //:rust_binary

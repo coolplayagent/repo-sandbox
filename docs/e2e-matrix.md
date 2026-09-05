@@ -61,14 +61,20 @@ seed preparation 45 minutes, preserving their plain progress logs under
 `target/e2e/preparation/` even on failure. A preparation failure fails the job.
 The native cold CLI build remains in the matrix; all scenario deadlines and
 publication, offline, cache, and size assertions remain required. This separates
-emulated toolchain setup from the multi-platform CLI contract checks.
+emulated toolchain setup from the multi-platform CLI contract checks. The cold/warm
+CLI scenario uses a separate builder, so clearing its internal cache cannot
+remove the shared ARM preparation. Single-stage acceptance inherits the exact
+loaded comparison image and runs only its Cargo/Bazel checks, avoiding another
+complete seed on the Docker Engine builder. The size gate still compares the
+original task and baseline images.
 
 Failure cleanup is ownership-scoped. Images and containers use unique run IDs.
 The runner failure test checks the retained container's
 `io.repo-sandbox.task-id` label before removing that exact container ID. The
 dogfood script removes only its uniquely tagged images and task-local cache
-directories. No scenario prunes Docker, deletes builders selected by the
-caller, or removes shared images/caches.
+directories. The cache-boundary scenario prunes only its newly created builder,
+removes that exact builder on exit, and preserves the caller's selected builder
+and shared images/caches.
 
 ## Opt-in targets
 

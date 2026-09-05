@@ -226,10 +226,12 @@ for architecture in amd64 arm64; do
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
     --progress plain --tag "$acceptance_task" -f "$temporary/context/Dockerfile.task" \
     "$temporary/context"
+  # Reuse the exact loaded baseline. Building its full Dockerfile here would
+  # repeat its seed on the Engine builder, including emulated ARM toolchains.
   retry_external_build docker build --network host --provenance=false \
-    --platform "$platform" --target acceptance --build-arg "SOURCE_DIGEST=$source_digest" \
+    --platform "$platform" --target acceptance --build-arg "ACCEPTANCE_IMAGE=$baseline" \
     --progress plain --tag "$acceptance_baseline" \
-    -f "$temporary/context/Dockerfile.single-stage" "$temporary/context"
+    -f "$temporary/context/Dockerfile.acceptance" "$temporary/context"
   printf '%s build-stage acceptance network=host scope=public-dependency-download passed\n' \
     "$architecture"
 
