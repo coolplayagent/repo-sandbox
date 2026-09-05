@@ -4,4 +4,3 @@ template:
   parameters:
     platform: linux/amd64
     rust_version: "1.97.0"
-    bazelisk_version: "1.27.0"

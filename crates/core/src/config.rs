@@ -120,41 +120,75 @@ pub struct Step {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CliOverrides {
     pub repository: Option<String>,
+    /// Operator-selected ref retained for provenance when `git_ref` is pinned.
+    pub requested_git_ref: Option<String>,
     pub git_ref: Option<String>,
     pub platform: Option<Platform>,
+    pub platforms: Vec<Platform>,
+    pub oci_layout: Option<PathBuf>,
     pub push: bool,
     pub report: Option<PathBuf>,
     pub keep_on_failure: bool,
     pub recurse_submodules: bool,
+    pub remote_auth: RemoteAuthentication,
+    /// Digest of the exact repository configuration bytes used for planning.
+    pub repository_config_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RemoteAuthentication {
+    pub https_username: Option<String>,
+    pub https_token_environment: Option<String>,
+    pub https_credential_helper: bool,
+    pub ssh_private_key: Option<PathBuf>,
+    pub ssh_known_hosts: Option<PathBuf>,
+    pub ssh_agent: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionRequest {
     pub repository: Option<String>,
+    pub requested_git_ref: Option<String>,
     pub git_ref: Option<String>,
     pub platform: Platform,
+    pub platforms: Vec<Platform>,
+    pub oci_layout: Option<PathBuf>,
     pub push: bool,
     pub report: Option<PathBuf>,
     pub keep_on_failure: bool,
     pub recurse_submodules: bool,
+    pub remote_auth: RemoteAuthentication,
+    pub repository_config_digest: Option<String>,
 }
 
 impl ExecutionRequest {
     /// Resolve the finite set of runtime overrides. Repository build logic always
     /// remains in `Config` and is not copied into the override type.
     pub fn resolve(config: &Config, cli: CliOverrides) -> Self {
+        let platform = cli
+            .platform
+            .or_else(|| cli.platforms.first().copied())
+            .or_else(|| config.legacy.as_ref().map(|template| template.platform))
+            .or_else(|| config.template.platform().ok())
+            .expect("validated configurations always define a platform");
+        let platforms = if cli.platforms.is_empty() {
+            vec![platform]
+        } else {
+            cli.platforms
+        };
         Self {
             repository: cli.repository,
+            requested_git_ref: cli.requested_git_ref,
             git_ref: cli.git_ref,
-            platform: cli
-                .platform
-                .or_else(|| config.legacy.as_ref().map(|template| template.platform))
-                .or_else(|| config.template.platform().ok())
-                .expect("validated configurations always define a platform"),
+            platform,
+            platforms,
+            oci_layout: cli.oci_layout,
             push: cli.push,
             report: cli.report,
             keep_on_failure: cli.keep_on_failure,
             recurse_submodules: cli.recurse_submodules,
+            remote_auth: cli.remote_auth,
+            repository_config_digest: cli.repository_config_digest,
         }
     }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "repo-sandbox-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "repo_sandbox_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_path_to_error.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true

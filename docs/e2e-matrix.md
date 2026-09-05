@@ -18,9 +18,16 @@ The default output is a unique `target/e2e/<pid>-<timestamp>/` directory. Every
 executed scenario gets its own directory containing the complete
 `scenario.log`, assertion-bearing `report.json`, and its declared artifacts.
 An existing scenario directory is never reused or overwritten.
-On Linux the runner starts each command in a new session; on Windows it uses an
-exact root PID. A matrix timeout terminates that owned process tree before the
-scenario is reaped, so child Docker or SSH clients cannot outlive the run.
+On Linux the runner starts each command in a new session and requires
+[`pidfd_open`](https://man7.org/linux/man-pages/man2/pidfd_open.2.html)/
+[`pidfd_send_signal`](https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html)
+support (Linux 5.3+ or equivalent backports). It
+probes those APIs before spawning a scenario. Cleanup binds each process by
+pidfd, verifies its session, and removes remaining live session members even
+when they use another process group or the scenario leader exits first. The
+leader is reaped only after cleanup, keeping its session identity reserved.
+This requirement applies to the matrix harness, not the installed CLI. On
+Windows the harness terminates the tree rooted at the exact scenario PID.
 
 ## Required host matrix
 
@@ -41,18 +48,43 @@ isolated data root, socket, exec root and bridge, and first proves that a
 `busybox:1.36` container can be created and run with
 `--storage-opt size=32M`. BuildKit and disposable dogfood acceptance build
 stages that fetch public dependencies use the host network; final task
-containers and runner scenarios stay on the isolated bridge. The job removes
+containers and runner scenarios use Docker network `none`. The isolated bridge
+belongs only to the task-owned test daemon and its supporting fixtures. The job removes
 its exact Buildx builder, verifies the
 daemon PID and command line before terminating it, unmounts the task filesystem,
 its exec-root network namespace and loop device, removes the task bridge and
 directory, and asserts those resources are gone.
 
+CI prepares the arm64 environment in an explicit cache-only Buildx step before
+running the matrix. It gives builder bootstrap 60 seconds and emulated offline
+seed preparation 45 minutes, preserving their plain progress logs under
+`target/e2e/preparation/` even on failure. A preparation failure fails the job.
+Preparation also exports a complete local cache into a fresh task-owned directory
+under `RUNNER_TEMP`. Dogfood explicitly imports this cache for its first ARM
+environment build, so BuildKit garbage collection cannot discard the only copy
+of the expensive preparation. Its own cold/warm exports and every cache-vertex
+assertion still run. Completed architecture images, archives and caches are removed
+before the next architecture, and CI removes the preparation cache on every exit.
+CI uploads compact diagnostics separately from the complete results archive.
+The compact archive omits only `task-layout/blobs/`; logs, reports, OCI indexes
+and registry manifests remain available without downloading image layers.
+The original full archive and all runtime blob-digest assertions are retained.
+The native cold CLI build remains in the matrix; all scenario deadlines and
+publication, offline, cache, and size assertions remain required. This separates
+emulated toolchain setup from the multi-platform CLI contract checks. The cold/warm
+CLI scenario uses a separate builder, so clearing its internal cache cannot
+remove the shared ARM preparation. Single-stage acceptance inherits the exact
+loaded comparison image and runs only its Cargo/Bazel checks, avoiding another
+complete seed on the Docker Engine builder. The size gate still compares the
+original task and baseline images.
+
 Failure cleanup is ownership-scoped. Images and containers use unique run IDs.
 The runner failure test checks the retained container's
 `io.repo-sandbox.task-id` label before removing that exact container ID. The
 dogfood script removes only its uniquely tagged images and task-local cache
-directories. No scenario prunes Docker, deletes builders selected by the
-caller, or removes shared images/caches.
+directories. The cache-boundary scenario prunes only its newly created builder,
+removes that exact builder on exit, and preserves the caller's selected builder
+and shared images/caches.
 
 ## Opt-in targets
 

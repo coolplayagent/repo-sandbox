@@ -5,6 +5,10 @@ FROM environment AS task
 ARG SOURCE_DIGEST
 COPY --link source/ /workspace/
 WORKDIR /workspace
+RUN cp BUILD.seed BUILD.bazel
+RUN if [ ! -e MODULE.bazel.lock ]; then \
+      cp /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock MODULE.bazel.lock; \
+    fi
 LABEL io.repo-sandbox.source.digest="${SOURCE_DIGEST}"
 
 FROM task AS acceptance

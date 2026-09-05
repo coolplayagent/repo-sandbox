@@ -5,14 +5,15 @@ into a bounded local Docker job. `plan(&RunSpec)` returns the structured Docker
 argv without executing it, so callers can inspect the security and resource
 policy before starting a container.
 
-The default plan uses Docker's `bridge` network, runs without `--privileged`,
+The plan uses Docker's `none` network, runs without `--privileged`,
 does not mount the Docker socket, enables `no-new-privileges`, drops all Linux
 capabilities, and allocates explicit CPU, memory, memory-swap, writable-layer,
 and `/tmp` tmpfs limits. It starts no TTY or interactive session. A small non-interactive keeper
 process exists only for the lifetime of the job so ordered build and test steps
 share `/workspace`; it is removed after the last step or any terminal failure.
 
-Every task has a validated unique `io.repo-sandbox.task-id` label. The runner
+Every task has a validated unique `io.repo-sandbox.task-id` label and a stable
+`io.repo-sandbox.repository-id` digest label. The runner
 rejects a pre-existing matching label before creation. Ownership begins only
 when `docker container create` succeeds and returns an ID; cleanup then uses
 that exact ID. The runner never removes by a caller-supplied name, never prunes
@@ -31,6 +32,9 @@ failure remains the job status. Total timeout, resource exhaustion, and
 infrastructure errors always stop execution. Memory OOM and temporary-storage
 exhaustion are distinct from ordinary command failures.
 
+Every success, command failure, cancellation, cleanup failure, and early
+preflight/snapshot/image/publication failure uses schema version 1 with the same
+top-level fields. Fields unavailable before runner creation are `null` or empty.
 `RunReport` also records the source snapshot identity and origin, a secret-free
 configuration summary, the image reference and content digest, total timing,
 cleanup disposition, and cleanup errors. `write_report_json` writes both success
@@ -39,6 +43,18 @@ flush plus `sync_all`, and an atomic create-if-absent hard-link publication.
 Existing reports are never overwritten; concurrent writers produce one winner,
 and failed writers clean their private temporary file.
 
+Registry side effects that occur before a final multi-platform artifact exists
+are recorded separately in `publication_progress`. Each entry identifies its
+kind (`registry_preflight_staging`, `environment_staging`, `task_staging`, or
+`task_index_staging`), exact reference and digest, whether it was verified, and
+whether it is staging or final. The registry preflight entry represents the
+task-unique write used to prove the same daemon/Buildx publication boundary;
+registries do not provide a portable delete operation, so it is an intentional
+remote staging fact. The
+`published` field retains its narrower contract: it describes only the final
+immutable artifact and its requested aliases, so consumers never mistake a
+staging environment/task reference for the requested output.
+
 By default the exact container ID returned by this task's successful create is
 removed on success and failure. `keep_on_failure` retains that container only on
 a non-success outcome and marks the report `retained_on_failure`. Snapshot
@@ -46,6 +62,11 @@ materializations use delete-on-drop by default; after a failed run a caller may
 invoke `MaterializedSnapshot::retain_on_failure` when the CLI flag is present.
 Neither path issues Docker image removal, builder removal, or any prune command,
 so shared images and global BuildKit cache are outside the cleanup boundary.
+
+Ordinary allowlisted environment variables are inherited by name. Secrets are
+private temporary files mounted read-only and loaded only inside `docker exec`,
+so their values do not enter argv or persistent `Config.Env`. Secret-bearing
+step output is buffered and value-redacted before console and report emission.
 
 Artifact export is declaration based: every request must exactly equal a
 configured relative directory. Portable validation rejects both slash styles,

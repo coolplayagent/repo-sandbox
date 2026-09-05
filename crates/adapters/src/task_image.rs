@@ -5,7 +5,7 @@ use crate::buildkit::{
     ProcessExecutor, Progress,
 };
 use crate::snapshot::MaterializedSnapshot;
-use repo_sandbox_core::build::{BuiltImage, ImageRef};
+use repo_sandbox_core::build::{BuiltImage, ImageDigest, ImageRef};
 use repo_sandbox_core::config::Platform;
 use repo_sandbox_core::snapshot::SnapshotError;
 use repo_sandbox_core::task_image::{
@@ -47,6 +47,8 @@ pub struct TaskImageOptions {
     pub progress: Progress,
     pub cache: CacheConfig,
     pub builder: Builder,
+    pub output: ImageOutput,
+    pub platforms: Vec<Platform>,
 }
 
 impl Default for TaskImageOptions {
@@ -55,17 +57,26 @@ impl Default for TaskImageOptions {
             progress: Progress::Auto,
             cache: CacheConfig::default(),
             builder: Builder::default(),
+            output: ImageOutput::Load,
+            platforms: Vec::new(),
         }
     }
 }
 
 pub struct TaskImageRequest<'a> {
     pub environment: &'a BuiltImage,
+    /// Client-side OCI layout for an environment that is not registry-visible.
+    pub environment_oci_layout: Option<&'a Path>,
+    /// Optional verified single-platform digest used to keep the primary task
+    /// manifest byte-identical while a multi-platform environment index is used
+    /// as the build source.
+    pub identity_environment_digest: Option<&'a ImageDigest>,
     pub materialized: &'a MaterializedSnapshot,
     pub template_id: &'a str,
     pub template_version: &'a str,
     pub platform: Platform,
     pub configuration_digest: &'a ConfigurationDigest,
+    pub repository_id: &'a str,
     /// OCI `org.opencontainers.image.created`, supplied by the orchestration clock.
     pub created: &'a str,
     /// Repository without a tag; the adapter appends the immutable content tag.
@@ -139,34 +150,53 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
         cancellation: &dyn Cancellation,
     ) -> Result<BuiltTaskImage, TaskImageError> {
         validate_request(&request)?;
+        let identity_environment_digest = request
+            .identity_environment_digest
+            .unwrap_or(&request.environment.digest);
         let identity = task_image_identity(&TaskImageInputs {
-            environment_digest: &request.environment.digest,
+            environment_digest: identity_environment_digest,
             snapshot: &request.materialized.snapshot,
             template_id: request.template_id,
             template_version: request.template_version,
             configuration_digest: request.configuration_digest,
+            repository_id: request.repository_id,
             created: request.created,
         });
         let image = ImageRef::new(format!("{}:{}", request.repository, identity.tag()))
             .map_err(TaskImageError::InvalidRequest)?;
         let context = tempfile::tempdir().map_err(context_error("create task build context"))?;
-        write_context(context.path(), &request, &identity)?;
+        write_context(context.path(), &request, &identity, cancellation)?;
 
         let environment = immutable_environment_ref(request.environment)?;
+        let platforms = if request.options.platforms.is_empty() {
+            vec![request.platform]
+        } else {
+            request.options.platforms.clone()
+        };
         let plan = TemplatePlan {
             template_id: request.template_id.to_owned(),
             template_version: request.template_version.to_owned(),
-            base_image: environment,
+            base_image: environment.clone(),
             platform: request.platform,
-            target_platforms: vec![request.platform],
+            target_platforms: platforms.clone(),
             build_context: PathBuf::from("."),
             parameters: Default::default(),
             stages: Vec::new(),
+            execution: Default::default(),
         };
         let mut build_args = std::collections::BTreeMap::new();
         for (name, value) in labels(&request, &identity) {
             build_args.insert(name.to_owned(), value);
         }
+        let environment_context = if let Some(layout) = request.environment_oci_layout {
+            format!(
+                "oci-layout://{}@{}",
+                docker_host_path(layout),
+                request.environment.digest
+            )
+        } else {
+            format!("docker-image://{environment}")
+        };
         let result = self
             .buildkit
             .build(
@@ -176,10 +206,14 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
                     image,
                     BuildOptions {
                         progress: request.options.progress,
-                        output: ImageOutput::Load,
+                        output: request.options.output,
                         cache: request.options.cache,
                         builder: request.options.builder,
+                        platforms,
                         build_args,
+                        named_contexts: [("environment".to_owned(), environment_context)]
+                            .into_iter()
+                            .collect(),
                         ..BuildOptions::default()
                     },
                 ),
@@ -205,6 +239,16 @@ fn validate_request(request: &TaskImageRequest<'_>) -> Result<(), TaskImageError
         ));
     }
     validate_repository(request.repository)?;
+    if !request.repository_id.starts_with("sha256:")
+        || request.repository_id.len() != 71
+        || !request.repository_id[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(TaskImageError::InvalidRequest(
+            "repository ID must be a normalized sha256 digest".to_owned(),
+        ));
+    }
     let metadata = fs::symlink_metadata(request.materialized.path())
         .map_err(context_error("inspect source snapshot"))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -242,10 +286,25 @@ fn immutable_environment_ref(environment: &BuiltImage) -> Result<String, TaskIma
     Ok(format!("{}@{}", environment.image, environment.digest))
 }
 
+fn docker_host_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    if cfg!(windows) {
+        let normalized = text.replace('\\', "/");
+        if normalized.as_bytes().get(1) == Some(&b':') {
+            return format!("/{normalized}");
+        }
+        normalized
+    } else {
+        text.to_owned()
+    }
+}
+
 fn write_context(
     root: &Path,
     request: &TaskImageRequest<'_>,
     identity: &TaskImageIdentity,
+    cancellation: &dyn Cancellation,
 ) -> Result<(), TaskImageError> {
     fs::write(root.join("Dockerfile"), dockerfile())
         .map_err(context_error("write task Dockerfile"))?;
@@ -253,10 +312,10 @@ fn write_context(
         .map_err(context_error("write task .dockerignore"))?;
     let destination = root.join("source");
     fs::create_dir(&destination).map_err(context_error("create source context"))?;
-    validate_context_paths(request.materialized.path())?;
+    validate_context_paths(request.materialized.path(), cancellation)?;
     let copied = request
         .materialized
-        .copy_verified_to(&destination)
+        .copy_verified_to_cancellable(&destination, cancellation)
         .map_err(TaskImageError::Snapshot)?;
     if copied != request.materialized.snapshot.file_count {
         return Err(TaskImageError::InvalidRequest(format!(
@@ -271,9 +330,8 @@ fn write_context(
 }
 
 fn dockerfile() -> &'static str {
-    r#"# syntax=docker/dockerfile:1.7
+    r#"# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 ARG BASE_IMAGE
-FROM ${BASE_IMAGE} AS environment
 FROM environment AS task
 ARG TASK_CREATED
 ARG TASK_SOURCE_COMMIT
@@ -283,8 +341,13 @@ ARG TASK_TEMPLATE_VERSION
 ARG TASK_CONFIG_DIGEST
 ARG TASK_ENVIRONMENT_DIGEST
 ARG TASK_IDENTITY
+ARG TASK_REPOSITORY_ID
 COPY --link source/ /workspace/
 WORKDIR /workspace
+RUN if [ ! -e MODULE.bazel.lock ] \
+      && [ -s /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock ]; then \
+      cp /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock MODULE.bazel.lock; \
+    fi
 LABEL org.opencontainers.image.created="${TASK_CREATED}" \
       org.opencontainers.image.revision="${TASK_SOURCE_COMMIT}" \
       org.opencontainers.image.version="${TASK_TEMPLATE_VERSION}" \
@@ -294,7 +357,9 @@ LABEL org.opencontainers.image.created="${TASK_CREATED}" \
       io.repo-sandbox.template.version="${TASK_TEMPLATE_VERSION}" \
       io.repo-sandbox.config.digest="${TASK_CONFIG_DIGEST}" \
       io.repo-sandbox.environment.digest="${TASK_ENVIRONMENT_DIGEST}" \
-      io.repo-sandbox.task.identity="${TASK_IDENTITY}"
+      io.repo-sandbox.task.identity="${TASK_IDENTITY}" \
+      io.repo-sandbox.owner="${TASK_IDENTITY}" \
+      io.repo-sandbox.repository-id="${TASK_REPOSITORY_ID}"
 "#
 }
 
@@ -322,13 +387,25 @@ fn labels(
         ),
         (
             "TASK_ENVIRONMENT_DIGEST",
-            request.environment.digest.to_string(),
+            request
+                .identity_environment_digest
+                .unwrap_or(&request.environment.digest)
+                .to_string(),
         ),
         ("TASK_IDENTITY", identity.oci_value()),
+        ("TASK_REPOSITORY_ID", request.repository_id.to_owned()),
     ]
 }
 
-fn validate_context_paths(source: &Path) -> Result<(), TaskImageError> {
+fn validate_context_paths(
+    source: &Path,
+    cancellation: &dyn Cancellation,
+) -> Result<(), TaskImageError> {
+    if cancellation.is_cancelled() {
+        return Err(TaskImageError::InvalidRequest(
+            "task context creation cancelled".into(),
+        ));
+    }
     for entry in fs::read_dir(source).map_err(context_error("read source snapshot"))? {
         let entry = entry.map_err(context_error("read source snapshot entry"))?;
         let name = entry.file_name();
@@ -346,7 +423,7 @@ fn validate_context_paths(source: &Path) -> Result<(), TaskImageError> {
             ));
         }
         if metadata.is_dir() {
-            validate_context_paths(&entry.path())?;
+            validate_context_paths(&entry.path(), cancellation)?;
         } else if metadata.is_file() {
         } else {
             return Err(TaskImageError::InvalidRequest(
@@ -430,10 +507,28 @@ mod tests {
                 assert!(ignore.contains("source/**/.git"));
                 assert!(ignore.contains("source/**/.env.*"));
                 let dockerfile = fs::read_to_string(context.join("Dockerfile"))?;
-                assert!(dockerfile.contains("FROM ${BASE_IMAGE} AS environment"));
+                assert!(!dockerfile.contains("FROM ${BASE_IMAGE} AS environment"));
                 assert!(dockerfile.contains("FROM environment AS task"));
                 assert!(dockerfile.contains("COPY --link source/ /workspace/"));
+                assert!(
+                    dockerfile.contains(
+                        "/usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock"
+                    )
+                );
+                assert!(dockerfile.contains("if [ ! -e MODULE.bazel.lock ]"));
+                assert!(dockerfile.contains(
+                    "[ -s /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock ]"
+                ));
+                assert!(dockerfile.contains("io.repo-sandbox.owner=\"${TASK_IDENTITY}\""));
                 assert!(!dockerfile.contains("ENTRYPOINT"));
+                let context = value_after(&invocation.args, "--build-context");
+                assert!(
+                    context.starts_with("environment=docker-image://")
+                        || context.starts_with("environment=oci-layout:///")
+                );
+                let digest = context.rsplit_once('@').unwrap().1;
+                assert!(digest.starts_with("sha256:"));
+                assert_eq!(digest.len(), 71);
                 let metadata = PathBuf::from(value_after(&invocation.args, "--metadata-file"));
                 fs::write(
                     metadata,
@@ -505,11 +600,14 @@ mod tests {
     ) -> TaskImageRequest<'a> {
         TaskImageRequest {
             environment,
+            environment_oci_layout: None,
+            identity_environment_digest: None,
             materialized,
             template_id: "rust-bazel",
             template_version: "1.0.0",
             platform: Platform::LinuxAmd64,
             configuration_digest: config,
+            repository_id: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             created: "2026-09-01T00:00:00Z",
             repository: "repo-sandbox/task",
             options: TaskImageOptions::default(),
@@ -548,6 +646,25 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["--build-arg", "TASK_CONFIG_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]));
         assert!(args.windows(2).any(|pair| pair == ["--build-arg", "BASE_IMAGE=repo-sandbox/environment:stable@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"]));
         assert_eq!(value_after(args, "--target"), "task");
+    }
+
+    #[test]
+    fn local_environment_is_transferred_as_digest_pinned_oci_context() {
+        let (_repository, materialized) = materialize(&[("source.rs", "safe")]);
+        let environment = environment();
+        let config = config();
+        let layout = tempfile::tempdir().unwrap();
+        let executor = InspectingExecutor::new();
+        let mut task = request(&environment, &materialized, &config);
+        task.environment_oci_layout = Some(layout.path());
+        TaskImageBuilder::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(task, &NeverCancelled)
+            .unwrap();
+        let calls = executor.invocations.lock().unwrap();
+        let context = value_after(&calls[0].args, "--build-context");
+        assert!(context.starts_with("environment=oci-layout:///"));
+        assert!(context.ends_with(environment.digest.as_str()));
     }
 
     #[test]
@@ -700,6 +817,30 @@ mod tests {
             .unwrap();
         assert_ne!(first.identity, second.identity);
         assert_ne!(first.image.image, second.image.image);
+    }
+
+    #[test]
+    fn multi_platform_request_can_preserve_verified_primary_identity() {
+        let (_repository, materialized) = materialize(&[("source.rs", "safe")]);
+        let verified_environment = environment();
+        let mut environment_index = verified_environment.clone();
+        environment_index.digest = ImageDigest::new(format!("sha256:{}", "e".repeat(64))).unwrap();
+        let config = config();
+        let executor = InspectingExecutor::new();
+        let verified = TaskImageBuilder::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(
+                request(&verified_environment, &materialized, &config),
+                &NeverCancelled,
+            )
+            .unwrap();
+        let mut multi = request(&environment_index, &materialized, &config);
+        multi.identity_environment_digest = Some(&verified_environment.digest);
+        let multi = TaskImageBuilder::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(multi, &NeverCancelled)
+            .unwrap();
+        assert_eq!(multi.identity, verified.identity);
     }
 
     /// Optional end-to-end check. It validates labels, history, exported files, and workdir.

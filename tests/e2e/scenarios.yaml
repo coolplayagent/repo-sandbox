@@ -1,5 +1,140 @@
 version: 1
 scenarios:
+  - id: cli-build-success
+    description: Exercise cold/warm real CLI builds, stable-source reports, source invalidation, digests and cleanup.
+    tier: required
+    targets: [docker]
+    covers: [cli, build, report, phase, step, digest, exact_cleanup, cold_cache, warm_cache, source_change]
+    timeout_seconds: 900
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-build-success, "${RESULT_DIR}"] }
+    expected: { exit_code: 0, log_contains: ["cache=cold_then_warm cache_hit=verified source_digest=changed", "cli-build-success=passed"], artifacts: [cli-build-success.passed] }
+
+  - id: cli-verify-success
+    description: Exercise build and test phases from the real CLI entry point.
+    tier: required
+    targets: [docker]
+    covers: [cli, verify, build_phase, test_phase, step_results, report_digest, cleanup]
+    timeout_seconds: 600
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-verify-success, "${RESULT_DIR}"] }
+    expected: { exit_code: 0, log_contains: ["cli-verify-success=passed"], artifacts: [cli-verify-success.passed] }
+
+  - id: cli-build-failure
+    description: Verify a real CLI build failure is reported with exit code 10.
+    tier: required
+    targets: [docker]
+    covers: [cli, build_failure, exit_code_10, failure_report, phase_attribution, step_attribution, cleanup]
+    timeout_seconds: 600
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-build-failure, "${RESULT_DIR}"] }
+    expected: { exit_code: 0, log_contains: ["cli-build-failure=passed"], artifacts: [cli-build-failure.passed] }
+
+  - id: cli-test-failure
+    description: Verify a real CLI test failure is reported with exit code 11 and never published, optionally with an operator registry policy.
+    tier: required
+    targets: [docker]
+    covers: [cli, test_failure, exit_code_11, no_publish, phase_attribution, step_attribution, cleanup, opt_in_registry]
+    timeout_seconds: 600
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-test-failure, "${RESULT_DIR}"] }
+    expected: { exit_code: 0, log_contains: ["cli-test-failure=passed"], artifacts: [cli-test-failure.passed] }
+
+  - id: cli-clean-owned-only
+    description: Retain a failed task, prove dry-run immutability, reject a forged owner, clean it, and preserve a foreign shared resource.
+    tier: required
+    targets: [docker]
+    covers: [cli, clean, dry_run_unchanged, owner_mismatch, referenced_exit, foreign_shared_resource, exact_cleanup, idempotent]
+    timeout_seconds: 600
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-clean-owned-only, "${RESULT_DIR}"] }
+    expected: { exit_code: 0, log_contains: ["dry_run=unchanged owner_mismatch=refused referenced=exit3 foreign_resource=preserved cleanup=idempotent", "cli-clean-owned-only=passed"], artifacts: [cli-clean-owned-only.passed] }
+
+  - id: cli-interrupt-cleanup
+    description: Interrupt a live CLI test step and prove stable cancellation reporting, exact cleanup journaling and unrelated-resource safety.
+    tier: required
+    targets: [docker]
+    covers: [cli, ctrl_c, exit_code_3, cancelled_phase, cancelled_step, cleanup, journal_terminal_state, foreign_resource_safety]
+    timeout_seconds: 600
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-interrupt-cleanup, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["interrupt_exit=3 phase=test cleanup=removed journal_container=cleaned unrelated=unchanged", "cli-interrupt-cleanup=passed"]
+      artifacts: [cli-interrupt-cleanup.passed, ctrl-c-unrelated.keep]
+
+  - id: cli-multi-platform-oci
+    description: Verify on the primary platform, then export and inspect a two-platform OCI layout through the real CLI.
+    tier: required
+    targets: [docker]
+    covers: [cli, repeated_platform, amd64, arm64, primary_runner, oci_layout, manifest_digest]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-multi-platform-oci, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["multi_platform=linux/amd64,linux/arm64 output=oci-layout runner=verified", "cli-multi-platform-oci=passed"]
+      artifacts: [cli-multi-platform-oci.passed]
+
+  - id: cli-registry-publish
+    description: Publish a verified CLI result to a temporary local registry, verify immutable and alias manifests, pull it back, then prove a failed verify publishes nothing.
+    tier: required
+    targets: [docker]
+    covers: [cli, verify, push, local_registry, immutable_tag, alias, manifest, pullback, failed_verify_no_publish]
+    timeout_seconds: 1200
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-registry-publish, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["registry_cli=published immutable=verified multi_platform=verified primary_digest=runner-verified alias=verified pullback=verified failed_verify_publish=none", "cli-registry-publish=passed"]
+      artifacts: [cli-registry-publish.passed, immutable.json, alias.json, multi-manifest.json, multi-alias.json]
+
+  - id: cli-public-file-remote
+    description: Exercise the public remote CLI path against an offline local file bare repository pinned to an immutable commit.
+    tier: required
+    targets: [docker]
+    covers: [cli, public_remote_git, file_transport, offline, fixed_commit, report]
+    timeout_seconds: 600
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-public-file-remote, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["remote_cli=file:// commit=pinned transport=offline"]
+      artifacts: [cli-public-file-remote.passed]
+
+  - id: cli-private-https-remote
+    description: Exercise the private HTTPS remote CLI path with externally supplied disposable credentials and prove they never persist.
+    tier: opt_in
+    targets: [docker, wsl, vm]
+    covers: [cli, private_https_git, fixed_commit, credential_redaction, credential_scan]
+    required_env: [REPO_SANDBOX_E2E_HTTPS_URL, REPO_SANDBOX_E2E_HTTPS_REF, REPO_SANDBOX_E2E_HTTPS_USER, REPO_SANDBOX_E2E_HTTPS_TOKEN]
+    redact_env: [REPO_SANDBOX_E2E_HTTPS_TOKEN]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-private-https-remote, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["private_remote=https-remote credential_scan=passed"]
+      log_not_contains: ["${ENV:REPO_SANDBOX_E2E_HTTPS_TOKEN}"]
+      artifacts: [cli-private-https-remote.passed]
+
+  - id: cli-private-ssh-remote
+    description: Exercise the private SSH remote CLI path with an external key and strict known-host checking, without persisting key material.
+    tier: opt_in
+    targets: [docker, wsl, vm]
+    covers: [cli, private_ssh_git, fixed_commit, external_key, strict_known_hosts, credential_scan]
+    required_env: [REPO_SANDBOX_E2E_SSH_URL, REPO_SANDBOX_E2E_SSH_REF, REPO_SANDBOX_E2E_SSH_KEY, REPO_SANDBOX_E2E_SSH_KNOWN_HOSTS]
+    redact_file_env: [REPO_SANDBOX_E2E_SSH_KEY]
+    timeout_seconds: 1800
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-private-ssh-remote, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["private_remote=ssh-remote credential_scan=passed"]
+      artifacts: [cli-private-ssh-remote.passed]
+
+  - id: cli-profile-contracts
+    description: Run fixed, explicitly enabled central diagnostic profiles for timeout, resource, architecture, secret injection and artifact export.
+    tier: required
+    targets: [docker]
+    covers: [cli, verify, timeout, memory_limit, temporary_storage_limit, architecture_mismatch, secret_environment, artifact_export]
+    timeout_seconds: 1200
+    command: { program: repo-bash, args: ["${ROOT}/scripts/e2e/docker-scenario.sh", cli-profile-contracts, "${RESULT_DIR}"] }
+    expected:
+      exit_code: 0
+      log_contains: ["profile_cli=timeout,memory,temporary-storage,architecture,secret-artifact status=verified"]
+      log_not_contains: ["${ENV:REPO_SANDBOX_E2E_PROFILE_SECRET}"]
+      artifacts: [cli-profile-contracts.passed]
+
   - id: public-git-snapshot
     description: Materialize a public remote through a task-owned localhost unauthenticated HTTP service.
     tier: required

@@ -1,7 +1,7 @@
 //! Central environment template catalog and deterministic dependency planning.
 
 use crate::config::{Platform, TemplateSelection};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -27,6 +27,87 @@ pub struct TemplateDefinition {
     pub build_context: PathBuf,
     #[serde(default)]
     pub parameters: BTreeMap<String, ParameterDefinition>,
+    pub execution: ExecutionDefinition,
+}
+
+/// Versioned central execution profile. Repository configuration can select and
+/// parameterize a profile, but cannot replace commands or safety limits.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionDefinition {
+    pub version: u8,
+    pub build: Vec<ExecutionStep>,
+    pub test: Vec<ExecutionStep>,
+    pub resources: ExecutionResources,
+    pub timeout_seconds: u32,
+    #[serde(default = "default_true")]
+    pub fail_fast: bool,
+    #[serde(default)]
+    pub environment_allow: Vec<String>,
+    #[serde(default)]
+    pub secret_environment: Vec<String>,
+    #[serde(default)]
+    pub artifact_directories: Vec<PathBuf>,
+    #[serde(default)]
+    pub registry: Option<RegistryPolicy>,
+    /// Optional centrally-controlled runtime platform override for diagnostics.
+    #[serde(default)]
+    pub runner_platform: Option<Platform>,
+}
+
+impl Default for ExecutionDefinition {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            build: vec![ExecutionStep {
+                name: "build".into(),
+                command: "true".into(),
+            }],
+            test: vec![ExecutionStep {
+                name: "test".into(),
+                command: "true".into(),
+            }],
+            resources: ExecutionResources {
+                cpu: 1,
+                memory_mb: 512,
+                temporary_storage_mb: 1024,
+            },
+            timeout_seconds: 300,
+            fail_fast: true,
+            environment_allow: Vec::new(),
+            secret_environment: Vec::new(),
+            artifact_directories: Vec::new(),
+            registry: None,
+            runner_platform: None,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionStep {
+    pub name: String,
+    pub command: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionResources {
+    pub cpu: u16,
+    pub memory_mb: u32,
+    pub temporary_storage_mb: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryPolicy {
+    pub repository: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -49,7 +130,7 @@ pub struct TemplateCatalog {
     components: Vec<ComponentDefinition>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TemplatePlan {
     pub template_id: String,
     pub template_version: String,
@@ -60,9 +141,10 @@ pub struct TemplatePlan {
     pub build_context: PathBuf,
     pub parameters: BTreeMap<String, String>,
     pub stages: Vec<PlanStage>,
+    pub execution: ExecutionDefinition,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PlanStage {
     pub id: String,
     pub version: String,
@@ -122,7 +204,14 @@ impl TemplateCatalog {
 
     pub fn builtin() -> Result<Self, PlanError> {
         Self::from_yaml_sources(
-            &[include_str!("../../../templates/rust-bazel/template.yaml")],
+            &[
+                include_str!("../../../templates/rust-bazel/template.yaml"),
+                include_str!("../../../templates/acceptance/timeout.yaml"),
+                include_str!("../../../templates/acceptance/memory.yaml"),
+                include_str!("../../../templates/acceptance/temporary-storage.yaml"),
+                include_str!("../../../templates/acceptance/architecture.yaml"),
+                include_str!("../../../templates/acceptance/secret-artifact.yaml"),
+            ],
             &[
                 include_str!("../../../templates/components/base-tools/component.yaml"),
                 include_str!("../../../templates/components/bazel/component.yaml"),
@@ -277,6 +366,18 @@ impl TemplateCatalog {
                 })
             })
             .collect();
+        let mut execution = template.execution.clone();
+        if let Some(registry) = &mut execution.registry {
+            registry.repository = interpolate(&registry.repository, &parameters);
+            registry.aliases = registry
+                .aliases
+                .iter()
+                .map(|value| interpolate(value, &parameters))
+                .collect();
+            if registry.repository.trim().is_empty() {
+                execution.registry = None;
+            }
+        }
         Ok(TemplatePlan {
             template_id: template.id.clone(),
             template_version: template.version.clone(),
@@ -286,6 +387,7 @@ impl TemplateCatalog {
             build_context: template.build_context.clone(),
             parameters,
             stages,
+            execution,
         })
     }
 
@@ -306,6 +408,15 @@ impl TemplateCatalog {
                 &format!("{path}.target_platforms"),
                 &template.target_platforms,
             )?;
+            validate_execution(&format!("{path}.execution"), &template.execution)?;
+            if let Some(platform) = template.execution.runner_platform
+                && !template.target_platforms.contains(&platform)
+            {
+                return Err(PlanError::new(
+                    format!("{path}.execution.runner_platform"),
+                    format!("runner platform {platform} is not supported by the template"),
+                ));
+            }
             let mut component_ids = BTreeSet::new();
             for (component_index, component) in template.components.iter().enumerate() {
                 require_non_empty(
@@ -418,6 +529,80 @@ fn validate_platforms(path: &str, platforms: &[Platform]) -> Result<(), PlanErro
     Ok(())
 }
 
+fn validate_execution(path: &str, execution: &ExecutionDefinition) -> Result<(), PlanError> {
+    if execution.version != 1 {
+        return Err(PlanError::new(
+            format!("{path}.version"),
+            "expected version 1",
+        ));
+    }
+    if execution.build.is_empty() || execution.test.is_empty() {
+        return Err(PlanError::new(
+            path,
+            "build and test must each contain at least one step",
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for (phase, steps) in [("build", &execution.build), ("test", &execution.test)] {
+        for (index, step) in steps.iter().enumerate() {
+            require_non_empty(&format!("{path}.{phase}[{index}].name"), &step.name)?;
+            require_non_empty(&format!("{path}.{phase}[{index}].command"), &step.command)?;
+            if !names.insert(step.name.as_str()) {
+                return Err(PlanError::new(
+                    format!("{path}.{phase}[{index}].name"),
+                    "step names must be unique across build and test",
+                ));
+            }
+        }
+    }
+    if execution.resources.cpu == 0
+        || execution.resources.memory_mb == 0
+        || execution.resources.temporary_storage_mb == 0
+        || execution.timeout_seconds == 0
+    {
+        return Err(PlanError::new(
+            path,
+            "resource limits and timeout must be greater than zero",
+        ));
+    }
+    for (index, directory) in execution.artifact_directories.iter().enumerate() {
+        validate_context(&format!("{path}.artifact_directories[{index}]"), directory)?;
+    }
+    let mut ordinary_environment = BTreeSet::new();
+    for (kind, values) in [
+        ("environment_allow", &execution.environment_allow),
+        ("secret_environment", &execution.secret_environment),
+    ] {
+        let mut seen = BTreeSet::new();
+        for (index, value) in values.iter().enumerate() {
+            let valid = value.bytes().enumerate().all(|(offset, byte)| {
+                byte == b'_' || byte.is_ascii_alphabetic() || (offset > 0 && byte.is_ascii_digit())
+            });
+            if !valid || value.is_empty() || !seen.insert(value) {
+                return Err(PlanError::new(
+                    format!("{path}.{kind}[{index}]"),
+                    "must be a unique POSIX environment name",
+                ));
+            }
+            if kind == "environment_allow" {
+                ordinary_environment.insert(value);
+            } else if ordinary_environment.contains(value) {
+                return Err(PlanError::new(
+                    format!("{path}.{kind}[{index}]"),
+                    "must not overlap environment_allow",
+                ));
+            }
+        }
+    }
+    if let Some(registry) = &execution.registry {
+        require_non_empty(&format!("{path}.registry.repository"), &registry.repository)?;
+        for (index, alias) in registry.aliases.iter().enumerate() {
+            require_non_empty(&format!("{path}.registry.aliases[{index}]"), alias)?;
+        }
+    }
+    Ok(())
+}
+
 fn interpolate(value: &str, parameters: &BTreeMap<String, String>) -> String {
     parameters
         .iter()
@@ -453,6 +638,12 @@ build_context: templates/components/base
             include_str!("../../../templates/components/rust/context/Dockerfile"),
         ];
         assert!(dockerfiles.iter().all(|source| source.contains("FROM ")));
+        assert!(
+            dockerfiles
+                .iter()
+                .all(|source| !source.contains("ARG BAZEL_VERSION")
+                    && !source.contains("ARG BAZELISK_VERSION"))
+        );
         let catalog = TemplateCatalog::builtin().unwrap();
         let selection = TemplateSelection {
             id: "rust-bazel".to_owned(),
@@ -462,7 +653,20 @@ build_context: templates/components/base
             ]),
         };
         let plan = catalog.plan(&selection, Platform::LinuxAmd64).unwrap();
+        assert_eq!(plan.template_version, "1.0.1");
         assert_eq!(plan.base_image, "docker.io/library/rust:1.97.0-bookworm");
+        assert!(!plan.parameters.contains_key("bazel_version"));
+        assert!(!plan.parameters.contains_key("bazelisk_version"));
+        assert!(plan.execution.environment_allow.is_empty());
+        assert_eq!(plan.execution.build[0].command, "bazel build //...");
+        assert_eq!(plan.execution.test[0].command, "bazel test //...");
+        assert!(
+            plan.execution
+                .build
+                .iter()
+                .chain(&plan.execution.test)
+                .all(|step| !step.command.contains("bazelisk") && !step.command.contains("latest"))
+        );
         assert_eq!(
             plan.stages
                 .iter()
@@ -472,6 +676,58 @@ build_context: templates/components/base
         );
         let arm_plan = catalog.plan(&selection, Platform::LinuxArm64).unwrap();
         assert_eq!(arm_plan.platform, Platform::LinuxArm64);
+
+        for name in ["bazel_version", "bazelisk_version"] {
+            let mut injected = selection.clone();
+            injected
+                .parameters
+                .insert(name.into(), "non-default".into());
+            let error = catalog.plan(&injected, Platform::LinuxAmd64).unwrap_err();
+            assert_eq!(error.path(), format!("$.template.parameters.{name}"));
+        }
+    }
+
+    #[test]
+    fn execution_profile_is_mandatory_and_versioned() {
+        let missing = r#"id: test
+version: "1"
+base_image: example:1
+components: []
+target_platforms: [linux/amd64]
+build_context: templates/test
+"#;
+        let error = TemplateCatalog::from_yaml_sources(&[missing], &[]).unwrap_err();
+        assert!(error.to_string().contains("missing field `execution`"));
+        let invalid = missing.to_owned()
+            + "execution: { version: 2, build: [{ name: b, command: \"true\" }], test: [{ name: t, command: \"true\" }], resources: { cpu: 1, memory_mb: 1, temporary_storage_mb: 1 }, timeout_seconds: 1 }\n";
+        let error = TemplateCatalog::from_yaml_sources(&[&invalid], &[]).unwrap_err();
+        assert_eq!(error.path(), "$.templates[0].execution.version");
+    }
+
+    #[test]
+    fn secret_environment_cannot_overlap_persisted_environment() {
+        let template = r#"
+id: test
+version: "1"
+base_image: example:1
+components: []
+target_platforms: [linux/amd64]
+build_context: templates/test
+execution:
+  version: 1
+  build: [{ name: build, command: "true" }]
+  test: [{ name: test, command: "true" }]
+  resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }
+  timeout_seconds: 1
+  environment_allow: [TOKEN]
+  secret_environment: [TOKEN]
+"#;
+        let error = TemplateCatalog::from_yaml_sources(&[template], &[]).unwrap_err();
+        assert_eq!(
+            error.path(),
+            "$.templates[0].execution.secret_environment[0]"
+        );
+        assert!(error.to_string().contains("must not overlap"));
     }
 
     #[test]
@@ -488,6 +744,7 @@ components:
     depends_on: [base]
 target_platforms: [linux/amd64]
 build_context: templates/test
+execution: { version: 1, build: [{ name: build, command: "true" }], test: [{ name: test, command: "true" }], resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }, timeout_seconds: 1 }
 "#;
         let zed = COMPONENT.replace("id: base", "id: zed");
         let alpha = COMPONENT.replace("id: base", "id: alpha");
@@ -515,6 +772,7 @@ base_image: example:1
 components: [{ id: absent }]
 target_platforms: [linux/amd64]
 build_context: templates/test
+execution: { version: 1, build: [{ name: build, command: "true" }], test: [{ name: test, command: "true" }], resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }, timeout_seconds: 1 }
 "#;
         let catalog = TemplateCatalog::from_yaml_sources(&[template], &[COMPONENT]).unwrap();
         let error = catalog
@@ -539,6 +797,7 @@ base_image: example:1
 components: []
 target_platforms: [linux/amd64]
 build_context: templates/test
+execution: { version: 1, build: [{ name: build, command: "true" }], test: [{ name: test, command: "true" }], resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }, timeout_seconds: 1 }
 "#;
         let error = TemplateCatalog::from_yaml_sources(&[template, template], &[]).unwrap_err();
         assert_eq!(error.path(), "$.templates[1].id");
@@ -555,6 +814,7 @@ components:
   - { id: other, depends_on: [base] }
 target_platforms: [linux/amd64]
 build_context: templates/test
+execution: { version: 1, build: [{ name: build, command: "true" }], test: [{ name: test, command: "true" }], resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }, timeout_seconds: 1 }
 "#;
         let other = COMPONENT.replace("id: base", "id: other");
         let catalog =
@@ -575,6 +835,7 @@ base_image: example:1
 components: [{ id: base }]
 target_platforms: [linux/arm64]
 build_context: templates/test
+execution: { version: 1, build: [{ name: build, command: "true" }], test: [{ name: test, command: "true" }], resources: { cpu: 1, memory_mb: 128, temporary_storage_mb: 128 }, timeout_seconds: 1 }
 "#;
         let catalog = TemplateCatalog::from_yaml_sources(&[template], &[COMPONENT]).unwrap();
         let error = catalog

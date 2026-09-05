@@ -48,6 +48,7 @@ jobs:
         run: scripts/ci/release-bazel.sh
       - name: Rust formatting and lint contracts
         run: |
+          scripts/ci/offline-baseline-contract.sh
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh
@@ -61,14 +62,14 @@ jobs:
           "$RUNNER_TEMP/repo-sandbox" --version | grep -Fx "repo-sandbox $version"
           sample=$(mktemp -d)
           cp .repo-sandbox.yaml.example "$sample/.repo-sandbox.yaml"
-          "$RUNNER_TEMP/repo-sandbox" plan --repository "$sample" | grep -F 'Template: rust-bazel@1.0.0'
+          "$RUNNER_TEMP/repo-sandbox" plan --repository "$sample" | grep -F 'Template: rust-bazel@1.0.1'
       - name: CI and release security contracts
         run: scripts/ci/contracts.sh
 
   docker-required:
     name: Required Docker E2E
     runs-on: ubuntu-24.04
-    timeout-minutes: 65
+    timeout-minutes: 240
     steps:
       - name: Checkout the tested commit without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -83,6 +84,16 @@ jobs:
         with:
           platforms: amd64,arm64
           cache-image: false
+      - name: Install the minimum supported Buildx
+        run: |
+          install -d "$HOME/.docker/cli-plugins"
+          curl --fail --location --show-error \
+            https://github.com/docker/buildx/releases/download/v0.15.1/buildx-v0.15.1.linux-amd64 \
+            --output "$HOME/.docker/cli-plugins/docker-buildx"
+          echo '8d486f0088b7407a90ad675525ba4a17d0a537741b9b33fe3391a88cafa2dd0b  '"$HOME/.docker/cli-plugins/docker-buildx" | sha256sum --check --strict
+          chmod 0755 "$HOME/.docker/cli-plugins/docker-buildx"
+          docker buildx version | grep -F 'v0.15.1'
+          docker buildx imagetools create --help | grep -F -- '--prefer-index'
       - name: Install XFS quota tooling
         run: sudo apt-get update && sudo apt-get install --yes xfsprogs
       - name: Start task-owned XFS pquota Docker daemon and BuildKit namespace
@@ -92,9 +103,44 @@ jobs:
           export DOCKER_HOST="$docker_host"
           builder=$(scripts/e2e/ci-quota-docker.sh builder-name "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT")
           docker buildx create --name "$builder" --driver docker-container --driver-opt network=host --use
+          docker buildx inspect "$builder" --bootstrap
+          docker buildx inspect "$builder" | grep -Eq 'Platforms:.*linux/amd64'
           echo "REPO_SANDBOX_BUILDER=$builder" >> "$GITHUB_ENV"
+      # Keep emulated toolchain setup separate from CLI publication deadlines,
+      # and preserve progress even if preparation times out. The native cold
+      # build and all existing matrix deadlines/assertions remain exercised.
+      - name: Prepare the arm64 offline environment with visible progress
+        run: |
+          set -euo pipefail
+          mkdir -p target/e2e/preparation
+          prepared_cache=$(mktemp -d "$RUNNER_TEMP/repo-sandbox-arm-cache.XXXXXXXX")
+          echo "REPO_SANDBOX_PREPARED_ARM_CACHE=$prepared_cache" >> "$GITHUB_ENV"
+          timeout --signal=TERM --kill-after=30s 60s \
+            docker buildx inspect "$REPO_SANDBOX_BUILDER" --bootstrap \
+            2>&1 | tee target/e2e/preparation/builder.log
+          timeout --signal=TERM --kill-after=30s 2700s \
+            docker buildx build --builder "$REPO_SANDBOX_BUILDER" \
+              --platform linux/arm64 --target environment --provenance=false \
+              --cache-to "type=local,dest=$prepared_cache,mode=max" \
+              --output type=cacheonly --progress plain \
+              templates/rust-bazel/context \
+            2>&1 | tee target/e2e/preparation/arm64-environment.log
+          test -s "$prepared_cache/index.json"
       - name: Run required runner integration scenarios
+        env:
+          # Fixed non-production fixture value; matrix assertions require that it is redacted.
+          REPO_SANDBOX_E2E_PROFILE_SECRET: repo-sandbox-ci-profile-secret-not-a-credential
         run: cargo run -p repo-sandbox-adapters --bin e2e-matrix -- --target docker
+      - name: Upload compact scenario diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-matrix-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/e2e/
+            !target/e2e/**/task-layout/blobs/**
+          if-no-files-found: error
+          retention-days: 7
       - name: Upload scenario logs and reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -106,3 +152,12 @@ jobs:
       - name: Stop task-owned Docker daemon and remove quota storage
         if: always()
         run: sudo scripts/e2e/ci-quota-docker.sh stop "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+      - name: Remove task-owned ARM preparation cache
+        if: always()
+        run: |
+          if [[ -n ${REPO_SANDBOX_PREPARED_ARM_CACHE:-} ]]; then
+            case "$REPO_SANDBOX_PREPARED_ARM_CACHE" in
+              "$RUNNER_TEMP"/repo-sandbox-arm-cache.*) rm -rf -- "$REPO_SANDBOX_PREPARED_ARM_CACHE" ;;
+              *) echo 'refuse unexpected preparation cache path' >&2; exit 1 ;;
+            esac
+          fi

@@ -5,10 +5,12 @@
 //! values sent on stdin.
 
 use crate::buildkit::{Cancellation, NeverCancelled};
+use crate::snapshot::{ProcessTree, configure_process_tree};
 use repo_sandbox_core::build::{ImageDigest, ImageRef, PlatformDigest};
 use repo_sandbox_core::config::Platform;
 use repo_sandbox_core::registry::{
-    PublishRequest, PublishedImage, PullRequest, PulledImage, RegistryTag,
+    PublicationFactKind, PublicationFinality, PublishRequest, PublishedImage, PullRequest,
+    PulledImage, RegistryTag, RemotePublicationFact,
 };
 use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -56,7 +58,8 @@ impl RegistryExecutor for SystemRegistryExecutor {
         stdin: Option<&[u8]>,
         cancellation: &dyn Cancellation,
     ) -> io::Result<RegistryOutput> {
-        let mut child = Command::new(&invocation.program)
+        let mut command = Command::new(&invocation.program);
+        command
             .args(&invocation.args)
             .current_dir(
                 invocation
@@ -70,18 +73,29 @@ impl RegistryExecutor for SystemRegistryExecutor {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        if let Some(secret) = stdin {
-            child.stdin.take().expect("piped stdin").write_all(secret)?;
-        }
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn()?;
+        let process_tree = ProcessTree::attach(&mut child).inspect_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
+        let stdin_writer = stdin.map(|secret| {
+            let mut secret = secret.to_vec();
+            let mut pipe = child.stdin.take().expect("piped stdin");
+            thread::spawn(move || {
+                let result = pipe.write_all(&secret);
+                secret.fill(0);
+                result
+            })
+        });
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let stdout_reader = thread::spawn(move || read_output(stdout));
         let stderr_reader = thread::spawn(move || read_output(stderr));
         let (status, interrupted) = loop {
             if cancellation.is_cancelled() {
-                child.kill()?;
+                process_tree.terminate();
                 break (child.wait()?, true);
             }
             if let Some(status) = child.try_wait()? {
@@ -89,6 +103,17 @@ impl RegistryExecutor for SystemRegistryExecutor {
             }
             thread::sleep(Duration::from_millis(25));
         };
+        // A registry CLI can exit while its Buildx plugin or credential helper
+        // still owns the pipes. Terminate the creation-time tree before joining.
+        process_tree.terminate();
+        if let Some(writer) = stdin_writer {
+            match writer.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(io::Error::other("registry stdin writer panicked")),
+            }
+        }
         Ok(RegistryOutput {
             exit_code: status.code(),
             stdout: join_output(stdout_reader)?,
@@ -191,6 +216,11 @@ impl RegistryError {
     pub const fn kind(&self) -> RegistryErrorKind {
         self.kind
     }
+
+    pub fn is_manifest_absent(&self) -> bool {
+        let message = self.message.to_ascii_lowercase();
+        message.contains("manifest unknown") || message.contains("no such manifest")
+    }
 }
 
 impl Display for RegistryError {
@@ -230,6 +260,173 @@ pub struct DockerRegistry<E> {
 impl<E> DockerRegistry<E> {
     pub const fn new(executor: E) -> Self {
         Self { executor }
+    }
+}
+
+impl<E: RegistryExecutor> DockerRegistry<E> {
+    /// Resolve a daemon-pushed single-platform staging tag to its registry
+    /// manifest digest while proving it still names the locally verified
+    /// image configuration. Docker may re-serialize a loaded OCI manifest on
+    /// push, so its remote manifest digest need not equal the BuildKit digest.
+    pub fn resolve_single_source_digest(
+        &self,
+        image: &ImageRef,
+        expected_config: &ImageDigest,
+        cancellation: &dyn Cancellation,
+    ) -> Result<ImageDigest, RegistryError> {
+        let digest_invocation = docker(&[
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            image.to_string(),
+        ]);
+        let described = self.run(
+            "inspect single-platform staging descriptor",
+            &digest_invocation,
+            None,
+            cancellation,
+        )?;
+        let digest = parse_descriptor_digest(&described.stdout)?;
+        let pinned = digest_ref(image, &digest)?;
+        let raw_invocation = docker(&[
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            "--raw".into(),
+            pinned,
+        ]);
+        let raw = self.run(
+            "inspect single-platform staging manifest",
+            &raw_invocation,
+            None,
+            cancellation,
+        )?;
+        let document: serde_json::Value =
+            serde_json::from_str(&raw.stdout).map_err(|error| RegistryError {
+                kind: RegistryErrorKind::Manifest,
+                message: format!("parse single-platform staging manifest: {error}"),
+            })?;
+        let config = document
+            .pointer("/config/digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| RegistryError {
+                kind: RegistryErrorKind::Manifest,
+                message: "single-platform staging manifest has no config digest".into(),
+            })?;
+        let config = ImageDigest::new(config).map_err(|message| RegistryError {
+            kind: RegistryErrorKind::Manifest,
+            message,
+        })?;
+        ensure_digest(expected_config, &config, "single-platform staging config")?;
+        Ok(digest)
+    }
+
+    /// Publish while reporting only remote references whose manifest copy and
+    /// digest/platform verification have both completed successfully.
+    pub fn publish_with_progress(
+        &self,
+        request: &PublishRequest,
+        cancellation: &dyn Cancellation,
+        progress: impl FnMut(&PublishedImage),
+    ) -> Result<PublishedImage, RegistryError> {
+        self.publish_with_observers(request, cancellation, progress, |_| {})
+    }
+
+    pub fn publish_with_observers(
+        &self,
+        request: &PublishRequest,
+        cancellation: &dyn Cancellation,
+        mut progress: impl FnMut(&PublishedImage),
+        mut facts: impl FnMut(RemotePublicationFact),
+    ) -> Result<PublishedImage, RegistryError> {
+        validate_publish(request)?;
+        self.require_carbon_copy_capability(cancellation)?;
+        let immutable = request
+            .repository
+            .tagged(&RegistryTag::for_digest(&request.digest));
+        let source = digest_ref(&request.source, &request.digest)?;
+        let mut published = PublishedImage {
+            immutable: immutable.clone(),
+            aliases: Vec::new(),
+            digest: request.digest.clone(),
+            platform_digests: request.platform_digests.clone(),
+        };
+        for (target, kind) in std::iter::once((immutable.clone(), PublicationFactKind::Immutable))
+            .chain(
+                request
+                    .aliases
+                    .iter()
+                    .map(|alias| (request.repository.tagged(alias), PublicationFactKind::Alias)),
+            )
+        {
+            facts(RemotePublicationFact {
+                kind,
+                reference: target.clone(),
+                digest: None,
+                verified: false,
+                finality: PublicationFinality::Final,
+            });
+            if let Err(error) = self.copy_manifest(&source, &target, &[], cancellation) {
+                struct Reconciliation(std::time::Instant);
+                impl Cancellation for Reconciliation {
+                    fn is_cancelled(&self) -> bool {
+                        std::time::Instant::now() >= self.0
+                    }
+                }
+                let token = Reconciliation(std::time::Instant::now() + Duration::from_secs(30));
+                if let Ok(observed) = self.inspect_digest(&target, &[], &token) {
+                    facts(RemotePublicationFact {
+                        kind,
+                        reference: target,
+                        digest: Some(observed.digest),
+                        verified: false,
+                        finality: PublicationFinality::Final,
+                    });
+                }
+                return Err(error);
+            }
+            let inspected =
+                self.inspect_digest(&target, &request.platform_digests, cancellation)?;
+            ensure_digest(&request.digest, &inspected.digest, "published reference")?;
+            facts(RemotePublicationFact {
+                kind,
+                reference: target.clone(),
+                digest: Some(inspected.digest),
+                verified: true,
+                finality: PublicationFinality::Final,
+            });
+            if kind == PublicationFactKind::Alias {
+                published.aliases.push(target);
+            }
+            progress(&published);
+        }
+        Ok(published)
+    }
+
+    fn require_carbon_copy_capability(
+        &self,
+        cancellation: &dyn Cancellation,
+    ) -> Result<(), RegistryError> {
+        let invocation = docker(&[
+            "buildx".into(),
+            "imagetools".into(),
+            "create".into(),
+            "--help".into(),
+        ]);
+        let help = self.run(
+            "check Buildx immutable-manifest capability",
+            &invocation,
+            None,
+            cancellation,
+        )?;
+        if help.stdout.contains("--prefer-index") || help.stderr.contains("--prefer-index") {
+            Ok(())
+        } else {
+            Err(RegistryError::new(
+                RegistryErrorKind::Command,
+                "Docker Buildx lacks `imagetools create --prefer-index`; install Buildx v0.15.1 or newer before publishing",
+            ))
+        }
     }
 }
 
@@ -319,30 +516,7 @@ impl<E: RegistryExecutor> OciRegistry for DockerRegistry<E> {
         request: &PublishRequest,
         cancellation: &dyn Cancellation,
     ) -> Result<PublishedImage, RegistryError> {
-        validate_publish(request)?;
-        let content_tag = RegistryTag::for_digest(&request.digest);
-        let immutable = request.repository.tagged(&content_tag);
-        let source = digest_ref(&request.source, &request.digest)?;
-        self.copy_manifest(&source, &immutable, &[], cancellation)?;
-        let inspected = self.inspect_digest(&immutable, &request.platform_digests, cancellation)?;
-        ensure_digest(&request.digest, &inspected.digest, "published content tag")?;
-
-        let mut aliases = Vec::with_capacity(request.aliases.len());
-        for alias in &request.aliases {
-            let target = request.repository.tagged(alias);
-            let pinned = digest_ref(&immutable, &request.digest)?;
-            self.copy_manifest(&pinned, &target, &[], cancellation)?;
-            let alias_manifest =
-                self.inspect_digest(&target, &request.platform_digests, cancellation)?;
-            ensure_digest(&request.digest, &alias_manifest.digest, "published alias")?;
-            aliases.push(target);
-        }
-        Ok(PublishedImage {
-            immutable,
-            aliases,
-            digest: inspected.digest,
-            platform_digests: inspected.platforms,
-        })
+        self.publish_with_progress(request, cancellation, |_| {})
     }
 
     fn pull_and_verify(
@@ -441,6 +615,10 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
             "buildx".into(),
             "imagetools".into(),
             "create".into(),
+            // The default promotes a single image manifest to an index and
+            // therefore changes its digest. Immutable publication requires a
+            // byte-identical copy of the already pinned source descriptor.
+            "--prefer-index=false".into(),
             "--tag".into(),
             target.to_string(),
             source.into(),
@@ -474,12 +652,31 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
             "imagetools".into(),
             "inspect".into(),
             "--raw".into(),
-            image.to_string(),
+            digest_ref(image, &digest)?.to_string(),
         ]);
         let raw = self.run("inspect raw manifest", &raw_invocation, None, cancellation)?;
-        let platforms = parse_platforms(&raw.stdout)?;
+        let mut platforms = parse_platforms(&raw.stdout)?;
+        if platforms.is_empty() && expected.len() == 1 && expected[0].digest == digest {
+            // OCI image manifests do not carry an os/architecture descriptor;
+            // the exact top-level digest plus BuildKit's single requested
+            // platform is the complete immutable evidence in this case.
+            platforms = expected.to_vec();
+        }
         if !expected.is_empty() {
             verify_platforms(&platforms, expected)?;
+        }
+        if !image.as_str().contains('@') {
+            let current = self.run(
+                "recheck manifest descriptor",
+                &digest_invocation,
+                None,
+                cancellation,
+            )?;
+            ensure_digest(
+                &digest,
+                &parse_descriptor_digest(&current.stdout)?,
+                "mutable manifest reference",
+            )?;
         }
         Ok(InspectedManifest { digest, platforms })
     }
@@ -809,6 +1006,98 @@ mod tests {
     const AMD: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const ARM: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
+    struct ImmediatelyCancelled;
+
+    impl Cancellation for ImmediatelyCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn system_registry_executor_bounds_helpers_that_inherit_output_pipes() {
+        #[cfg(unix)]
+        let invocation = RegistryInvocation {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 30 & wait".into()],
+            current_dir: None,
+        };
+        #[cfg(windows)]
+        let invocation = RegistryInvocation {
+            program: "cmd".into(),
+            args: vec![
+                "/d".into(),
+                "/s".into(),
+                "/c".into(),
+                "start \"\" /b cmd /d /s /c \"ping -n 30 127.0.0.1 >NUL\"".into(),
+            ],
+            current_dir: None,
+        };
+        let started = std::time::Instant::now();
+        let output = SystemRegistryExecutor
+            .execute(&invocation, None, &ImmediatelyCancelled)
+            .unwrap();
+        assert!(output.interrupted);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn system_registry_executor_cancels_a_blocked_secret_stdin_writer() {
+        struct CancelSoon(std::time::Instant);
+        impl Cancellation for CancelSoon {
+            fn is_cancelled(&self) -> bool {
+                self.0.elapsed() >= Duration::from_millis(100)
+            }
+        }
+        #[cfg(unix)]
+        let invocation = RegistryInvocation {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            current_dir: None,
+        };
+        #[cfg(windows)]
+        let invocation = RegistryInvocation {
+            program: "cmd".into(),
+            args: vec![
+                "/d".into(),
+                "/s".into(),
+                "/c".into(),
+                "ping -n 30 127.0.0.1 >NUL".into(),
+            ],
+            current_dir: None,
+        };
+        let secret = vec![b'x'; 4 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let output = SystemRegistryExecutor
+            .execute(&invocation, Some(&secret), &CancelSoon(started))
+            .unwrap();
+        assert!(output.interrupted);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn system_registry_executor_bounds_broken_pipe_from_unread_secret_stdin() {
+        #[cfg(unix)]
+        let invocation = RegistryInvocation {
+            program: "sh".into(),
+            args: vec!["-c".into(), "exit 0".into()],
+            current_dir: None,
+        };
+        #[cfg(windows)]
+        let invocation = RegistryInvocation {
+            program: "cmd".into(),
+            args: vec!["/d".into(), "/c".into(), "exit 0".into()],
+            current_dir: None,
+        };
+        let secret = vec![b'x'; 4 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let output = SystemRegistryExecutor
+            .execute(&invocation, Some(&secret), &NeverCancelled)
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     struct FakeExecutor {
         outputs: Mutex<VecDeque<RegistryOutput>>,
         invocations: Mutex<Vec<(RegistryInvocation, bool)>>,
@@ -851,6 +1140,15 @@ mod tests {
         }
     }
 
+    fn failed(stderr: impl Into<String>) -> RegistryOutput {
+        RegistryOutput {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: stderr.into(),
+            interrupted: false,
+        }
+    }
+
     fn multiarch() -> String {
         format!(
             r#"{{"schemaVersion":2,"manifests":[{{"digest":"{AMD}","platform":{{"os":"linux","architecture":"amd64"}}}},{{"digest":"{ARM}","platform":{{"os":"linux","architecture":"arm64","variant":"v8"}}}}]}}
@@ -872,6 +1170,12 @@ mod tests {
         "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{},\"layers\":[]}\n".into()
     }
 
+    fn single_manifest_with_config(config: &str) -> String {
+        format!(
+            "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{{\"digest\":\"{config}\"}},\"layers\":[]}}\n"
+        )
+    }
+
     fn platform_digests() -> Vec<PlatformDigest> {
         vec![
             PlatformDigest {
@@ -883,6 +1187,24 @@ mod tests {
                 digest: ImageDigest::new(ARM).unwrap(),
             },
         ]
+    }
+
+    #[test]
+    fn mutable_alias_inspection_pins_raw_and_rejects_concurrent_retag() {
+        let registry = DockerRegistry::new(FakeExecutor::new(vec![
+            ok(described()),
+            ok(multiarch()),
+            ok(format!("Digest: {AMD}\n")),
+        ]));
+        let image = ImageRef::new("registry.test/team/image:latest").unwrap();
+        assert!(
+            registry
+                .inspect_digest(&image, &platform_digests(), &NeverCancelled)
+                .is_err()
+        );
+        let calls = registry.executor.invocations.lock().unwrap();
+        assert!(calls[1].0.args.last().unwrap().ends_with(ROOT));
+        assert_eq!(calls[2].0.args.last().unwrap(), image.as_str());
     }
 
     #[test]
@@ -950,12 +1272,15 @@ mod tests {
     #[test]
     fn publish_creates_content_tag_then_alias_and_verifies_multiarch_digests() {
         let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
             ok(""),
             ok(described()),
             ok(multiarch()),
+            ok(described()),
             ok(""),
             ok(described()),
             ok(multiarch()),
+            ok(described()),
         ]);
         let registry = DockerRegistry::new(executor);
         let request = PublishRequest {
@@ -979,9 +1304,14 @@ mod tests {
             "registry.test/team/image:latest"
         );
         let calls = registry.executor.invocations.lock().unwrap();
-        assert_eq!(calls[0].0.args[0..3], ["buildx", "imagetools", "create"]);
+        assert_eq!(
+            calls[0].0.args,
+            ["buildx", "imagetools", "create", "--help"]
+        );
+        assert_eq!(calls[1].0.args[0..3], ["buildx", "imagetools", "create"]);
+        assert_eq!(calls[1].0.args[3], "--prefer-index=false");
         assert!(
-            calls[0]
+            calls[1]
                 .0
                 .args
                 .iter()
@@ -990,16 +1320,166 @@ mod tests {
     }
 
     #[test]
+    fn single_manifest_publication_progress_retains_verified_immutable_on_alias_failure() {
+        let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
+            ok(""),
+            ok(described()),
+            ok(single_manifest()),
+            ok(described()),
+            failed("alias copy denied"),
+        ]);
+        let registry = DockerRegistry::new(executor);
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/source/image:build").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: vec![PlatformDigest {
+                platform: Platform::LinuxAmd64,
+                digest: root_digest(),
+            }],
+            aliases: vec![RegistryTag::new("latest").unwrap()],
+        };
+        let mut observed = Vec::new();
+        assert!(
+            registry
+                .publish_with_progress(&request, &NeverCancelled, |state| observed
+                    .push(state.clone()))
+                .is_err()
+        );
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed.last().unwrap().digest, root_digest());
+        assert!(observed.last().unwrap().aliases.is_empty());
+    }
+
+    #[test]
+    fn multi_manifest_publication_progress_retains_each_verified_alias_before_later_failure() {
+        let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
+            ok(""),
+            ok(described()),
+            ok(multiarch()),
+            ok(described()),
+            ok(""),
+            ok(described()),
+            ok(multiarch()),
+            ok(described()),
+            ok(""),
+            failed("alias inspect transport failure"),
+        ]);
+        let registry = DockerRegistry::new(executor);
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/source/image:build").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: platform_digests(),
+            aliases: vec![
+                RegistryTag::new("stable").unwrap(),
+                RegistryTag::new("latest").unwrap(),
+            ],
+        };
+        let mut observed = Vec::new();
+        assert!(
+            registry
+                .publish_with_progress(&request, &NeverCancelled, |state| observed
+                    .push(state.clone()))
+                .is_err()
+        );
+        assert_eq!(observed.len(), 2);
+        assert!(observed[0].aliases.is_empty());
+        assert_eq!(observed[1].aliases.len(), 1);
+        assert!(observed[1].aliases[0].as_str().ends_with(":stable"));
+        assert_eq!(observed.last().unwrap().aliases.len(), 1);
+        assert!(
+            observed.last().unwrap().aliases[0]
+                .as_str()
+                .ends_with(":stable")
+        );
+        assert_eq!(
+            observed.last().unwrap().platform_digests,
+            platform_digests()
+        );
+    }
+
+    #[test]
+    fn immutable_copy_fact_is_reported_even_when_its_verification_transport_fails() {
+        let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
+            ok(""),
+            failed("inspect timed out"),
+        ]);
+        let registry = DockerRegistry::new(executor);
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/source/image:build").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: platform_digests(),
+            aliases: Vec::new(),
+        };
+        let mut observed = Vec::new();
+        let mut facts = Vec::new();
+        assert!(
+            registry
+                .publish_with_observers(
+                    &request,
+                    &NeverCancelled,
+                    |state| observed.push(state.clone()),
+                    |fact| facts.push(fact)
+                )
+                .is_err()
+        );
+        assert!(observed.is_empty());
+        assert_eq!(facts.len(), 1);
+        assert!(!facts[0].verified);
+        assert_eq!(facts[0].digest, None);
+    }
+
+    #[test]
+    fn ambiguous_copy_preserves_unknown_fact_when_reconciliation_fails() {
+        let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
+            failed("copy response lost"),
+            failed("inspect timed out"),
+        ]);
+        let registry = DockerRegistry::new(executor);
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/source/image:build").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: platform_digests(),
+            aliases: Vec::new(),
+        };
+        let mut observed = Vec::new();
+        let mut facts = Vec::new();
+        assert!(
+            registry
+                .publish_with_observers(
+                    &request,
+                    &NeverCancelled,
+                    |state| observed.push(state.clone()),
+                    |fact| facts.push(fact)
+                )
+                .is_err()
+        );
+        assert!(observed.is_empty());
+        assert_eq!(facts.len(), 1);
+        assert!(!facts[0].verified);
+        assert_eq!(facts[0].digest, None);
+    }
+
+    #[test]
     fn pull_fetches_every_platform_by_pinned_digest_and_rechecks_tag() {
         let executor = FakeExecutor::new(vec![
             ok(described()),
             ok(multiarch()),
+            ok(described()),
             ok(""),
             ok("linux/amd64\n"),
             ok(""),
             ok("linux/arm64\n"),
             ok(described()),
             ok(multiarch()),
+            ok(described()),
         ]);
         let registry = DockerRegistry::new(executor);
         let request = PullRequest {
@@ -1061,6 +1541,7 @@ mod tests {
         let rejected = DockerRegistry::new(FakeExecutor::new(vec![
             ok(described()),
             ok(single_manifest()),
+            ok(described()),
         ]));
         let error = rejected
             .pull_and_verify(
@@ -1077,10 +1558,12 @@ mod tests {
         let accepted = DockerRegistry::new(FakeExecutor::new(vec![
             ok(described()),
             ok(single_manifest()),
+            ok(described()),
             ok(""),
             ok("linux/amd64\n"),
             ok(described()),
             ok(single_manifest()),
+            ok(described()),
         ]));
         accepted
             .pull_and_verify(
@@ -1092,6 +1575,115 @@ mod tests {
                 &NeverCancelled,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn publication_accepts_an_exact_single_platform_manifest() {
+        let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
+            ok(""),
+            ok(described()),
+            ok(single_manifest()),
+            ok(described()),
+        ]);
+        let registry = DockerRegistry::new(executor);
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/team/image:source").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: vec![PlatformDigest {
+                platform: Platform::LinuxAmd64,
+                digest: root_digest(),
+            }],
+            aliases: Vec::new(),
+        };
+        let published = registry.publish(&request, &NeverCancelled).unwrap();
+        assert_eq!(published.platform_digests, request.platform_digests);
+        let calls = registry.executor.invocations.lock().unwrap();
+        assert_eq!(
+            &calls[1].0.args[..5],
+            [
+                "buildx",
+                "imagetools",
+                "create",
+                "--prefer-index=false",
+                "--tag"
+            ]
+        );
+        assert!(
+            calls[1]
+                .0
+                .args
+                .last()
+                .unwrap()
+                .ends_with(&format!("@{}", root_digest()))
+        );
+    }
+
+    #[test]
+    fn publication_requires_carbon_copy_capability_before_remote_side_effects() {
+        let registry = DockerRegistry::new(FakeExecutor::new(vec![ok(
+            "Usage: docker buildx imagetools create [OPTIONS]",
+        )]));
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/team/image:source").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: vec![PlatformDigest {
+                platform: Platform::LinuxAmd64,
+                digest: root_digest(),
+            }],
+            aliases: vec![RegistryTag::new("latest").unwrap()],
+        };
+        let error = registry.publish(&request, &NeverCancelled).unwrap_err();
+        assert_eq!(error.kind(), RegistryErrorKind::Command);
+        assert!(error.to_string().contains("Buildx v0.15.1 or newer"));
+        let calls = registry.executor.invocations.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0.args,
+            ["buildx", "imagetools", "create", "--help"]
+        );
+        assert!(!calls[0].0.args.iter().any(|arg| arg == "--tag"));
+    }
+
+    #[test]
+    fn daemon_push_uses_remote_manifest_digest_after_verifying_local_config_identity() {
+        let remote = root_digest();
+        let local_config = ImageDigest::new(AMD).unwrap();
+        let raw = single_manifest_with_config(AMD);
+        let registry = DockerRegistry::new(FakeExecutor::new(vec![ok(described()), ok(raw)]));
+        let resolved = registry
+            .resolve_single_source_digest(
+                &ImageRef::new("registry.test/team/image:task-staging").unwrap(),
+                &local_config,
+                &NeverCancelled,
+            )
+            .unwrap();
+        assert_eq!(resolved, remote);
+        let calls = registry.executor.invocations.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].0.args.last().unwrap(),
+            &format!("registry.test/team/image:task-staging@{ROOT}")
+        );
+        drop(calls);
+
+        let foreign = DockerRegistry::new(FakeExecutor::new(vec![
+            ok(described()),
+            ok(single_manifest_with_config(ARM)),
+        ]));
+        assert_eq!(
+            foreign
+                .resolve_single_source_digest(
+                    &ImageRef::new("registry.test/team/image:task-staging").unwrap(),
+                    &local_config,
+                    &NeverCancelled,
+                )
+                .unwrap_err()
+                .kind(),
+            RegistryErrorKind::DigestMismatch
+        );
     }
 
     /// Configurable end-to-end coverage against an operator-provided disposable repository.

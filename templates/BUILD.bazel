@@ -9,3 +9,18 @@ filegroup(
     srcs = ["rust-bazel/context/Dockerfile"],
     visibility = ["//visibility:public"],
 )
+
+filegroup(
+    name = "rust-bazel-offline-baseline",
+    srcs = glob([
+        "rust-bazel/context/bazel",
+        "rust-bazel/context/offline-baseline/**",
+    ]),
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "component-dockerfiles",
+    srcs = glob(["components/*/context/Dockerfile"]),
+    visibility = ["//visibility:public"],
+)

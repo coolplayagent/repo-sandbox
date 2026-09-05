@@ -6,6 +6,11 @@ ci="$root/.github/workflows/ci.yml"
 release="$root/.github/workflows/release.yml"
 adapters_build="$root/crates/adapters/BUILD.bazel"
 cli_build="$root/apps/cli/BUILD.bazel"
+environment_dockerfile="$root/templates/rust-bazel/context/Dockerfile"
+bazel_wrapper="$root/templates/rust-bazel/context/bazel"
+baseline_lock="$root/templates/rust-bazel/context/offline-baseline/MODULE.bazel.lock"
+euleros_installer="$root/scripts/wsl/install-euleros.sh"
+yum_installer="$root/scripts/vm/install-yum.sh"
 
 for required in "$ci" "$release" "$root/scripts/ci/workspace-version.sh" \
   "$root/scripts/ci/download-release-artifacts.sh" \
@@ -50,6 +55,25 @@ grep -Fq 'verify-glibc-baseline.sh" "$temporary/repo-sandbox" 2.28' \
 grep -Fq 'raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_COMMIT}/scripts/ci/verify-glibc-baseline.sh' \
   "$release"
 grep -Fq 'version=$(scripts/ci/workspace-version.sh)' "$ci"
+grep -Fq 'docker buildx inspect "$builder" --bootstrap' "$ci"
+grep -Fq 'prepared_cache=$(mktemp -d "$RUNNER_TEMP/repo-sandbox-arm-cache.XXXXXXXX")' "$ci"
+grep -Fq 'REPO_SANDBOX_PREPARED_ARM_CACHE=$prepared_cache' "$ci"
+grep -Fq -- '--cache-to "type=local,dest=$prepared_cache,mode=max"' "$ci"
+grep -Fq 'test -s "$prepared_cache/index.json"' "$ci"
+grep -Fq 'name: Remove task-owned ARM preparation cache' "$ci"
+grep -Fq "Platforms:.*linux/amd64" "$ci"
+grep -Fq 'v0.15.1/buildx-v0.15.1.linux-amd64' "$euleros_installer"
+grep -Fq '8d486f0088b7407a90ad675525ba4a17d0a537741b9b33fe3391a88cafa2dd0b' \
+  "$euleros_installer" "$yum_installer"
+grep -Fq 'readonly BUILDX_VERSION=v0.15.1' "$yum_installer"
+grep -Fq '13f4ffd2b6922e941d6b6a9faee73ec9b8cab5b309ef90dfadf48142c2a47f34' \
+  "$yum_installer"
+grep -Fq 'v0.15.1/buildx-v0.15.1.linux-amd64' "$ci"
+grep -Fq '8d486f0088b7407a90ad675525ba4a17d0a537741b9b33fe3391a88cafa2dd0b' "$ci"
+grep -Fq "imagetools create --help | grep -F -- '--prefer-index'" "$ci"
+grep -Fq 'ensure_buildx_carbon_copy_capability' "$euleros_installer" "$yum_installer"
+bash "$root/scripts/tests/buildx-capability.sh"
+grep -Fq 'REPO_SANDBOX_E2E_PROFILE_SECRET: repo-sandbox-ci-profile-secret-not-a-credential' "$ci"
 ! grep -Fq "grep -Fx 'repo-sandbox 0.1.0'" "$ci"
 grep -Fq 'bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh' "$ci"
 grep -Fq 'publish-release.sh "${{ needs.prepare.outputs.tag }}" "$GITHUB_REPOSITORY" release "${{ needs.prepare.outputs.commit }}"' "$release"
@@ -102,8 +126,47 @@ grep -Fq 'gh api --method DELETE "repos/${repository}/releases/${release_id}"' \
 # The adapter's include_str! tests must stay hermetic without broad workspace data.
 grep -Fq '"//scripts/docker:multistage-acceptance"' "$adapters_build"
 grep -Fq '"//templates:rust-bazel-dockerfile"' "$adapters_build"
+grep -Fq '"//templates:rust-bazel-offline-baseline"' "$adapters_build"
 grep -Fq 'srcs = ["multistage-acceptance.sh"]' "$root/scripts/docker/BUILD.bazel"
 grep -Fq 'srcs = ["rust-bazel/context/Dockerfile"]' "$root/templates/BUILD.bazel"
+grep -Fq 'name = "rust-bazel-offline-baseline"' "$root/templates/BUILD.bazel"
+grep -Fq 'FROM environment-base AS offline-seed' "$environment_dockerfile"
+grep -Fq 'mod graph >/dev/null' "$environment_dockerfile"
+grep -Fq 'cmp /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes' \
+  "$environment_dockerfile"
+grep -Fq 'bazel --batch --output_user_root=/toolchain/bazel-seed test //...' \
+  "$environment_dockerfile"
+grep -Fq 'COPY --from=offline-seed /toolchain/bazel-seed/cache/repos/' \
+  "$environment_dockerfile"
+! sed -n '/FROM environment-base AS offline-seed/,/FROM environment-base AS environment/p' \
+  "$environment_dockerfile" | grep -Fq 'github_token'
+grep -Fq '/usr/local/libexec/repo-sandbox/bazel-9.2.0' "$bazel_wrapper"
+grep -Fq -- '--output_user_root=/var/cache/repo-sandbox/bazel' "$bazel_wrapper"
+grep -Fq -- '--ignore_all_rc_files' "$bazel_wrapper"
+grep -Fq -- '--repository_disable_download' "$bazel_wrapper"
+for module in platforms/1.0.0 rules_shell/0.6.1 rules_java/9.1.0 rules_cc/0.2.17; do
+  for metadata in MODULE.bazel source.json; do
+    grep -Fq "\"https://bcr.bazel.build/modules/$module/$metadata\"" "$baseline_lock"
+  done
+done
+grep -Fq '["--network", "none"]' "$root/crates/adapters/src/docker_runner.rs"
+grep -Fxq 'templates/rust-bazel/context/Dockerfile text eol=lf' "$root/.gitattributes"
+grep -Fxq 'templates/rust-bazel/context/bazel text eol=lf' "$root/.gitattributes"
+grep -Fxq 'templates/rust-bazel/context/offline-baseline/* text eol=lf' \
+  "$root/.gitattributes"
+grep -Fq "Template: rust-bazel@1.0.1" "$ci"
+! grep -Rq -F --exclude=contracts.sh 'rust-bazel@1.0.0' \
+  "$root/.github" "$root/scripts" "$root/docs"
+grep -Fq 'Bazel unexpectedly downloaded a module outside the central baseline' \
+  "$root/scripts/docker/multistage-acceptance.sh"
+grep -Fq 'templates/rust-bazel/context/offline-baseline' \
+  "$root/scripts/docker/multistage-acceptance.sh"
+grep -Fq 'COPY offline-baseline/' "$root/tests/multistage/Dockerfile.single-stage"
+grep -Fq '/usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock' \
+  "$root/tests/multistage/Dockerfile.single-stage"
+grep -Fq 'rm -rf /tmp/repo-sandbox-bazel-check' "$environment_dockerfile"
+bash "$root/scripts/e2e/docker-scenario.sh" --self-test-task-id
+bash "$root/scripts/docker/multistage-acceptance.sh" --self-test-cache-assertions
 grep -A5 -F 'name = "e2e_matrix_test"' "$adapters_build" | grep -Fq 'srcs = ["e2e/e2e_matrix.rs"]'
 grep -Fq 'bazelisk test --action_env=PATH //...' "$ci"
 grep -Fq -- '- name: Release Bazel target selection' "$ci"
@@ -125,13 +188,25 @@ fi
 [[ $(grep -c '"@crates//:clap"' "$cli_build") -eq 2 ]]
 ! grep -Fq 'all_crate_deps' "$cli_build"
 
-# Keep every required scenario budget stable: this change deliberately grants only
-# the dual-architecture dogfood scenario more time on hosted QEMU runners.
+# Keep every scenario budget explicit. The required Docker job is sequential, so
+# its outer timeout must cover the sum of every required Docker scenario plus teardown.
 scenario_timeouts=$(awk '
   /- id: / { id=$3 }
   /timeout_seconds:/ { print id "=" $2 }
 ' "$root/tests/e2e/scenarios.yaml")
 expected_scenario_timeouts=$(printf '%s\n' \
+  'cli-build-success=900' \
+  'cli-verify-success=600' \
+  'cli-build-failure=600' \
+  'cli-test-failure=600' \
+  'cli-clean-owned-only=600' \
+  'cli-interrupt-cleanup=600' \
+  'cli-multi-platform-oci=1800' \
+  'cli-registry-publish=1200' \
+  'cli-public-file-remote=600' \
+  'cli-private-https-remote=1800' \
+  'cli-private-ssh-remote=1800' \
+  'cli-profile-contracts=1200' \
   'public-git-snapshot=60' \
   'private-https-snapshot=120' \
   'private-ssh-snapshot=120' \
@@ -145,10 +220,16 @@ expected_scenario_timeouts=$(printf '%s\n' \
   'euleros-hce-vm-matrix=3600')
 [[ "$scenario_timeouts" == "$expected_scenario_timeouts" ]]
 
-dogfood_timeout=3300
 docker_job_minutes=$(awk '/^  docker-required:/{found=1} found && /timeout-minutes:/{print $2; exit}' \
   "$ci")
-[[ $((docker_job_minutes * 60)) -ge $((dogfood_timeout + 600)) ]]
+required_docker_budget=$(awk '
+  /- id: / { id=$3; tier=""; docker=0 }
+  /tier: required/ { tier="required" }
+  /targets: \[[^]]*docker/ { docker=1 }
+  /timeout_seconds:/ { if (tier == "required" && docker) total += $2 }
+  END { print total }
+' "$root/tests/e2e/scenarios.yaml")
+[[ $((docker_job_minutes * 60)) -ge $((required_docker_budget + 600)) ]]
 
 while IFS= read -r action; do
   [[ $action =~ @([a-f0-9]{40})([[:space:]]|$) ]] || {

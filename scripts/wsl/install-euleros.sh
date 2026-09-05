@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=../lib/buildx-capability.sh
+source "$SCRIPT_DIR/../lib/buildx-capability.sh"
+
 readonly EXPECTED_VERSION="2.10.7"
 readonly BAZELISK_URL="https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-linux-amd64"
 readonly BAZELISK_SHA256="5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992"
-readonly BUILDX_URL="https://github.com/docker/buildx/releases/download/v0.14.1/buildx-v0.14.1.linux-amd64"
-readonly BUILDX_SHA256="68e4f8895331ade982de8085a8c137b8af65f3ef95040b6c6113552243638508"
+readonly BUILDX_URL="https://github.com/docker/buildx/releases/download/v0.15.1/buildx-v0.15.1.linux-amd64"
+readonly BUILDX_SHA256="8d486f0088b7407a90ad675525ba4a17d0a537741b9b33fe3391a88cafa2dd0b"
 
 source_dir=""
 configure_systemd_only=false
@@ -146,11 +150,8 @@ if [[ ! -e /usr/local/bin/bazel ]]; then
   ln -s bazelisk /usr/local/bin/bazel
 fi
 
-if ! docker buildx version >/dev/null 2>&1; then
-  install -d -m 0755 /usr/local/lib/docker/cli-plugins
-  install_verified_binary "$BUILDX_URL" "$BUILDX_SHA256" /usr/local/lib/docker/cli-plugins/docker-buildx
-fi
-docker buildx version >/dev/null
+ensure_buildx_carbon_copy_capability \
+  "$BUILDX_URL" "$BUILDX_SHA256" /usr/local/lib/docker/cli-plugins/docker-buildx
 
 binfmt_arm64_enabled() {
   [[ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] &&

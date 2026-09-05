@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=../lib/buildx-capability.sh
+source "$SCRIPT_DIR/../lib/buildx-capability.sh"
+
 readonly BAZELISK_VERSION=v1.29.0
 readonly BAZELISK_AMD64_SHA256=5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992
 readonly BAZELISK_ARM64_SHA256=e20e8b0f4f240091b7a55bf17b9398bd4f40ee70ae0208dff95dd4c445fb4010
-readonly BUILDX_VERSION=v0.14.1
-readonly BUILDX_AMD64_SHA256=68e4f8895331ade982de8085a8c137b8af65f3ef95040b6c6113552243638508
-readonly BUILDX_ARM64_SHA256=82e776e50a84293c160e8c89c125b7a86295c7aa7f30751d6a7c051c171762c1
+readonly BUILDX_VERSION=v0.15.1
+readonly BUILDX_AMD64_SHA256=8d486f0088b7407a90ad675525ba4a17d0a537741b9b33fe3391a88cafa2dd0b
+readonly BUILDX_ARM64_SHA256=13f4ffd2b6922e941d6b6a9faee73ec9b8cab5b309ef90dfadf48142c2a47f34
 
 if ((EUID != 0)); then
   command -v sudo >/dev/null 2>&1 || { echo 'installation requires root or sudo' >&2; exit 77; }
@@ -129,13 +133,9 @@ if ! command -v bazelisk >/dev/null 2>&1; then
 fi
 [[ -e /usr/local/bin/bazel ]] || ln -s bazelisk /usr/local/bin/bazel
 
-if ! docker buildx version >/dev/null 2>&1; then
-  install -d -m 0755 /usr/local/lib/docker/cli-plugins
-  install_verified_binary \
-    "https://github.com/docker/buildx/releases/download/$BUILDX_VERSION/buildx-$BUILDX_VERSION.linux-$artifact_arch" \
-    "$buildx_sha" /usr/local/lib/docker/cli-plugins/docker-buildx
-fi
-docker buildx version >/dev/null
+ensure_buildx_carbon_copy_capability \
+  "https://github.com/docker/buildx/releases/download/$BUILDX_VERSION/buildx-$BUILDX_VERSION.linux-$artifact_arch" \
+  "$buildx_sha" /usr/local/lib/docker/cli-plugins/docker-buildx
 
 # doctor requires the opposite architecture to be executable. Use only a
 # package already exposed by the operator-configured repositories.

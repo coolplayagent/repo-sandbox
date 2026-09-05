@@ -13,22 +13,49 @@ dependency selections, platform mismatches, and dependency cycles are reported
 with YAML-style paths. Topological sorting uses component IDs to break ties, so
 the same inputs always produce the same `TemplatePlan` stage order.
 
-The bootstrap catalog contains `rust-bazel@1.0.0` and the `base-tools`, `bazel`,
+The bootstrap catalog contains `rust-bazel@1.0.1` and the `base-tools`, `bazel`,
 and `rust` components. Its manifests and Dockerfiles are Bazel compile inputs,
 and core tests statically parse and plan the embedded catalog. Central paths are
 ordinary checked-in files; no symlinks or init-dev-compatible filename
 conventions are required.
 
-The central Rust+Bazel Dockerfile has two named stages. `toolchain-build` owns
+The central Rust+Bazel Dockerfile has four named stages. `toolchain-build` owns
 the large upstream assembly image, the downloader, optional BuildKit secret,
-and transient installation state. `environment` starts from Debian slim,
+and transient installation state. `environment-base` starts from Debian slim,
 installs only task-runtime build dependencies, and copies the Rust/Cargo,
 fixed Bazel, and optional Bazelisk executables across an explicit
-`COPY --from=toolchain-build` boundary. The actual Bazel binary is pinned by
-the `bazel_version` template parameter, so the normal `bazel` command does not
-need Bazelisk to download a second executable at task runtime. Apt,
-Cargo and Bazel paths use locked, architecture-specific BuildKit cache mounts;
-those mounts and `/run/secrets` are never committed to a layer.
+`COPY --from=toolchain-build` boundary. `offline-seed` resolves two fixed, centrally owned graphs: the existing
+`genrule` plus `cc_test` baseline and a separate Rust workspace fixture with
+its pinned crate-universe closure. Neither graph has access to repository
+source or the optional GitHub token. A `RUN --network=none` instruction
+re-fetches the full Rust dependency closure and builds real Rust/C++ smoke tests
+after expanded repositories and action caches are removed. On amd64 it also
+compiles and tests the fixture linked against all workspace dependencies; arm64
+avoids repeating that heavy compilation under QEMU. The arm64 check proves
+offline archive recovery and toolchain execution, not compilation of every
+application dependency. The final `environment` copies only the
+resulting content-addressed Bazel repository closure. The actual Bazel binary is pinned by
+the trusted central template to Bazel 9.2.0, so repositories cannot override
+`bazel_version` or `bazelisk_version`, and the normal `bazel` command does not
+need Bazelisk to resolve `latest` or download a second executable at task
+runtime.
+
+The root-owned `bazel` wrapper ignores repository, user, and system rc files,
+clears Bazelisk override variables, selects the fixed binary, and disables all
+repository downloads. Task containers use Docker network `none`. When a source
+snapshot has no `MODULE.bazel.lock`, the task image supplies the checksum-pinned
+baseline lock for Bazel 9.2.0's central C++ fixture and its toolchain module
+mapping. C++ fixtures explicitly load `rules_cc` 0.2.17, as required by Bazel 9. The read-only image closure contains both registry metadata and source
+archives, rather than relying on a BuildKit cache mount. Version 1 seeds the
+centrally defined C++ baseline and the separate pinned Rust workspace closure;
+any additional dependency or extension closure that requires a download fails
+closed at runtime. The CI offline-baseline contract checks that the Rust seed
+graph matches the workspace inputs, the template and wrapper match `.bazelversion`,
+and all baseline locks use the matching Bazel lock schema. Rust seed fetches
+use `--lockfile_mode=error` online and offline so stale locks fail immediately
+instead of silently regenerating the crate graph. Apt and Cargo
+paths use locked, architecture-specific BuildKit cache mounts; those mounts and
+`/run/secrets` are never committed to a layer.
 
 Inspect a repository selection without building or pulling an image:
 
@@ -37,7 +64,8 @@ repo-sandbox plan --repository path/to/repository
 ```
 
 The output identifies the resolved template, image, platform, central build
-context, and every dependency edge in stable execution order.
+context, every dependency edge, and the mandatory versioned execution profile
+in stable order. Repository YAML cannot replace profile commands or limits.
 
 ## BuildKit adapter
 

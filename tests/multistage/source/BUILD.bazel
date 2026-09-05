@@ -1,6 +1,0 @@
-genrule(
-    name = "rust_binary",
-    srcs = ["src/main.rs"],
-    outs = ["multistage-smoke"],
-    cmd = "rustc $(location src/main.rs) -o $@ && test \"$$($@)\" = 42",
-)

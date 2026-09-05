@@ -1,0 +1,14 @@
+id: rust-bazel-acceptance-architecture
+version: "1.0.1"
+base_image: docker.io/library/rust:1.97.0-bookworm
+components: [{ id: base-tools }, { id: bazel, depends_on: [base-tools] }, { id: rust, depends_on: [base-tools] }]
+target_platforms: [linux/amd64, linux/arm64]
+build_context: templates/rust-bazel/context
+execution:
+  version: 1
+  build: [{ name: acceptance-build, command: "true" }]
+  test: [{ name: acceptance-architecture, command: "uname -m" }]
+  resources: { cpu: 1, memory_mb: 256, temporary_storage_mb: 64 }
+  timeout_seconds: 120
+  fail_fast: true
+  runner_platform: linux/arm64

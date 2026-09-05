@@ -1,6 +1,133 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+assert_cached_step() {
+  local log=$1
+  local description=$2
+  # The total instruction count and optional platform prefix are presentation
+  # details. Keep the ordinal so distinct RUN instructions remain required.
+  awk -v description="$description" '
+    function stable(text) {
+      gsub(/\[linux\/[^ ]+ /, "[", text)
+      gsub(/\/[0-9]+\]/, "]", text)
+      return text
+    }
+    {
+      line=stable($0)
+      wanted=stable(description)
+      offset=index(line, wanted)
+      next_char=substr(line, offset + length(wanted), 1)
+      if (offset && (next_char == "" || next_char ~ /[[:space:]]/)) expected[$1]=1
+    }
+    $2 == "CACHED" { cached[$1]=1 }
+    END {
+      count=0
+      for (step in expected) {
+        count++
+        if (!cached[step]) {
+          print "required cache vertex not cached: " step " for " description > "/dev/stderr"
+          exit 1
+        }
+      }
+      if (count == 0) print "required cache operation missing: " description > "/dev/stderr"
+      exit count == 0
+    }
+  ' "$log"
+}
+
+assert_environment_cached() {
+  local warm_log=$1
+  assert_cached_step "$warm_log" '[toolchain-build 2/2] RUN' || return 1
+  assert_cached_step "$warm_log" '[environment-base 2/7] RUN' || return 1
+  assert_cached_step "$warm_log" '[environment-base 3/7] COPY --from=toolchain-build /usr/local/cargo/' || return 1
+  assert_cached_step "$warm_log" '[environment-base 4/7] COPY --from=toolchain-build /usr/local/rustup/' || return 1
+  assert_cached_step "$warm_log" '[environment-base 5/7] COPY --from=toolchain-build /toolchain/bin/bazel' || return 1
+  assert_cached_step "$warm_log" '[environment-base 6/7] COPY --from=toolchain-build /toolchain/bin/bazelisk' || return 1
+  assert_cached_step "$warm_log" '[environment-base 7/7] RUN' || return 1
+  assert_cached_step "$warm_log" '[offline-seed 2/2] RUN' || return 1
+  assert_cached_step "$warm_log" '[offline-seed 3/3] RUN' || return 1
+  assert_cached_step "$warm_log" '[environment 1/4] COPY --from=offline-seed /toolchain/bazel-seed/cache/repos/' || return 1
+  assert_cached_step "$warm_log" '[environment 4/4] RUN' || return 1
+}
+
+select_prepared_arm_cache() {
+  local architecture=$1
+  local prepared_cache=${2-}
+  prepared_cache_args=()
+  if [[ $architecture == arm64 && -n $prepared_cache ]]; then
+    if [[ ! -s "$prepared_cache/index.json" ]]; then
+      echo "prepared ARM cache is missing its OCI index: $prepared_cache" >&2
+      return 1
+    fi
+    prepared_cache_args=(--cache-from "type=local,src=$prepared_cache")
+  fi
+}
+
+if [[ ${1-} == --self-test-cache-assertions ]]; then
+  cache_fixture=$(mktemp)
+  prepared_fixture=$(mktemp -d)
+  trap 'rm -f "$cache_fixture" "$cache_fixture.miss"; rm -rf "$prepared_fixture"' EXIT
+  printf '%s\n' '#17 [offline-seed 2/3] RUN online-seed' '#17 CACHED' \
+    '#19 [offline-seed 3/3] RUN offline-verify' '#19 CACHED' >"$cache_fixture"
+  assert_cached_step "$cache_fixture" '[offline-seed 2/2] RUN'
+  cat >"$cache_fixture" <<'CACHELOG'
+#11 [linux/amd64 toolchain-build 2/2] RUN install-tools
+#11 CACHED
+#12 [linux/amd64 environment-base 2/7] RUN install-runtime
+#12 CACHED
+#13 [linux/amd64 environment-base 3/7] COPY --from=toolchain-build /usr/local/cargo/
+#13 CACHED
+#14 [linux/amd64 environment-base 4/7] COPY --from=toolchain-build /usr/local/rustup/
+#14 CACHED
+#15 [linux/amd64 environment-base 5/7] COPY --from=toolchain-build /toolchain/bin/bazel
+#15 CACHED
+#16 [linux/amd64 environment-base 6/7] COPY --from=toolchain-build /toolchain/bin/bazelisk
+#16 CACHED
+#17 [linux/amd64 environment-base 7/7] RUN verify-tools
+#17 CACHED
+#18 [offline-seed 2/3] RUN online-seed
+#18 CACHED
+#19 [offline-seed 3/3] RUN offline-verify
+#19 CACHED
+#20 [environment 1/4] COPY --from=offline-seed /toolchain/bazel-seed/cache/repos/
+#20 CACHED
+#21 [environment 4/4] RUN install-wrapper
+#21 CACHED
+CACHELOG
+  assert_environment_cached "$cache_fixture"
+  for vertex in $(seq 11 21); do
+    sed "s/^#$vertex CACHED$/#$vertex DONE 0.1s/" "$cache_fixture" >"$cache_fixture.miss"
+    if assert_environment_cached "$cache_fixture.miss" 2>/dev/null; then echo "uncached vertex $vertex was accepted" >&2; exit 1; fi
+    sed "/^#$vertex /d" "$cache_fixture" >"$cache_fixture.miss"
+    if assert_environment_cached "$cache_fixture.miss" 2>/dev/null; then echo "missing required vertex $vertex was accepted" >&2; exit 1; fi
+  done
+  sed '/^#15 /s|/toolchain/bin/bazel$|/toolchain/bin/bazelisk|' "$cache_fixture" >"$cache_fixture.miss"
+  if assert_environment_cached "$cache_fixture.miss" 2>/dev/null; then echo 'bazelisk substituted for bazel was accepted' >&2; exit 1; fi
+  sed '/^#11 /s/] RUN /] RUNNER /' "$cache_fixture" >"$cache_fixture.miss"
+  if assert_environment_cached "$cache_fixture.miss" 2>/dev/null; then echo 'operation prefix collision was accepted' >&2; exit 1; fi
+  rm -f "$cache_fixture.miss"
+  if assert_cached_step "$cache_fixture" '[missing-stage 1/4] COPY' 2>/dev/null; then exit 1; fi
+  printf '%s\n' '#17 [offline-seed 2/3] RUN online-seed' '#17 CACHED' \
+    '#19 [offline-seed 3/3] RUN offline-verify' '#19 DONE 0.1s' >"$cache_fixture"
+  if assert_cached_step "$cache_fixture" '[offline-seed 3/3] RUN' 2>/dev/null; then exit 1; fi
+  select_prepared_arm_cache amd64 "$prepared_fixture/missing"
+  [[ -z ${prepared_cache_args[*]-} ]]
+  select_prepared_arm_cache arm64 ''
+  [[ -z ${prepared_cache_args[*]-} ]]
+  if select_prepared_arm_cache arm64 "$prepared_fixture/missing" 2>/dev/null; then
+    echo 'missing prepared ARM cache was accepted' >&2; exit 1
+  fi
+  mkdir -p "$prepared_fixture/cache with spaces"
+  printf '{}\n' >"$prepared_fixture/cache with spaces/index.json"
+  select_prepared_arm_cache arm64 "$prepared_fixture/cache with spaces"
+  [[ ${#prepared_cache_args[@]} -eq 2 ]]
+  [[ ${prepared_cache_args[0]} == --cache-from ]]
+  [[ ${prepared_cache_args[1]} == "type=local,src=$prepared_fixture/cache with spaces" ]]
+  select_prepared_arm_cache amd64 "$prepared_fixture/cache with spaces"
+  [[ -z ${prepared_cache_args[*]-} ]]
+  exit 0
+fi
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 temporary=$(mktemp -d)
 run_id="issue1-$$"
@@ -38,18 +165,11 @@ retry_external_build() {
 }
 
 cp -R "$repo_root/tests/multistage/." "$temporary/context"
+cp -R "$repo_root/templates/rust-bazel/context/offline-baseline" "$temporary/context/"
+cp "$repo_root/templates/rust-bazel/context/bazel" "$temporary/context/bazel"
 cp "$temporary/context/source/src/main.rs" "$temporary/main.rs.original"
 printf '%s\n' 'issue1-secret-marker-must-not-leak' >"$temporary/github-token"
 
-assert_cached_step() {
-  local log=$1
-  local description=$2
-  awk -v description="$description" '
-    index($0, description) { step=$1 }
-    step != "" && $1 == step && $2 == "CACHED" { hit=1 }
-    END { exit !hit }
-  ' "$log"
-}
 
 printf '%-8s %15s %15s %15s %10s\n' platform compressed_single compressed_multi unpacked_multi reduction
 for architecture in amd64 arm64; do
@@ -63,8 +183,9 @@ for architecture in amd64 arm64; do
   cache_warm="$temporary/cache-$architecture-warm"
   cold_log="$temporary/environment-$architecture-cold.log"
   warm_log="$temporary/environment-$architecture-warm.log"
+  select_prepared_arm_cache "$architecture" "${REPO_SANDBOX_PREPARED_ARM_CACHE:-}"
 
-  retry_external_build docker buildx build "${builder_args[@]}" --provenance=false \
+  retry_external_build docker buildx build "${builder_args[@]}" "${prepared_cache_args[@]}" --provenance=false \
     --platform "$platform" --target environment \
     --secret "id=github_token,src=$temporary/github-token" \
     --cache-to "type=local,dest=$cache_cold,mode=max" --progress plain --load \
@@ -80,13 +201,7 @@ for architecture in amd64 arm64; do
   test "$cold_environment_identity" = "$warm_environment_identity"
   printf '%s environment cold/warm identity: %s\n' \
     "$architecture" "$warm_environment_identity"
-  assert_cached_step "$warm_log" '[toolchain-build 2/2] RUN'
-  assert_cached_step "$warm_log" '[environment 2/7] RUN'
-  assert_cached_step "$warm_log" '[environment 3/7] COPY --from=toolchain-build /usr/local/cargo/'
-  assert_cached_step "$warm_log" '[environment 4/7] COPY --from=toolchain-build /usr/local/rustup/'
-  assert_cached_step "$warm_log" '[environment 5/7] COPY --from=toolchain-build /toolchain/bin/bazel'
-  assert_cached_step "$warm_log" '[environment 6/7] COPY --from=toolchain-build /toolchain/bin/bazelisk'
-  assert_cached_step "$warm_log" '[environment 7/7] RUN'
+  assert_environment_cached "$warm_log"
 
   source_digest=$(tar -C "$temporary/context/source" --sort=name --mtime='UTC 1970-01-01' \
     --owner=0 --group=0 --numeric-owner -cf - . | sha256sum | awk '{print "sha256:"$1}')
@@ -141,10 +256,12 @@ for architecture in amd64 arm64; do
     --build-arg "ENVIRONMENT_IMAGE=$environment" --build-arg "SOURCE_DIGEST=$source_digest" \
     --progress plain --tag "$acceptance_task" -f "$temporary/context/Dockerfile.task" \
     "$temporary/context"
+  # Reuse the exact loaded baseline. Building its full Dockerfile here would
+  # repeat its seed on the Engine builder, including emulated ARM toolchains.
   retry_external_build docker build --network host --provenance=false \
-    --platform "$platform" --target acceptance --build-arg "SOURCE_DIGEST=$source_digest" \
+    --platform "$platform" --target acceptance --build-arg "ACCEPTANCE_IMAGE=$baseline" \
     --progress plain --tag "$acceptance_baseline" \
-    -f "$temporary/context/Dockerfile.single-stage" "$temporary/context"
+    -f "$temporary/context/Dockerfile.acceptance" "$temporary/context"
   printf '%s build-stage acceptance network=host scope=public-dependency-download passed\n' \
     "$architecture"
 
@@ -154,7 +271,9 @@ for architecture in amd64 arm64; do
     test ! -e /toolchain
     test ! -e /run/secrets/github_token
     test -z "$(find /root/.cache -mindepth 1 -print -quit 2>/dev/null)"
-    test -z "$(find /var/cache/repo-sandbox -mindepth 1 -print -quit 2>/dev/null)"
+    test -d /var/cache/repo-sandbox/bazel/cache/repos/v1
+    test -s /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock
+    test -x /usr/local/libexec/repo-sandbox/bazel-9.2.0
     test ! -e /root/.cache/bazel
     test ! -e /root/.cache/bazelisk
     test ! -e /toolchain-downloads
@@ -167,8 +286,54 @@ for architecture in amd64 arm64; do
     command -v bazel >/dev/null
     command -v git >/dev/null
     command -v cc >/dev/null
+    ! grep -R -F issue1-secret-marker-must-not-leak \
+      /var/cache/repo-sandbox /usr/local/share/repo-sandbox >/dev/null 2>&1
   '
   printf '%s final-image history/filesystem security scan: passed\n' "$architecture"
+
+  docker run --rm --network none --platform "$platform" \
+    --env USE_BAZEL_VERSION=latest --env BAZEL_OPTS=--bazelrc=/workspace/.bazelrc \
+    "$task" sh -ec '
+      bazel version | grep -Fx "Build label: 9.2.0"
+      bazel --batch build //:rust_binary
+      bazel --batch test //...
+    '
+  printf '%s final-task Bazel closure: network=none pinned=9.2.0 rc=ignored passed\n' \
+    "$architecture"
+
+  if [[ $architecture == amd64 ]]; then
+    missing_log="$temporary/offline-closure-missing.log"
+    if docker run --rm --network none --platform "$platform" "$task" sh -ec '
+      rm -rf /var/cache/repo-sandbox/bazel/cache/repos
+      bazel --batch build //...
+    ' >"$missing_log" 2>&1; then
+      echo 'Bazel unexpectedly succeeded without the embedded repository closure' >&2
+      exit 1
+    fi
+    grep -Eqi 'registry|repository|download' "$missing_log"
+
+    corrupt_log="$temporary/offline-closure-corrupt.log"
+    if docker run --rm --network none --platform "$platform" "$task" sh -ec '
+      sed -i "0,/8a28e4a/{s/8a28e4a/ffffffff/}" MODULE.bazel.lock
+      bazel --batch build //...
+    ' >"$corrupt_log" 2>&1; then
+      echo 'Bazel unexpectedly accepted a corrupt registry-content pin' >&2
+      exit 1
+    fi
+    grep -Eqi 'registry|checksum|download|hash' "$corrupt_log"
+
+    foreign_log="$temporary/offline-closure-foreign-module.log"
+    if docker run --rm --network none --platform "$platform" "$task" sh -ec '
+      printf '\''%s\n'\'' '\''bazel_dep(name = "rules_go", version = "0.50.1")'\'' \
+        >> MODULE.bazel
+      bazel --batch build //...
+    ' >"$foreign_log" 2>&1; then
+      echo 'Bazel unexpectedly downloaded a module outside the central baseline' >&2
+      exit 1
+    fi
+    grep -Eqi 'registry|repository|download' "$foreign_log"
+    echo 'amd64 missing/corrupt/foreign offline closure fail-closed: passed'
+  fi
 
   docker image save "$task" -o "$temporary/multi-$architecture.tar"
   docker image save "$baseline" -o "$temporary/single-$architecture.tar"
@@ -182,4 +347,13 @@ for architecture in amd64 arm64; do
   printf '%-8s %15d %15d %15d %9s%%\n' "$architecture" "$single_compressed" \
     "$multi_compressed" "$multi_unpacked" "$reduction"
   awk -v reduction="$reduction" 'BEGIN { exit !(reduction >= 10.0) }'
+  # Measurements and warm-cache checks for this architecture are complete.
+  # Free their large local exports before the next architecture needs space.
+  rm -rf -- "$cache_cold" "$cache_warm"
+  rm -f -- "$temporary/multi-$architecture.tar" "$temporary/single-$architecture.tar" \
+    "$temporary/multi-$architecture.tar.gz" "$temporary/single-$architecture.tar.gz"
+  # These unique tags are no longer used; EXIT cleanup retries if removal fails.
+  docker image rm --force "$environment" "$task" "$baseline" \
+    "$acceptance_task" "$acceptance_baseline" >/dev/null 2>&1 || \
+    echo "could not remove all completed $architecture image tags; EXIT cleanup will retry" >&2
 done

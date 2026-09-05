@@ -2,6 +2,7 @@
 //!
 //! This crate deliberately has no infrastructure dependencies.
 
+pub mod application;
 pub mod build;
 pub mod config;
 pub mod doctor;
@@ -70,33 +71,9 @@ impl Display for AppError {
 
 impl Error for AppError {}
 
-/// Route a command to its future use case.
-///
-/// Issue #2 only reserves these routes; the implementations intentionally live
-/// in later issues.
-pub fn route(command: Command) -> Result<String, AppError> {
-    Ok(format!("{} is not implemented yet", command.name()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_reserved_command_has_a_route() {
-        for command in [
-            Command::Doctor,
-            Command::Plan,
-            Command::Build,
-            Command::Verify,
-            Command::Clean,
-        ] {
-            assert_eq!(
-                route(command).unwrap(),
-                format!("{} is not implemented yet", command.name())
-            );
-        }
-    }
 
     #[test]
     fn application_errors_map_to_stable_exit_codes() {

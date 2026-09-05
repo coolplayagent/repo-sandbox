@@ -1,0 +1,18 @@
+[package]
+name = "repo-sandbox-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "repo_sandbox_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "repo-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+repo-sandbox-adapters = { path = "../../crates/adapters" }
+repo-sandbox-core = { path = "../../crates/core" }

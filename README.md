@@ -50,15 +50,33 @@ repo-sandbox plan --repository .
 Private Git snapshots support SSH agent/key references and HTTPS token/credential
 helper authentication without storing credentials. See
 [`docs/config-v1.md`](docs/config-v1.md#private-git-authentication) for the
-security contract.
+security contract. With no credential flag, implicit helpers, askpass programs,
+SSH agents, and default SSH identities are disabled.
 
 `doctor` checks the host OS/CPU, Docker daemon, BuildKit, buildx,
 cross-architecture QEMU/binfmt support, repository filesystem space, and Docker
 Hub registry connectivity. It never installs software or changes host/Docker
 configuration. A failed capability includes suggested operator actions and exits
 with the environment exit code (`3`). `plan` resolves the selected central
-template and displays its stable dependency graph; `build`, `verify`, and
-`clean` remain reserved for follow-up issues.
+template and displays its stable dependency graph and execution profile.
+`build` runs the central build phase; `verify` runs build then test. Both create
+immutable snapshots/task images, stream logs, write no-overwrite JSON reports,
+and precisely remove their one-shot container. `--push` and `--oci-layout`
+require `verify` and cannot be combined in one invocation; both emit an image
+only after successful verification. `clean` removes only manifest-recorded, owner-verified resources:
+
+Add `.reports/` to the repository’s `.gitignore` before using these examples.
+Explicit report and OCI destinations inside the repository must be Git-ignored
+so later source snapshots cannot include earlier reports or images. Destinations
+outside the repository are also supported.
+
+```bash
+repo-sandbox build --repository . --report-path .reports/build.json
+repo-sandbox verify --repository . --report-path .reports/verify.json
+repo-sandbox verify --repository . --platform linux/amd64 --platform linux/arm64 --oci-layout .reports/task-oci
+repo-sandbox clean --repository . --dry-run --include-images --include-cache
+repo-sandbox clean --repository . --yes --include-images --include-cache
+```
 
 Environment builds use canonical `linux/amd64` and `linux/arm64` platform names.
 Cross-architecture and multi-platform builds require a builder that advertises

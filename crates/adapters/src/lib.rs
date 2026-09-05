@@ -2,11 +2,13 @@
 
 pub mod artifacts;
 pub mod buildkit;
+pub mod cancellation;
 pub mod docker_runner;
 pub mod doctor;
 pub mod registry;
 pub mod snapshot;
 pub mod task_image;
+pub mod workflow;
 
 pub mod logging {
     use tracing_subscriber::EnvFilter;

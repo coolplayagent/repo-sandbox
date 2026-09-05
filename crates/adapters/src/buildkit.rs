@@ -1,5 +1,6 @@
 //! Docker Buildx/BuildKit adapter for central environment templates.
 
+use crate::snapshot::{ProcessTree, configure_process_tree};
 use repo_sandbox_core::build::{BuiltImage, ImageDigest, ImageRef, PlatformDigest};
 use repo_sandbox_core::config::Platform;
 use repo_sandbox_core::template::TemplatePlan;
@@ -72,19 +73,27 @@ impl ProcessExecutor for SystemProcessExecutor {
         invocation: &ProcessInvocation,
         cancellation: &dyn Cancellation,
     ) -> io::Result<ProcessOutput> {
-        let mut child = Command::new(&invocation.program)
+        let mut command = Command::new(&invocation.program);
+        command
             .args(&invocation.args)
             .current_dir(invocation.current_dir.as_deref().unwrap_or(Path::new(".")))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        #[cfg(all(unix, not(target_os = "linux")))]
+        configure_oci_fd_inheritance(&mut command, invocation)?;
+        let mut child = command.spawn()?;
+        let process_tree = ProcessTree::attach(&mut child).inspect_err(|_error| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
         let stdout = child.stdout.take().expect("piped stdout is available");
         let stderr = child.stderr.take().expect("piped stderr is available");
         let stdout_reader = thread::spawn(move || read_stream(stdout));
         let stderr_reader = thread::spawn(move || read_stream(stderr));
         let (status, interrupted) = loop {
             if cancellation.is_cancelled() {
-                child.kill()?;
+                process_tree.terminate();
                 break (child.wait()?, true);
             }
             if let Some(status) = child.try_wait()? {
@@ -92,12 +101,69 @@ impl ProcessExecutor for SystemProcessExecutor {
             }
             thread::sleep(Duration::from_millis(25));
         };
+        process_tree.terminate();
         Ok(ProcessOutput {
             exit_code: status.code(),
             stdout: join_reader(stdout_reader)?,
             stderr: join_reader(stderr_reader)?,
             interrupted,
         })
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn configure_oci_fd_inheritance(
+    command: &mut Command,
+    invocation: &ProcessInvocation,
+) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let fds = invocation
+        .args
+        .iter()
+        .flat_map(|argument| {
+            argument
+                .match_indices("/dev/fd/")
+                .filter_map(move |(offset, _)| {
+                    argument[offset + 8..]
+                        .split(['/', ','])
+                        .next()?
+                        .parse::<i32>()
+                        .ok()
+                })
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    unsafe extern "C" {
+        fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
+    }
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    // Check the retained fd in the parent, but clear CLOEXEC only in the
+    // forked Docker child. Unrelated concurrent children never inherit it.
+    for fd in &fds {
+        if unsafe { fcntl(*fd, F_GETFD, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: pre_exec performs only async-signal-safe fcntl and captures an fd.
+    unsafe {
+        command.pre_exec(move || {
+            for fd in &fds {
+                let flags = fcntl(*fd, F_GETFD, 0);
+                if flags < 0 || fcntl(*fd, F_SETFD, flags & !FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+struct CleanupDeadline(std::time::Instant);
+impl Cancellation for CleanupDeadline {
+    fn is_cancelled(&self) -> bool {
+        std::time::Instant::now() >= self.0
     }
 }
 
@@ -183,6 +249,8 @@ pub struct BuildOptions {
     pub platforms: Vec<Platform>,
     /// Additional non-template build arguments. Reserved adapter arguments cannot be replaced.
     pub build_args: BTreeMap<String, String>,
+    /// Named BuildKit contexts. Values are explicit immutable context descriptors.
+    pub named_contexts: BTreeMap<String, String>,
 }
 
 pub struct BuildRequest<'a> {
@@ -257,6 +325,7 @@ pub enum BuildError {
         stderr: String,
     },
     Interrupted {
+        operation: &'static str,
         stdout: String,
         stderr: String,
     },
@@ -268,6 +337,25 @@ pub enum BuildError {
 }
 
 impl BuildError {
+    /// Whether this build may have exported before failing, including result
+    /// inspection and cleanup after a successful export. Wrapped cleanup errors
+    /// retain the primary failure stage.
+    pub fn may_have_exported(&self) -> bool {
+        match self {
+            Self::Process { operation, .. }
+            | Self::Failed { operation, .. }
+            | Self::Interrupted { operation, .. } => matches!(
+                *operation,
+                "docker buildx build"
+                    | "inspect pushed multi-platform manifest"
+                    | "remove owned Buildx builder"
+            ),
+            Self::Metadata(_) => true,
+            Self::CleanupAfter { primary, .. } => primary.may_have_exported(),
+            Self::InvalidRequest(_) | Self::Capability(_) => false,
+        }
+    }
+
     pub fn exit_code(&self) -> Option<i32> {
         match self {
             Self::Failed { exit_code, .. } => *exit_code,
@@ -347,16 +435,34 @@ impl<E> BuildKit<E> {
 impl<E: ProcessExecutor> BuildKit<E> {
     pub fn build(
         &self,
-        request: BuildRequest<'_>,
+        mut request: BuildRequest<'_>,
         cancellation: &dyn Cancellation,
     ) -> Result<BuiltImage, BuildError> {
         let platforms = validate_request(&request)?;
+        let nonce = if let Builder::Ephemeral { name } = &request.options.builder {
+            self.ensure_builder_name_is_available(name)?;
+            let directory = tempfile::tempdir().map_err(|source| BuildError::Process {
+                operation: "reserve ephemeral builder identity",
+                source,
+            })?;
+            let suffix = directory
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace('.', "");
+            request.options.builder = Builder::Ephemeral {
+                name: format!("{}-{}", &name[..name.len().min(40)], suffix),
+            };
+            Some(directory)
+        } else {
+            None
+        };
         let ephemeral = match &request.options.builder {
             Builder::Ephemeral { name } => Some(name.as_str()),
             Builder::Existing(_) => None,
         };
         if let Some(name) = ephemeral {
-            self.ensure_builder_name_is_available(name)?;
             let create = ProcessInvocation {
                 program: "docker".to_owned(),
                 args: vec![
@@ -369,15 +475,26 @@ impl<E: ProcessExecutor> BuildKit<E> {
                 ],
                 current_dir: None,
             };
-            // Ownership starts only after buildx confirms successful creation. A failed
-            // create can be an already-existing builder race, so deleting by name here
-            // could remove a resource owned by another task.
-            self.run("create Buildx builder", &create, cancellation)?;
+            // The unpredictable per-invocation name makes ambiguous creation ours to
+            // reconcile without touching a caller-selected/shared builder.
+            if let Err(primary) = self.run("create Buildx builder", &create, cancellation) {
+                let conflict = primary
+                    .stderr()
+                    .is_some_and(|text| text.to_ascii_lowercase().contains("already exists"));
+                if !conflict && let Err(cleanup) = self.reconcile_builder_creation(name) {
+                    return Err(BuildError::CleanupAfter {
+                        primary: Box::new(primary),
+                        cleanup: Box::new(cleanup),
+                    });
+                }
+                return Err(primary);
+            }
         }
 
         let primary = self
             .ensure_platform_capabilities(&request.options.builder, &platforms, cancellation)
             .and_then(|()| self.build_inner(&request, &platforms, cancellation));
+        drop(nonce);
         let cleanup = ephemeral.map(|name| self.remove_builder(name));
         match (primary, cleanup) {
             (result, None) | (result, Some(Ok(()))) => result,
@@ -414,7 +531,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
                 digest: digest.clone(),
             }]
         } else {
-            self.inspect_platform_digests(request, platforms, cancellation)?
+            self.inspect_platform_digests(request, &digest, platforms, cancellation)?
         };
         Ok(BuiltImage {
             image: request.image.clone(),
@@ -482,6 +599,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
     fn inspect_platform_digests(
         &self,
         request: &BuildRequest<'_>,
+        pushed_digest: &ImageDigest,
         platforms: &[Platform],
         cancellation: &dyn Cancellation,
     ) -> Result<Vec<PlatformDigest>, BuildError> {
@@ -494,7 +612,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
                         "imagetools".to_owned(),
                         "inspect".to_owned(),
                         "--raw".to_owned(),
-                        request.image.to_string(),
+                        format!("{}@{}", request.image, pushed_digest),
                     ],
                     current_dir: None,
                 };
@@ -513,6 +631,40 @@ impl<E: ProcessExecutor> BuildKit<E> {
         parse_platform_digests(&manifest, platforms)
     }
 
+    fn reconcile_builder_creation(&self, name: &str) -> Result<(), BuildError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let cancellation = CleanupDeadline(deadline);
+        let invocation = ProcessInvocation {
+            program: "docker".into(),
+            args: vec!["buildx".into(), "inspect".into(), name.into()],
+            current_dir: None,
+        };
+        loop {
+            let output = self
+                .executor
+                .execute(&invocation, &cancellation)
+                .map_err(|source| BuildError::Process {
+                    operation: "reconcile owned builder creation",
+                    source,
+                })?;
+            if output.exit_code == Some(0) {
+                return self.remove_builder(name);
+            }
+            if !builder_is_missing(&output.stderr) {
+                return Err(BuildError::Failed {
+                    operation: "reconcile owned builder creation",
+                    exit_code: output.exit_code,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn remove_builder(&self, name: &str) -> Result<(), BuildError> {
         let invocation = ProcessInvocation {
             program: "docker".to_owned(),
@@ -524,7 +676,11 @@ impl<E: ProcessExecutor> BuildKit<E> {
             ],
             current_dir: None,
         };
-        self.run("remove owned Buildx builder", &invocation, &NeverCancelled)
+        self.run(
+            "remove owned Buildx builder",
+            &invocation,
+            &CleanupDeadline(std::time::Instant::now() + Duration::from_secs(30)),
+        )
     }
 
     fn ensure_builder_name_is_available(&self, name: &str) -> Result<(), BuildError> {
@@ -535,13 +691,17 @@ impl<E: ProcessExecutor> BuildKit<E> {
         };
         let output = self
             .executor
-            .execute(&invocation, &NeverCancelled)
+            .execute(
+                &invocation,
+                &CleanupDeadline(std::time::Instant::now() + Duration::from_secs(30)),
+            )
             .map_err(|source| BuildError::Process {
                 operation: "inspect requested Buildx builder name",
                 source,
             })?;
         if output.interrupted {
             return Err(BuildError::Interrupted {
+                operation: "inspect requested Buildx builder name",
                 stdout: output.stdout,
                 stderr: output.stderr,
             });
@@ -569,12 +729,19 @@ impl<E: ProcessExecutor> BuildKit<E> {
         invocation: &ProcessInvocation,
         cancellation: &dyn Cancellation,
     ) -> Result<(), BuildError> {
-        let output = self
-            .executor
-            .execute(invocation, cancellation)
-            .map_err(|source| BuildError::Process { operation, source })?;
+        // Operation names are static, so progress cannot expose credential or
+        // repository arguments. Emit boundaries before buffered child output.
+        eprintln!("BuildKit operation started: {operation}");
+        let started = std::time::Instant::now();
+        let result = self.executor.execute(invocation, cancellation);
+        eprintln!(
+            "BuildKit operation finished: {operation} ({} ms)",
+            started.elapsed().as_millis()
+        );
+        let output = result.map_err(|source| BuildError::Process { operation, source })?;
         if output.interrupted {
             return Err(BuildError::Interrupted {
+                operation,
                 stdout: output.stdout,
                 stderr: output.stderr,
             });
@@ -587,6 +754,12 @@ impl<E: ProcessExecutor> BuildKit<E> {
                 stderr: output.stderr,
             });
         }
+        if !output.stdout.is_empty() {
+            print!("{}", output.stdout);
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", output.stderr);
+        }
         Ok(())
     }
 
@@ -596,12 +769,19 @@ impl<E: ProcessExecutor> BuildKit<E> {
         invocation: &ProcessInvocation,
         cancellation: &dyn Cancellation,
     ) -> Result<ProcessOutput, BuildError> {
-        let output = self
-            .executor
-            .execute(invocation, cancellation)
-            .map_err(|source| BuildError::Process { operation, source })?;
+        // Operation names are static, so progress cannot expose credential or
+        // repository arguments. Emit boundaries before buffered child output.
+        eprintln!("BuildKit operation started: {operation}");
+        let started = std::time::Instant::now();
+        let result = self.executor.execute(invocation, cancellation);
+        eprintln!(
+            "BuildKit operation finished: {operation} ({} ms)",
+            started.elapsed().as_millis()
+        );
+        let output = result.map_err(|source| BuildError::Process { operation, source })?;
         if output.interrupted {
             return Err(BuildError::Interrupted {
+                operation,
                 stdout: output.stdout,
                 stderr: output.stderr,
             });
@@ -637,6 +817,19 @@ fn validate_request(request: &BuildRequest<'_>) -> Result<Vec<Platform>, BuildEr
         if name.trim().is_empty() || value.contains('\0') {
             return Err(BuildError::InvalidRequest(format!(
                 "invalid build argument `{name}`"
+            )));
+        }
+    }
+    for (name, value) in &options.named_contexts {
+        if name.trim().is_empty()
+            || name
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b'=')
+            || value.trim().is_empty()
+            || value.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(BuildError::InvalidRequest(format!(
+                "invalid named build context `{name}`"
             )));
         }
     }
@@ -701,6 +894,8 @@ fn build_invocation(
         join_platforms(platforms),
         "--progress".to_owned(),
         request.options.progress.as_str().to_owned(),
+        "--provenance".to_owned(),
+        "false".to_owned(),
         "--metadata-file".to_owned(),
         metadata_path.to_string_lossy().into_owned(),
         "--tag".to_owned(),
@@ -709,18 +904,29 @@ fn build_invocation(
         request.target.as_str().to_owned(),
     ]);
     match &request.options.output {
-        ImageOutput::Load => args.push("--load".to_owned()),
-        ImageOutput::Push => args.push("--push".to_owned()),
+        ImageOutput::Load => push_pair(
+            &mut args,
+            "--output",
+            "type=docker,oci-mediatypes=true".into(),
+        ),
+        ImageOutput::Push => push_pair(
+            &mut args,
+            "--output",
+            "type=registry,oci-mediatypes=true".into(),
+        ),
         ImageOutput::OciDirectory(path) => {
             push_pair(
                 &mut args,
                 "--output",
-                format!("type=oci,dest={},tar=false", path.to_string_lossy()),
+                format!(
+                    "type=oci,dest={},tar=false,oci-mediatypes=true",
+                    path.to_string_lossy()
+                ),
             );
         }
     }
 
-    let reserved = build_arguments(request.plan, platforms)?;
+    let reserved = build_arguments(request.plan)?;
     let reserved_names = reserved.keys().cloned().collect::<BTreeSet<_>>();
     for (name, value) in reserved
         .into_iter()
@@ -747,6 +953,9 @@ fn build_invocation(
     }
     for cache in &request.options.cache.exports {
         push_pair(&mut args, "--cache-to", cache.clone());
+    }
+    for (name, value) in &request.options.named_contexts {
+        push_pair(&mut args, "--build-context", format!("{name}={value}"));
     }
     args.push(context.to_string_lossy().into_owned());
     Ok(ProcessInvocation {
@@ -926,10 +1135,7 @@ fn finish_platform_digests(
         .collect())
 }
 
-fn build_arguments(
-    plan: &TemplatePlan,
-    platforms: &[Platform],
-) -> Result<BTreeMap<String, String>, BuildError> {
+fn build_arguments(plan: &TemplatePlan) -> Result<BTreeMap<String, String>, BuildError> {
     let mut arguments = BTreeMap::from([
         ("BASE_IMAGE".to_owned(), plan.base_image.clone()),
         (
@@ -940,10 +1146,7 @@ fn build_arguments(
             "REPO_SANDBOX_TEMPLATE_VERSION".to_owned(),
             plan.template_version.clone(),
         ),
-        (
-            "REPO_SANDBOX_PLAN_DIGEST".to_owned(),
-            plan_digest_for_platforms(plan, platforms),
-        ),
+        ("REPO_SANDBOX_PLAN_DIGEST".to_owned(), plan_digest(plan)),
     ]);
     for (name, value) in &plan.parameters {
         let name = parameter_argument_name(name)?;
@@ -981,34 +1184,12 @@ fn parameter_argument_name(name: &str) -> Result<String, BuildError> {
 
 /// Stable fingerprint used by the Dockerfile so plan changes invalidate image configuration.
 pub fn plan_digest(plan: &TemplatePlan) -> String {
-    plan_digest_for_platforms(plan, &[plan.platform])
-}
-
-fn plan_digest_for_platforms(plan: &TemplatePlan, platforms: &[Platform]) -> String {
     let mut hasher = Sha256::new();
-    for value in [
-        plan.template_id.as_str(),
-        plan.template_version.as_str(),
-        plan.base_image.as_str(),
-        &plan.build_context.to_string_lossy(),
-    ] {
-        hash_field(&mut hasher, value);
-    }
-    for platform in platforms {
-        hash_field(&mut hasher, platform.as_str());
-    }
-    for (name, value) in &plan.parameters {
-        hash_field(&mut hasher, name);
-        hash_field(&mut hasher, value);
-    }
-    for stage in &plan.stages {
-        hash_field(&mut hasher, &stage.id);
-        hash_field(&mut hasher, &stage.version);
-        hash_field(&mut hasher, &stage.build_context.to_string_lossy());
-        for dependency in &stage.depends_on {
-            hash_field(&mut hasher, dependency);
-        }
-    }
+    hash_field(&mut hasher, "repo-sandbox-template-plan-v2");
+    hash_field(
+        &mut hasher,
+        &serde_json::to_string(plan).expect("template plan is serializable"),
+    );
     format!("sha256:{:x}", hasher.finalize())
 }
 
@@ -1051,6 +1232,41 @@ mod tests {
     use repo_sandbox_core::config::Platform;
     use repo_sandbox_core::template::PlanStage;
     use std::sync::Mutex;
+
+    struct ImmediatelyCancelled;
+
+    impl Cancellation for ImmediatelyCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn system_executor_bounds_descendants_that_inherit_output_pipes() {
+        #[cfg(unix)]
+        let invocation = ProcessInvocation {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 30 & wait".into()],
+            current_dir: None,
+        };
+        #[cfg(windows)]
+        let invocation = ProcessInvocation {
+            program: "cmd".into(),
+            args: vec![
+                "/d".into(),
+                "/s".into(),
+                "/c".into(),
+                "start \"\" /b cmd /d /s /c \"ping -n 30 127.0.0.1 >NUL\"".into(),
+            ],
+            current_dir: None,
+        };
+        let started = std::time::Instant::now();
+        let output = SystemProcessExecutor
+            .execute(&invocation, &ImmediatelyCancelled)
+            .unwrap();
+        assert!(output.interrupted);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -1203,6 +1419,7 @@ mod tests {
                 build_context: PathBuf::from("templates/components/base-tools/context"),
                 depends_on: Vec::new(),
             }],
+            execution: Default::default(),
         }
     }
 
@@ -1222,6 +1439,192 @@ mod tests {
 
     fn amd64_adapter(executor: &FakeExecutor) -> BuildKit<&FakeExecutor> {
         BuildKit::new(executor).with_native_platform(Platform::LinuxAmd64)
+    }
+
+    #[test]
+    fn cleanup_failure_after_successful_export_keeps_reconciliation_eligible() {
+        struct CleanupFailure;
+        impl ProcessExecutor for CleanupFailure {
+            fn execute(
+                &self,
+                invocation: &ProcessInvocation,
+                _: &dyn Cancellation,
+            ) -> io::Result<ProcessOutput> {
+                let mut output = ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    interrupted: false,
+                };
+                match invocation.args[1].as_str() {
+                    "inspect" => {
+                        output.exit_code = Some(1);
+                        output.stderr = "ERROR: no builder found".into();
+                    }
+                    "create" => {}
+                    "build" => {
+                        fs::write(
+                            value_after(&invocation.args, "--metadata-file"),
+                            format!(r#"{{"containerimage.digest":"{DIGEST}"}}"#),
+                        )?;
+                    }
+                    "rm" => {
+                        output.exit_code = Some(1);
+                        output.stderr = "builder cleanup failed".into();
+                    }
+                    operation => panic!("unexpected operation {operation}"),
+                }
+                Ok(output)
+            }
+        }
+        let template = plan();
+        let error = BuildKit::new(CleanupFailure)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(
+                request(
+                    &template,
+                    BuildOptions {
+                        output: ImageOutput::Push,
+                        builder: Builder::Ephemeral {
+                            name: "cleanup-proof".into(),
+                        },
+                        ..Default::default()
+                    },
+                ),
+                &NeverCancelled,
+            )
+            .unwrap_err();
+        assert!(error.may_have_exported());
+        let before_export = BuildError::CleanupAfter {
+            primary: Box::new(BuildError::Capability("builder lacks platform".into())),
+            cleanup: Box::new(error),
+        };
+        assert!(
+            !before_export.may_have_exported(),
+            "failed cleanup must not override the primary pre-export failure"
+        );
+    }
+
+    #[test]
+    fn export_reconciliation_is_gated_by_the_failed_execution_stage() {
+        #[derive(Clone, Copy, Debug)]
+        enum FailureStage {
+            Capability,
+            BuildInterrupted,
+            BuildResponseLost,
+            Metadata,
+            ManifestInspection,
+        }
+        struct StageExecutor(FailureStage, Mutex<Vec<ProcessInvocation>>);
+        impl ProcessExecutor for StageExecutor {
+            fn execute(
+                &self,
+                invocation: &ProcessInvocation,
+                _: &dyn Cancellation,
+            ) -> io::Result<ProcessOutput> {
+                self.1.lock().unwrap().push(invocation.clone());
+                let mut output = ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    interrupted: false,
+                };
+                if invocation.args.iter().any(|arg| arg == "--bootstrap") {
+                    if matches!(self.0, FailureStage::Capability) {
+                        output.exit_code = None;
+                        output.interrupted = true;
+                    } else {
+                        output.stdout = "Platforms: linux/amd64, linux/arm64".into();
+                    }
+                } else if invocation
+                    .args
+                    .get(1)
+                    .is_some_and(|operation| operation == "build")
+                {
+                    match self.0 {
+                        FailureStage::BuildInterrupted => {
+                            output.exit_code = None;
+                            output.interrupted = true;
+                        }
+                        FailureStage::BuildResponseLost => {
+                            return Err(io::Error::other("lost response after possible export"));
+                        }
+                        FailureStage::Metadata => {}
+                        FailureStage::ManifestInspection => {
+                            fs::write(
+                                value_after(&invocation.args, "--metadata-file"),
+                                format!(r#"{{"containerimage.digest":"{DIGEST}"}}"#),
+                            )?;
+                        }
+                        FailureStage::Capability => {
+                            panic!("capability failure must not reach the build")
+                        }
+                    }
+                } else {
+                    assert!(matches!(self.0, FailureStage::ManifestInspection));
+                    output.exit_code = Some(1);
+                    output.stderr = "registry inspection unavailable".into();
+                }
+                Ok(output)
+            }
+        }
+        for stage in [
+            FailureStage::Capability,
+            FailureStage::BuildInterrupted,
+            FailureStage::BuildResponseLost,
+            FailureStage::Metadata,
+            FailureStage::ManifestInspection,
+        ] {
+            let executor = StageExecutor(stage, Mutex::new(Vec::new()));
+            let plan = plan();
+            let error = BuildKit::new(&executor)
+                .with_native_platform(Platform::LinuxAmd64)
+                .build(
+                    request(
+                        &plan,
+                        BuildOptions {
+                            output: ImageOutput::Push,
+                            platforms: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
+                            ..Default::default()
+                        },
+                    ),
+                    &NeverCancelled,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.may_have_exported(),
+                !matches!(stage, FailureStage::Capability),
+                "stage={stage:?}: {error}"
+            );
+            if matches!(stage, FailureStage::Capability) {
+                assert_eq!(executor.1.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn every_exporter_preserves_the_same_oci_manifest_media_types() {
+        let plan = plan();
+        for output in [
+            ImageOutput::Load,
+            ImageOutput::Push,
+            ImageOutput::OciDirectory(PathBuf::from("layout")),
+        ] {
+            let request = request(
+                &plan,
+                BuildOptions {
+                    output,
+                    ..Default::default()
+                },
+            );
+            let invocation = build_invocation(
+                &request,
+                &[Platform::LinuxAmd64],
+                Path::new("metadata.json"),
+            )
+            .unwrap();
+            assert!(value_after(&invocation.args, "--output").ends_with("oci-mediatypes=true"));
+        }
     }
 
     #[test]
@@ -1264,8 +1667,13 @@ mod tests {
     fn central_dockerfile_confines_assembly_inputs_to_named_stages() {
         let dockerfile = include_str!("../../../templates/rust-bazel/context/Dockerfile");
         let toolchain = dockerfile.find(" AS toolchain-build").unwrap();
-        let environment = dockerfile.find(" AS environment").unwrap();
+        let environment_base = dockerfile.find(" AS environment-base").unwrap();
+        let offline_seed = dockerfile.find(" AS offline-seed").unwrap();
+        let environment = dockerfile.rfind(" AS environment").unwrap();
         assert!(toolchain < environment);
+        assert!(toolchain < environment_base);
+        assert!(environment_base < offline_seed);
+        assert!(offline_seed < environment);
         assert!(dockerfile.contains("COPY --from=toolchain-build /usr/local/cargo/"));
         assert!(dockerfile.contains("COPY --from=toolchain-build /usr/local/rustup/"));
         assert!(dockerfile.contains("COPY --from=toolchain-build /toolchain/bin/bazel"));
@@ -1275,7 +1683,6 @@ mod tests {
             "repo-sandbox-apt-",
             "repo-sandbox-cargo-registry-",
             "repo-sandbox-cargo-git-",
-            "repo-sandbox-bazel-",
             "repo-sandbox-toolchain-downloads-",
         ] {
             assert!(dockerfile.contains(cache), "missing cache mount {cache}");
@@ -1286,9 +1693,9 @@ mod tests {
                 .contains("apt-get install --yes --no-install-recommends ca-certificates curl")
         );
         assert!(!final_stage.contains("/run/secrets/github_token"));
-        assert!(final_stage.contains("target=/root/.cache/bazel"));
-        assert!(final_stage.contains("rustup default \"$RUST_VERSION\""));
-        assert!(final_stage.contains("rustup which --toolchain \"$RUST_VERSION\" rustc"));
+        assert!(final_stage.contains("/var/cache/repo-sandbox/bazel/cache/repos/"));
+        assert!(final_stage.contains("/usr/local/share/repo-sandbox/offline-baseline"));
+        assert!(final_stage.contains("/usr/local/libexec/repo-sandbox/bazel-9.2.0"));
         assert!(!final_stage.contains("/toolchain-downloads"));
         assert!(!final_stage.contains("BAZELISK_HOME="));
 
@@ -1454,13 +1861,66 @@ mod tests {
             value_after(&build.args, "--platform"),
             "linux/amd64,linux/arm64"
         );
-        assert!(build.args.contains(&"--push".to_owned()));
+        assert_eq!(
+            value_after(&build.args, "--output"),
+            "type=registry,oci-mediatypes=true"
+        );
         assert!(invocations.iter().any(|call| call.args.starts_with(&[
             "buildx".to_owned(),
             "imagetools".to_owned(),
             "inspect".to_owned(),
             "--raw".to_owned()
         ])));
+        let inspect = invocations
+            .iter()
+            .find(|call| call.args.get(2).map(String::as_str) == Some("inspect"))
+            .unwrap();
+        assert_eq!(
+            inspect.args.last().unwrap(),
+            &format!(
+                "registry.test/repo-sandbox/rust-bazel:test@sha256:{}",
+                "a".repeat(64)
+            )
+        );
+    }
+
+    #[test]
+    fn plan_digest_build_arg_is_identical_for_single_and_multi_platform_invocations() {
+        let executor = FakeExecutor::new(BuildBehavior::Success);
+        let plan = plan();
+        let adapter = amd64_adapter(&executor);
+        adapter
+            .build(request(&plan, BuildOptions::default()), &NeverCancelled)
+            .unwrap();
+        adapter
+            .build(
+                request(
+                    &plan,
+                    BuildOptions {
+                        output: ImageOutput::Push,
+                        platforms: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
+                        ..BuildOptions::default()
+                    },
+                ),
+                &NeverCancelled,
+            )
+            .unwrap();
+        let builds = executor
+            .invocations()
+            .into_iter()
+            .filter(|call| call.args.get(1).map(String::as_str) == Some("build"))
+            .collect::<Vec<_>>();
+        let digest = |invocation: &ProcessInvocation| {
+            invocation
+                .args
+                .windows(2)
+                .find(|pair| {
+                    pair[0] == "--build-arg" && pair[1].starts_with("REPO_SANDBOX_PLAN_DIGEST=")
+                })
+                .unwrap()[1]
+                .clone()
+        };
+        assert_eq!(digest(&builds[0]), digest(&builds[1]));
     }
 
     #[test]
@@ -1588,10 +2048,8 @@ mod tests {
         assert!(matches!(error, BuildError::Interrupted { .. }));
         let invocations = executor.invocations();
         assert_eq!(invocations.len(), 4);
-        assert_eq!(
-            invocations[3].args,
-            ["buildx", "rm", "--force", "repo-sandbox-task-7"]
-        );
+        assert_eq!(&invocations[3].args[..3], ["buildx", "rm", "--force"]);
+        assert!(invocations[3].args[3].starts_with("repo-sandbox-task-7-"));
         assert!(
             invocations
                 .iter()
@@ -1624,6 +2082,65 @@ mod tests {
             value_after(&invocations[0].args, "--builder"),
             "shared-builder"
         );
+    }
+
+    #[test]
+    fn interrupted_builder_creation_reconciles_the_unique_owned_name() {
+        struct Executor(Mutex<Vec<ProcessInvocation>>);
+        impl ProcessExecutor for Executor {
+            fn execute(
+                &self,
+                invocation: &ProcessInvocation,
+                cancellation: &dyn Cancellation,
+            ) -> io::Result<ProcessOutput> {
+                let mut calls = self.0.lock().unwrap();
+                calls.push(invocation.clone());
+                let mut output = ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    interrupted: false,
+                };
+                match calls.len() {
+                    1 => {
+                        output.exit_code = Some(1);
+                        output.stderr = "ERROR: no builder found".into();
+                    }
+                    2 => {
+                        output.exit_code = None;
+                        output.interrupted = true;
+                    }
+                    _ => {
+                        assert!(!cancellation.is_cancelled());
+                    }
+                }
+                Ok(output)
+            }
+        }
+        let executor = Executor(Mutex::new(Vec::new()));
+        let template = plan();
+        let error = BuildKit::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(
+                request(
+                    &template,
+                    BuildOptions {
+                        builder: Builder::Ephemeral {
+                            name: "requested".into(),
+                        },
+                        ..Default::default()
+                    },
+                ),
+                &NeverCancelled,
+            )
+            .unwrap_err();
+        assert!(matches!(error, BuildError::Interrupted { .. }));
+        let calls = executor.0.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        let created = value_after(&calls[1].args, "--name");
+        assert!(created.starts_with("requested-"));
+        assert_eq!(calls[2].args.last().unwrap(), created);
+        assert_eq!(calls[3].args.last().unwrap(), created);
     }
 
     #[test]
@@ -1709,10 +2226,8 @@ mod tests {
         assert_eq!(error.exit_code(), Some(42));
         let invocations = executor.invocations();
         assert_eq!(invocations.len(), 4);
-        assert_eq!(
-            invocations[3].args,
-            ["buildx", "rm", "--force", "repo-sandbox-task-8"]
-        );
+        assert_eq!(&invocations[3].args[..3], ["buildx", "rm", "--force"]);
+        assert!(invocations[3].args[3].starts_with("repo-sandbox-task-8-"));
     }
 
     /// Optional host integration check; unit and CI suites never require Docker.
