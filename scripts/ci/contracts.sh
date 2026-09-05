@@ -162,6 +162,7 @@ grep -Fq '/usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock' \
   "$root/tests/multistage/Dockerfile.single-stage"
 grep -Fq 'rm -rf /tmp/repo-sandbox-bazel-check' "$environment_dockerfile"
 bash "$root/scripts/e2e/docker-scenario.sh" --self-test-task-id
+bash "$root/scripts/docker/multistage-acceptance.sh" --self-test-cache-assertions
 grep -A5 -F 'name = "e2e_matrix_test"' "$adapters_build" | grep -Fq 'srcs = ["e2e/e2e_matrix.rs"]'
 grep -Fq 'bazelisk test --action_env=PATH //...' "$ci"
 grep -Fq -- '- name: Release Bazel target selection' "$ci"

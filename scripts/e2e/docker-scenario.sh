@@ -706,7 +706,7 @@ EOF
           expected_step_status=resource_exceeded
           ;;
         architecture)
-          expected_exit=3; expected_status=infrastructure_failed; expected_phase=environment
+          expected_exit=3; expected_status=infrastructure_failed; expected_phase=runner
           expected_step_status=
           expected_cleanup=not_needed
           ;;
@@ -722,7 +722,17 @@ EOF
       if [[ -n $expected_step_status ]]; then
         assert_step "$report" test "acceptance-$profile" "$expected_step_status"
       fi
-      if [[ $profile == memory ]]; then
+      if [[ $profile == architecture ]]; then
+        python3 - "$report" <<'PYARCHITECTURE'
+import json, sys
+with open(sys.argv[1]) as source:
+    report = json.load(source)
+assert report["status"]["operation"] == "validate runner platform"
+assert "expected linux/arm64, inspected linux/amd64" in report["status"]["message"]
+assert report["container_id"] is None
+assert not report["steps"]
+PYARCHITECTURE
+      elif [[ $profile == memory ]]; then
         grep -Fq '"limit": "memory"' "$report"
       elif [[ $profile == temporary-storage ]]; then
         grep -Fq '"limit": "temporary_storage"' "$report"

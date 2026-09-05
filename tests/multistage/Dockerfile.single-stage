@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1.7
-# This is the checked-in pre-change central template plus the same task source.
+# This retains the pre-change single-stage assembly plus the same task source.
 # It keeps exactly the same Rust, Cargo, C compiler, Git, CA and Bazel behavior;
-# its extra contents are the natural consequence of single-stage inheritance.
+# both images seed the same Rust/C++ dependency closure. Its extra contents
+# are the natural consequence of single-stage inheritance.
 ARG BASE_IMAGE=docker.io/library/rust:1.97.0-bookworm
 FROM ${BASE_IMAGE} AS task
 ARG TARGETARCH
@@ -27,21 +28,51 @@ COPY offline-baseline/ /opt/repo-sandbox/offline-baseline/
 RUN set -eu; \
     cd /opt/repo-sandbox/offline-baseline; \
     cp BUILD.seed BUILD.bazel; \
-    mkdir -p /var/cache/repo-sandbox/bazel /usr/local/share/repo-sandbox/offline-baseline; \
+    cp MODULE.bazel MODULE.cpp; \
+    cp MODULE.bazel.lock MODULE.cpp.lock; \
+    mkdir -p apps/cli/src crates/core/src crates/adapters/src crates/adapters/e2e; \
+    for source in apps/cli/src/lib.rs apps/cli/src/main.rs crates/core/src/lib.rs crates/adapters/src/lib.rs crates/adapters/e2e/e2e_matrix.rs; do \
+      printf 'fn main() {}\n' > "$source"; \
+    done; \
+    mkdir -p /var/cache/repo-sandbox/bazel; \
     cp MODULE.bazel.lock /tmp/repo-sandbox-baseline.lock; \
     bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel mod graph >/dev/null; \
-    sed -n '/^  "registryFileHashes": {$/,/^  },$/p' \
-      /tmp/repo-sandbox-baseline.lock >/tmp/repo-sandbox-expected-hashes; \
-    sed -n '/^  "registryFileHashes": {$/,/^  },$/p' \
-      MODULE.bazel.lock >/tmp/repo-sandbox-actual-hashes; \
+    sed -n '/^  "registryFileHashes": {$/,/^  },$/p' /tmp/repo-sandbox-baseline.lock > /tmp/repo-sandbox-expected-hashes; \
+    sed -n '/^  "registryFileHashes": {$/,/^  },$/p' MODULE.bazel.lock > /tmp/repo-sandbox-actual-hashes; \
     test -s /tmp/repo-sandbox-expected-hashes; \
     cmp /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes; \
     bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel test //...; \
-    cp MODULE.bazel.lock /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock; \
+    cp MODULE.rust MODULE.bazel; \
+    cp MODULE.rust.lock MODULE.bazel.lock; \
+    cp BUILD.rust.seed BUILD.bazel; \
+    bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel fetch @crates//... //:rust_dependencies_full; \
+    bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel test //...; \
+    if [ "$TARGETARCH" = amd64 ]; then bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel test //:rust_dependencies_full; fi; \
+    rm /tmp/repo-sandbox-baseline.lock /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes; \
+    find /var/cache/repo-sandbox/bazel -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
+    find /var/cache/repo-sandbox/bazel/cache -mindepth 1 -maxdepth 1 ! -name repos -exec rm -rf '{}' +
+
+# Prove that the repository CAS alone is sufficient after discarding the seed's
+# installed toolchains, extracted repositories and action outputs. All target
+# architectures re-fetch the full closure offline and compile Rust/C++ smoke
+# tests. amd64 additionally compiles every workspace dependency; avoid repeating
+# that expensive compilation under arm64 QEMU emulation.
+RUN --network=none set -eu; \
+    cd /opt/repo-sandbox/offline-baseline; \
+    bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel fetch @crates//... //:rust_dependencies_full --repository_disable_download; \
+    bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel test //... --repository_disable_download; \
+    if [ "$TARGETARCH" = amd64 ]; then bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel test //:rust_dependencies_full --repository_disable_download; fi; \
     find /var/cache/repo-sandbox/bazel -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
     find /var/cache/repo-sandbox/bazel/cache -mindepth 1 -maxdepth 1 ! -name repos -exec rm -rf '{}' +; \
-    rm -rf /opt/repo-sandbox /tmp/repo-sandbox-baseline.lock \
-      /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes
+    cp MODULE.cpp MODULE.bazel; \
+    cp MODULE.cpp.lock MODULE.bazel.lock; \
+    cp BUILD.seed BUILD.bazel; \
+    bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel test //... --repository_disable_download; \
+    find /var/cache/repo-sandbox/bazel -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
+    find /var/cache/repo-sandbox/bazel/cache -mindepth 1 -maxdepth 1 ! -name repos -exec rm -rf '{}' +; \
+    mkdir -p /usr/local/share/repo-sandbox/offline-baseline; \
+    cp MODULE.cpp.lock /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock; \
+    rm -rf /opt/repo-sandbox
 COPY bazel /tmp/repo-sandbox-bazel-wrapper
 RUN set -eu; \
     mkdir -p /usr/local/libexec/repo-sandbox; \

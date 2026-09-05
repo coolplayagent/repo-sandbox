@@ -1,6 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+assert_cached_step() {
+  local log=$1
+  local description=$2
+  # Vertex numbering changes when a Dockerfile gains a stage instruction.
+  # Match its stage/operation and require every matching vertex to be cached.
+  awk -v description="$description" '
+    function stable(text) {
+      gsub(/ [0-9]+\/[0-9]+\]/, "]", text)
+      return text
+    }
+    index(stable($0), stable(description)) { expected[$1]=1 }
+    $2 == "CACHED" { cached[$1]=1 }
+    END {
+      count=0
+      for (step in expected) {
+        count++
+        if (!cached[step]) exit 1
+      }
+      exit count == 0
+    }
+  ' "$log"
+}
+
+if [[ ${1-} == --self-test-cache-assertions ]]; then
+  cache_fixture=$(mktemp)
+  trap 'rm -f "$cache_fixture"' EXIT
+  printf '%s\n' '#17 [offline-seed 2/3] RUN online-seed' '#17 CACHED' \
+    '#19 [offline-seed 3/3] RUN offline-verify' '#19 CACHED' >"$cache_fixture"
+  assert_cached_step "$cache_fixture" '[offline-seed 2/2] RUN'
+  ! assert_cached_step "$cache_fixture" '[environment 1/4] COPY'
+  printf '%s\n' '#17 [offline-seed 2/3] RUN online-seed' '#17 CACHED' \
+    '#19 [offline-seed 3/3] RUN offline-verify' '#19 DONE 0.1s' >"$cache_fixture"
+  ! assert_cached_step "$cache_fixture" '[offline-seed 2/2] RUN'
+  exit 0
+fi
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 temporary=$(mktemp -d)
 run_id="issue1-$$"
@@ -43,15 +79,6 @@ cp "$repo_root/templates/rust-bazel/context/bazel" "$temporary/context/bazel"
 cp "$temporary/context/source/src/main.rs" "$temporary/main.rs.original"
 printf '%s\n' 'issue1-secret-marker-must-not-leak' >"$temporary/github-token"
 
-assert_cached_step() {
-  local log=$1
-  local description=$2
-  awk -v description="$description" '
-    index($0, description) { step=$1 }
-    step != "" && $1 == step && $2 == "CACHED" { hit=1 }
-    END { exit !hit }
-  ' "$log"
-}
 
 printf '%-8s %15s %15s %15s %10s\n' platform compressed_single compressed_multi unpacked_multi reduction
 for architecture in amd64 arm64; do

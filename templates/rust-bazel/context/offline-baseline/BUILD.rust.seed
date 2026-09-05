@@ -2,13 +2,23 @@ load("@rules_rust//rust:defs.bzl", "rust_test")
 
 exports_files(["Cargo.toml", "Cargo.lock"])
 rust_test(
-    name = "rust_dependencies",
+    name = "rust_dependencies_full",
+    tags = ["manual"],
     srcs = ["rust_test.rs"],
     edition = "2024",
     deps = ["@crates//:" + name for name in [
         "clap", "ctrlc", "serde", "serde_json", "serde_path_to_error",
         "serde_yaml", "sha2", "tempfile", "tracing-subscriber",
     ]],
+)
+
+# Exercise the actual Rust toolchain without compiling the complete application
+# dependency graph under CPU emulation. The full target is fetched on all targets
+# and compiled explicitly on amd64.
+rust_test(
+    name = "rust_toolchain",
+    srcs = ["rust_test.rs"],
+    edition = "2024",
 )
 
 genrule(name = "build_ok", outs = ["built.txt"], cmd = "echo built > $@")

@@ -28,8 +28,12 @@ fixed Bazel, and optional Bazelisk executables across an explicit
 `genrule` plus `cc_test` baseline and a separate Rust workspace fixture with
 its pinned crate-universe closure. Neither graph has access to repository
 source or the optional GitHub token. A `RUN --network=none` instruction
-rebuilds both graphs separately after expanded repositories and action caches
-are removed. The final `environment` copies only the
+re-fetches the full Rust dependency closure and builds real Rust/C++ smoke tests
+after expanded repositories and action caches are removed. On amd64 it also
+compiles and tests the fixture linked against all workspace dependencies; arm64
+avoids repeating that heavy compilation under QEMU. The arm64 check proves
+offline archive recovery and toolchain execution, not compilation of every
+application dependency. The final `environment` copies only the
 resulting content-addressed Bazel repository closure. The actual Bazel binary is pinned by
 the trusted central template to Bazel 8.3.1, so repositories cannot override
 `bazel_version` or `bazelisk_version`, and the normal `bazel` command does not

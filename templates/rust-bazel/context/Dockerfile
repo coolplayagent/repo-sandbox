@@ -107,17 +107,23 @@ RUN set -eu; \
     cp MODULE.rust MODULE.bazel; \
     cp MODULE.rust.lock MODULE.bazel.lock; \
     cp BUILD.rust.seed BUILD.bazel; \
-    bazel --batch --output_user_root=/toolchain/bazel-seed fetch @crates//...; \
+    bazel --batch --output_user_root=/toolchain/bazel-seed fetch @crates//... //:rust_dependencies_full; \
     bazel --batch --output_user_root=/toolchain/bazel-seed test //...; \
+    if [ "$TARGETARCH" = amd64 ]; then bazel --batch --output_user_root=/toolchain/bazel-seed test //:rust_dependencies_full; fi; \
     rm /tmp/repo-sandbox-baseline.lock /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes; \
     find /toolchain/bazel-seed -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
     find /toolchain/bazel-seed/cache -mindepth 1 -maxdepth 1 ! -name repos -exec rm -rf '{}' +
 
 # Prove that the repository CAS alone is sufficient after discarding the seed's
-# installed toolchains, extracted repositories and action outputs.
+# installed toolchains, extracted repositories and action outputs. All target
+# architectures re-fetch the full closure offline and compile Rust/C++ smoke
+# tests. amd64 additionally compiles every workspace dependency; avoid repeating
+# that expensive compilation under arm64 QEMU emulation.
 RUN --network=none set -eu; \
     cd /opt/repo-sandbox/offline-baseline; \
+    bazel --batch --output_user_root=/toolchain/bazel-seed fetch @crates//... //:rust_dependencies_full --repository_disable_download; \
     bazel --batch --output_user_root=/toolchain/bazel-seed test //... --repository_disable_download; \
+    if [ "$TARGETARCH" = amd64 ]; then bazel --batch --output_user_root=/toolchain/bazel-seed test //:rust_dependencies_full --repository_disable_download; fi; \
     find /toolchain/bazel-seed -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
     find /toolchain/bazel-seed/cache -mindepth 1 -maxdepth 1 ! -name repos -exec rm -rf '{}' +; \
     cp MODULE.cpp MODULE.bazel; \
