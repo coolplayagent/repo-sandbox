@@ -325,6 +325,7 @@ pub enum BuildError {
         stderr: String,
     },
     Interrupted {
+        operation: &'static str,
         stdout: String,
         stderr: String,
     },
@@ -336,6 +337,25 @@ pub enum BuildError {
 }
 
 impl BuildError {
+    /// Whether this build may have exported before failing, including result
+    /// inspection and cleanup after a successful export. Wrapped cleanup errors
+    /// retain the primary failure stage.
+    pub fn may_have_exported(&self) -> bool {
+        match self {
+            Self::Process { operation, .. }
+            | Self::Failed { operation, .. }
+            | Self::Interrupted { operation, .. } => matches!(
+                *operation,
+                "docker buildx build"
+                    | "inspect pushed multi-platform manifest"
+                    | "remove owned Buildx builder"
+            ),
+            Self::Metadata(_) => true,
+            Self::CleanupAfter { primary, .. } => primary.may_have_exported(),
+            Self::InvalidRequest(_) | Self::Capability(_) => false,
+        }
+    }
+
     pub fn exit_code(&self) -> Option<i32> {
         match self {
             Self::Failed { exit_code, .. } => *exit_code,
@@ -681,6 +701,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
             })?;
         if output.interrupted {
             return Err(BuildError::Interrupted {
+                operation: "inspect requested Buildx builder name",
                 stdout: output.stdout,
                 stderr: output.stderr,
             });
@@ -714,6 +735,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
             .map_err(|source| BuildError::Process { operation, source })?;
         if output.interrupted {
             return Err(BuildError::Interrupted {
+                operation,
                 stdout: output.stdout,
                 stderr: output.stderr,
             });
@@ -747,6 +769,7 @@ impl<E: ProcessExecutor> BuildKit<E> {
             .map_err(|source| BuildError::Process { operation, source })?;
         if output.interrupted {
             return Err(BuildError::Interrupted {
+                operation,
                 stdout: output.stdout,
                 stderr: output.stderr,
             });
@@ -1404,6 +1427,167 @@ mod tests {
 
     fn amd64_adapter(executor: &FakeExecutor) -> BuildKit<&FakeExecutor> {
         BuildKit::new(executor).with_native_platform(Platform::LinuxAmd64)
+    }
+
+    #[test]
+    fn cleanup_failure_after_successful_export_keeps_reconciliation_eligible() {
+        struct CleanupFailure;
+        impl ProcessExecutor for CleanupFailure {
+            fn execute(
+                &self,
+                invocation: &ProcessInvocation,
+                _: &dyn Cancellation,
+            ) -> io::Result<ProcessOutput> {
+                let mut output = ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    interrupted: false,
+                };
+                match invocation.args[1].as_str() {
+                    "inspect" => {
+                        output.exit_code = Some(1);
+                        output.stderr = "ERROR: no builder found".into();
+                    }
+                    "create" => {}
+                    "build" => {
+                        fs::write(
+                            value_after(&invocation.args, "--metadata-file"),
+                            format!(r#"{{"containerimage.digest":"{DIGEST}"}}"#),
+                        )?;
+                    }
+                    "rm" => {
+                        output.exit_code = Some(1);
+                        output.stderr = "builder cleanup failed".into();
+                    }
+                    operation => panic!("unexpected operation {operation}"),
+                }
+                Ok(output)
+            }
+        }
+        let template = plan();
+        let error = BuildKit::new(CleanupFailure)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(
+                request(
+                    &template,
+                    BuildOptions {
+                        output: ImageOutput::Push,
+                        builder: Builder::Ephemeral {
+                            name: "cleanup-proof".into(),
+                        },
+                        ..Default::default()
+                    },
+                ),
+                &NeverCancelled,
+            )
+            .unwrap_err();
+        assert!(error.may_have_exported());
+        let before_export = BuildError::CleanupAfter {
+            primary: Box::new(BuildError::Capability("builder lacks platform".into())),
+            cleanup: Box::new(error),
+        };
+        assert!(
+            !before_export.may_have_exported(),
+            "failed cleanup must not override the primary pre-export failure"
+        );
+    }
+
+    #[test]
+    fn export_reconciliation_is_gated_by_the_failed_execution_stage() {
+        #[derive(Clone, Copy, Debug)]
+        enum FailureStage {
+            Capability,
+            BuildInterrupted,
+            BuildResponseLost,
+            Metadata,
+            ManifestInspection,
+        }
+        struct StageExecutor(FailureStage, Mutex<Vec<ProcessInvocation>>);
+        impl ProcessExecutor for StageExecutor {
+            fn execute(
+                &self,
+                invocation: &ProcessInvocation,
+                _: &dyn Cancellation,
+            ) -> io::Result<ProcessOutput> {
+                self.1.lock().unwrap().push(invocation.clone());
+                let mut output = ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    interrupted: false,
+                };
+                if invocation.args.iter().any(|arg| arg == "--bootstrap") {
+                    if matches!(self.0, FailureStage::Capability) {
+                        output.exit_code = None;
+                        output.interrupted = true;
+                    } else {
+                        output.stdout = "Platforms: linux/amd64, linux/arm64".into();
+                    }
+                } else if invocation
+                    .args
+                    .get(1)
+                    .is_some_and(|operation| operation == "build")
+                {
+                    match self.0 {
+                        FailureStage::BuildInterrupted => {
+                            output.exit_code = None;
+                            output.interrupted = true;
+                        }
+                        FailureStage::BuildResponseLost => {
+                            return Err(io::Error::other("lost response after possible export"));
+                        }
+                        FailureStage::Metadata => {}
+                        FailureStage::ManifestInspection => {
+                            fs::write(
+                                value_after(&invocation.args, "--metadata-file"),
+                                format!(r#"{{"containerimage.digest":"{DIGEST}"}}"#),
+                            )?;
+                        }
+                        FailureStage::Capability => {
+                            panic!("capability failure must not reach the build")
+                        }
+                    }
+                } else {
+                    assert!(matches!(self.0, FailureStage::ManifestInspection));
+                    output.exit_code = Some(1);
+                    output.stderr = "registry inspection unavailable".into();
+                }
+                Ok(output)
+            }
+        }
+        for stage in [
+            FailureStage::Capability,
+            FailureStage::BuildInterrupted,
+            FailureStage::BuildResponseLost,
+            FailureStage::Metadata,
+            FailureStage::ManifestInspection,
+        ] {
+            let executor = StageExecutor(stage, Mutex::new(Vec::new()));
+            let plan = plan();
+            let error = BuildKit::new(&executor)
+                .with_native_platform(Platform::LinuxAmd64)
+                .build(
+                    request(
+                        &plan,
+                        BuildOptions {
+                            output: ImageOutput::Push,
+                            platforms: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
+                            ..Default::default()
+                        },
+                    ),
+                    &NeverCancelled,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.may_have_exported(),
+                !matches!(stage, FailureStage::Capability),
+                "stage={stage:?}: {error}"
+            );
+            if matches!(stage, FailureStage::Capability) {
+                assert_eq!(executor.1.lock().unwrap().len(), 1);
+            }
+        }
     }
 
     #[test]

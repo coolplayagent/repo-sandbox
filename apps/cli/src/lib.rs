@@ -324,6 +324,7 @@ fn run_runtime(
         started + REMOTE_PREPARATION_TIMEOUT,
     );
     let requested_report = arguments.report.clone();
+    let requested_repository = arguments.repository.clone();
     let report_reservation = requested_report
         .as_deref()
         .map(repo_sandbox_adapters::workflow::OutputReservation::report)
@@ -335,7 +336,13 @@ fn run_runtime(
             if let Some(path) = requested_report.as_deref()
                 && !path.exists()
             {
-                write_cli_failure_report(path, "unavailable", preparation_phase(&error), &error)?;
+                write_cli_failure_report(
+                    path,
+                    requested_repository.as_deref(),
+                    "unavailable",
+                    preparation_phase(&error),
+                    &error,
+                )?;
             }
             return Err(error);
         }
@@ -357,7 +364,13 @@ fn run_runtime(
             if let Some(path) = &execution.request.report
                 && !path.exists()
             {
-                write_cli_failure_report(path, &execution.digest, "orchestration", &error)?;
+                write_cli_failure_report(
+                    path,
+                    execution.request.repository.as_deref(),
+                    &execution.digest,
+                    "orchestration",
+                    &error,
+                )?;
             }
             return Err(error);
         }
@@ -486,12 +499,34 @@ fn preparation_phase(error: &AppError) -> &'static str {
     }
 }
 
+// Finish bounded failure bookkeeping after a workflow cancellation, without
+// reusing the consumed process signal or allowing Git validation to hang.
+struct FailureReportDeadline(Instant);
+
+impl repo_sandbox_adapters::buildkit::Cancellation for FailureReportDeadline {
+    fn is_cancelled(&self) -> bool {
+        Instant::now() >= self.0
+    }
+}
+
 fn write_cli_failure_report(
     path: &std::path::Path,
+    repository: Option<&str>,
     plan_digest: &str,
     phase: &'static str,
     error: &AppError,
 ) -> Result<(), AppError> {
+    // Failure fallback must obey the same source/output boundary as a normal
+    // workflow, including when configuration discovery never produced a plan.
+    if repo_sandbox_adapters::workflow::validate_repository_output_boundary(
+        repository,
+        path,
+        &FailureReportDeadline(Instant::now() + Duration::from_secs(5)),
+    )
+    .is_err()
+    {
+        return Ok(());
+    }
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -937,8 +972,10 @@ test: [{ name: test, run: cargo test }]
                 .as_nanos()
         ));
         fs::create_dir(&temporary).unwrap();
+        let repository = temporary.join("repository");
+        fs::create_dir(&repository).unwrap();
         fs::write(
-            temporary.join(".repo-sandbox.yaml"),
+            repository.join(".repo-sandbox.yaml"),
             "version: 1\ntemplate: definitely-not-valid\n",
         )
         .unwrap();
@@ -947,7 +984,7 @@ test: [{ name: test, run: cargo test }]
             "repo-sandbox",
             "build",
             "--repository",
-            temporary.to_str().unwrap(),
+            repository.to_str().unwrap(),
             "--report-path",
             report.to_str().unwrap(),
         ])
@@ -981,6 +1018,148 @@ test: [{ name: test, run: cargo test }]
         }
         assert!(json.contains("\"phase\": \"configuration\""));
         assert!(json.contains("\"exit_code\": 2"));
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn failure_reports_respect_the_source_output_boundary() {
+        let temporary = std::env::temp_dir().join(format!(
+            "cli-report-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&temporary).unwrap();
+        let repository = temporary.join("repository");
+        fs::create_dir(&repository).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(repository.join(".gitignore"), "ignored-reports/\n").unwrap();
+        let configuration = repository.join(".repo-sandbox.yaml");
+        // Cover both preparation failures and the workflow rejecting the same
+        // output after successful configuration preparation.
+        for source in [
+            "version: 1\ntemplate: invalid\n",
+            "version: 1\ntemplate:\n  id: rust-bazel\n  parameters:\n    platform: linux/amd64\n",
+        ] {
+            fs::write(&configuration, source).unwrap();
+            let report = repository.join("unignored-reports/failure.json");
+            let cli = Cli::try_parse_from([
+                "repo-sandbox",
+                "build",
+                "--repository",
+                repository.to_str().unwrap(),
+                "--report-path",
+                report.to_str().unwrap(),
+            ])
+            .unwrap();
+            let error = run(cli).unwrap_err();
+            assert_eq!(error.exit_code(), ExitCode::Configuration);
+            if source.contains("rust-bazel") {
+                assert!(error.to_string().contains("not Git-ignored"));
+            }
+            assert!(!report.parent().unwrap().exists());
+            assert!(!repository.join(".repo-sandbox").exists());
+        }
+        for source in [
+            "version: 1\ntemplate: invalid\n",
+            "version: 1\ntemplate:\n  id: rust-bazel\n  parameters:\n    platform: linux/amd64\n",
+        ] {
+            fs::write(&configuration, source).unwrap();
+            for leaf in [
+                "",
+                "cache",
+                "cache/failure.json",
+                "tasks",
+                "tasks/failure.json",
+                "reports",
+            ] {
+                let report = repository.join(".repo-sandbox").join(leaf);
+                let cli = Cli::try_parse_from([
+                    "repo-sandbox",
+                    "build",
+                    "--repository",
+                    repository.to_str().unwrap(),
+                    "--report-path",
+                    report.to_str().unwrap(),
+                ])
+                .unwrap();
+                assert_eq!(run(cli).unwrap_err().exit_code(), ExitCode::Configuration);
+                assert!(!repository.join(".repo-sandbox").exists());
+            }
+        }
+        fs::write(&configuration, "version: 1\ntemplate: invalid\n").unwrap();
+        for report in [
+            repository.join(".repo-sandbox/reports/failure.json"),
+            repository.join("ignored-reports/failure.json"),
+            temporary.join("external-reports/failure.json"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "repo-sandbox",
+                "build",
+                "--repository",
+                repository.to_str().unwrap(),
+                "--report-path",
+                report.to_str().unwrap(),
+            ])
+            .unwrap();
+            assert_eq!(run(cli).unwrap_err().exit_code(), ExitCode::Configuration);
+            assert!(
+                fs::read_to_string(report)
+                    .unwrap()
+                    .contains("configuration")
+            );
+        }
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_report_cannot_follow_a_state_symlink_but_can_write_externally() {
+        let temporary = std::env::temp_dir().join(format!(
+            "cli-state-report-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repository = temporary.join("repository");
+        let outside = temporary.join("outside");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(
+            repository.join(".repo-sandbox.yaml"),
+            "version: 1\ntemplate: invalid\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, repository.join(".repo-sandbox")).unwrap();
+        for report in [
+            repository.join(".repo-sandbox/reports/failure.json"),
+            temporary.join("external.json"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "repo-sandbox",
+                "build",
+                "--repository",
+                repository.to_str().unwrap(),
+                "--report-path",
+                report.to_str().unwrap(),
+            ])
+            .unwrap();
+            assert_eq!(run(cli).unwrap_err().exit_code(), ExitCode::Configuration);
+        }
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(temporary.join("external.json").is_file());
         fs::remove_dir_all(temporary).unwrap();
     }
 
@@ -1043,8 +1222,10 @@ test: [{ name: test, run: cargo test }]
                 .as_nanos()
         ));
         fs::create_dir(&temporary).unwrap();
+        let repository = temporary.join("repository");
+        fs::create_dir(&repository).unwrap();
         fs::write(
-            temporary.join(".repo-sandbox.yaml"),
+            repository.join(".repo-sandbox.yaml"),
             "version: 1\ntemplate: definitely-not-valid\n",
         )
         .unwrap();
@@ -1054,7 +1235,7 @@ test: [{ name: test, run: cargo test }]
             "repo-sandbox",
             "build",
             "--repository",
-            temporary.to_str().unwrap(),
+            repository.to_str().unwrap(),
             "--report-path",
             report.to_str().unwrap(),
         ])

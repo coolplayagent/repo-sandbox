@@ -11,7 +11,7 @@ use crate::docker_runner::{DockerExecutor, DockerRunner, SystemClock, SystemDock
 use crate::doctor::{DoctorProbe, SystemDoctorProbe};
 use crate::registry::{DockerRegistry, RegistryErrorKind, SystemRegistryExecutor};
 use crate::snapshot::GitSnapshotter;
-use crate::task_image::{TaskImageBuilder, TaskImageOptions, TaskImageRequest};
+use crate::task_image::{TaskImageBuilder, TaskImageError, TaskImageOptions, TaskImageRequest};
 use repo_sandbox_core::AppError;
 use repo_sandbox_core::application::{
     CleanCandidate, CleanPlan, CleanPort, CleanRequest, CleanResult, ExecutionPlan, ResourceKind,
@@ -1200,8 +1200,6 @@ fn validate_snapshot_output_boundary(
     {
         return Ok(());
     }
-    let root =
-        fs::canonicalize(repository).map_err(environment("resolve source output boundary"))?;
     for output in [
         plan.request.report.as_deref(),
         plan.request.oci_layout.as_deref(),
@@ -1209,31 +1207,90 @@ fn validate_snapshot_output_boundary(
     .into_iter()
     .flatten()
     {
-        let absolute = resolved_future_path(output)?;
-        if !absolute.starts_with(&root) || absolute.starts_with(root.join(".repo-sandbox")) {
-            continue;
-        }
-        let output = SystemProcessExecutor
-            .execute(
-                &ProcessInvocation {
-                    program: "git".into(),
-                    args: vec![
-                        "check-ignore".into(),
-                        "--quiet".into(),
-                        "--".into(),
-                        absolute.to_string_lossy().into_owned(),
-                    ],
-                    current_dir: Some(root.clone()),
-                },
-                cancellation,
-            )
-            .map_err(environment("check source output ignore policy"))?;
-        if output.interrupted || output.exit_code != Some(0) {
-            return Err(AppError::Configuration(format!(
-                "workflow output {} is inside the source repository and is not Git-ignored; add its output directory to .gitignore or use a destination outside the repository",
-                absolute.display()
-            )));
-        }
+        validate_local_output_boundary(repository, output, cancellation)?;
+    }
+    Ok(())
+}
+
+/// Validate an explicit output before creating it, including CLI preparation failures.
+pub fn validate_repository_output_boundary(
+    repository: Option<&str>,
+    output: &Path,
+    cancellation: &dyn Cancellation,
+) -> Result<(), AppError> {
+    let remote = repository.filter(|value| is_remote_repository(value));
+    let source = Path::new(if remote.is_some() {
+        "."
+    } else {
+        repository.unwrap_or(".")
+    });
+    let root = resolved_future_path(source)?;
+    let base = root.join(".repo-sandbox");
+    let lexical_base = normalized_output_path(&source.join(".repo-sandbox"))?;
+    let lexical_output = normalized_output_path(output)?;
+    let resolved_output = resolved_future_path(output)?;
+    let overlaps =
+        |state: &Path, report: &Path| report.starts_with(state) || state.starts_with(report);
+    let touches_state = overlaps(&lexical_base, &lexical_output)
+        || overlaps(&base, &lexical_output)
+        || resolved_future_path(&base).is_ok_and(|state| overlaps(&state, &resolved_output));
+    if touches_state {
+        // Check lexical state components before following an output through a
+        // state symlink. An external diagnostic report need not trust state.
+        validate_state_root(&root, &base)?;
+        let scoped_state = if let Some(remote) = remote {
+            let normalized = normalize_remote_identity(remote)?;
+            let mut hash = Sha256::new();
+            hash.update(b"repo-sandbox-remote-v1\0");
+            hash.update(normalized.as_bytes());
+            base.join("remotes").join(format!("{:x}", hash.finalize()))
+        } else {
+            base.clone()
+        };
+        let state = if resolved_output.starts_with(&scoped_state) {
+            &scoped_state
+        } else {
+            &base
+        };
+        validate_state_root(&root, state)?;
+        validate_state_outputs(state, output, None)?;
+    }
+    if remote.is_some() {
+        return Ok(());
+    }
+    validate_local_output_boundary(source, output, cancellation)
+}
+
+fn validate_local_output_boundary(
+    repository: &Path,
+    output: &Path,
+    cancellation: &dyn Cancellation,
+) -> Result<(), AppError> {
+    let root = resolved_future_path(repository)?;
+    let absolute = resolved_future_path(output)?;
+    if !absolute.starts_with(&root) || absolute.starts_with(root.join(".repo-sandbox")) {
+        return Ok(());
+    }
+    let checked = SystemProcessExecutor
+        .execute(
+            &ProcessInvocation {
+                program: "git".into(),
+                args: vec![
+                    "check-ignore".into(),
+                    "--quiet".into(),
+                    "--".into(),
+                    absolute.to_string_lossy().into_owned(),
+                ],
+                current_dir: Some(root),
+            },
+            cancellation,
+        )
+        .map_err(environment("check source output ignore policy"))?;
+    if checked.interrupted || checked.exit_code != Some(0) {
+        return Err(AppError::Configuration(format!(
+            "workflow output {} is inside the source repository and is not Git-ignored; add its output directory to .gitignore or use a destination outside the repository",
+            absolute.display()
+        )));
     }
     Ok(())
 }
@@ -1637,11 +1694,13 @@ fn build_multi_platform_task(
             cancellation,
         )
         .map_err(|error| {
-            reconcile_staging_write(
-                &environment_ref,
-                PublicationFactKind::EnvironmentStaging,
-                &mut on_progress,
-            );
+            if error.may_have_exported() {
+                reconcile_staging_write(
+                    &environment_ref,
+                    PublicationFactKind::EnvironmentStaging,
+                    &mut on_progress,
+                );
+            }
             bounded_error("multi-platform environment", error, cancellation)
         })?;
     on_progress(RemotePublicationFact {
@@ -1719,11 +1778,13 @@ fn build_multi_platform_task(
                 cancellation,
             )
             .map_err(|error| {
-                reconcile_staging_write(
-                    &staging_ref,
-                    PublicationFactKind::TaskStaging,
-                    &mut on_progress,
-                );
+                if matches!(&error, TaskImageError::Build(build) if build.may_have_exported()) {
+                    reconcile_staging_write(
+                        &staging_ref,
+                        PublicationFactKind::TaskStaging,
+                        &mut on_progress,
+                    );
+                }
                 bounded_error(
                     &format!("multi-platform task image for {platform}"),
                     error,
@@ -3938,9 +3999,19 @@ fn normalize_remote_identity(remote: &str) -> Result<String, AppError> {
         && !path.is_empty()
     {
         return Ok(format!(
-            "ssh://{}/{}",
-            host.to_ascii_lowercase(),
-            path.trim_start_matches('/').trim_end_matches('/')
+            "{}://{}/{}",
+            if path.starts_with('/') {
+                "ssh"
+            } else {
+                "scp-relative"
+            },
+            if path.starts_with('/') {
+                host.to_ascii_lowercase()
+            } else {
+                let user = user_host.rsplit_once('@').unwrap().0;
+                format!("{user}@{}", host.to_ascii_lowercase())
+            },
+            path.strip_prefix('/').unwrap_or(path).trim_end_matches('/')
         ));
     }
     Err(AppError::Configuration(format!(
@@ -9362,6 +9433,25 @@ mod tests {
         assert_ne!(first, second);
         assert!(!first.contains("token"));
         assert!(!first.contains("secret"));
+    }
+
+    #[test]
+    fn scp_identity_preserves_absolute_and_relative_paths() {
+        let relative = normalize_remote_identity("git@host:repo.git").unwrap();
+        let absolute = normalize_remote_identity("git@host:/repo.git").unwrap();
+        assert_ne!(relative, absolute);
+        assert_ne!(
+            relative,
+            normalize_remote_identity("other@host:repo.git").unwrap()
+        );
+        assert_eq!(
+            absolute,
+            normalize_remote_identity("ssh://git@host/repo.git").unwrap()
+        );
+        assert_eq!(
+            relative,
+            normalize_remote_identity("git@HOST:repo.git/").unwrap()
+        );
     }
 
     #[test]
