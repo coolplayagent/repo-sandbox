@@ -59,6 +59,12 @@ CI prepares the arm64 environment in an explicit cache-only Buildx step before
 running the matrix. It gives builder bootstrap 60 seconds and emulated offline
 seed preparation 45 minutes, preserving their plain progress logs under
 `target/e2e/preparation/` even on failure. A preparation failure fails the job.
+Preparation also exports a complete local cache into a fresh task-owned directory
+under `RUNNER_TEMP`. Dogfood explicitly imports this cache for its first ARM
+environment build, so BuildKit garbage collection cannot discard the only copy
+of the expensive preparation. Its own cold/warm exports and every cache-vertex
+assertion still run. Completed architecture images, archives and caches are removed
+before the next architecture, and CI removes the preparation cache on every exit.
 CI uploads compact diagnostics separately from the complete results archive.
 The compact archive omits only `task-layout/blobs/`; logs, reports, OCI indexes
 and registry manifests remain available without downloading image layers.

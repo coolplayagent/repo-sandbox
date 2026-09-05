@@ -50,9 +50,23 @@ assert_environment_cached() {
   assert_cached_step "$warm_log" '[environment 4/4] RUN' || return 1
 }
 
+select_prepared_arm_cache() {
+  local architecture=$1
+  local prepared_cache=${2-}
+  prepared_cache_args=()
+  if [[ $architecture == arm64 && -n $prepared_cache ]]; then
+    if [[ ! -s "$prepared_cache/index.json" ]]; then
+      echo "prepared ARM cache is missing its OCI index: $prepared_cache" >&2
+      return 1
+    fi
+    prepared_cache_args=(--cache-from "type=local,src=$prepared_cache")
+  fi
+}
+
 if [[ ${1-} == --self-test-cache-assertions ]]; then
   cache_fixture=$(mktemp)
-  trap 'rm -f "$cache_fixture" "$cache_fixture.miss"' EXIT
+  prepared_fixture=$(mktemp -d)
+  trap 'rm -f "$cache_fixture" "$cache_fixture.miss"; rm -rf "$prepared_fixture"' EXIT
   printf '%s\n' '#17 [offline-seed 2/3] RUN online-seed' '#17 CACHED' \
     '#19 [offline-seed 3/3] RUN offline-verify' '#19 CACHED' >"$cache_fixture"
   assert_cached_step "$cache_fixture" '[offline-seed 2/2] RUN'
@@ -96,6 +110,21 @@ CACHELOG
   printf '%s\n' '#17 [offline-seed 2/3] RUN online-seed' '#17 CACHED' \
     '#19 [offline-seed 3/3] RUN offline-verify' '#19 DONE 0.1s' >"$cache_fixture"
   if assert_cached_step "$cache_fixture" '[offline-seed 3/3] RUN' 2>/dev/null; then exit 1; fi
+  select_prepared_arm_cache amd64 "$prepared_fixture/missing"
+  [[ -z ${prepared_cache_args[*]-} ]]
+  select_prepared_arm_cache arm64 ''
+  [[ -z ${prepared_cache_args[*]-} ]]
+  if select_prepared_arm_cache arm64 "$prepared_fixture/missing" 2>/dev/null; then
+    echo 'missing prepared ARM cache was accepted' >&2; exit 1
+  fi
+  mkdir -p "$prepared_fixture/cache with spaces"
+  printf '{}\n' >"$prepared_fixture/cache with spaces/index.json"
+  select_prepared_arm_cache arm64 "$prepared_fixture/cache with spaces"
+  [[ ${#prepared_cache_args[@]} -eq 2 ]]
+  [[ ${prepared_cache_args[0]} == --cache-from ]]
+  [[ ${prepared_cache_args[1]} == "type=local,src=$prepared_fixture/cache with spaces" ]]
+  select_prepared_arm_cache amd64 "$prepared_fixture/cache with spaces"
+  [[ -z ${prepared_cache_args[*]-} ]]
   exit 0
 fi
 
@@ -154,8 +183,9 @@ for architecture in amd64 arm64; do
   cache_warm="$temporary/cache-$architecture-warm"
   cold_log="$temporary/environment-$architecture-cold.log"
   warm_log="$temporary/environment-$architecture-warm.log"
+  select_prepared_arm_cache "$architecture" "${REPO_SANDBOX_PREPARED_ARM_CACHE:-}"
 
-  retry_external_build docker buildx build "${builder_args[@]}" --provenance=false \
+  retry_external_build docker buildx build "${builder_args[@]}" "${prepared_cache_args[@]}" --provenance=false \
     --platform "$platform" --target environment \
     --secret "id=github_token,src=$temporary/github-token" \
     --cache-to "type=local,dest=$cache_cold,mode=max" --progress plain --load \
@@ -317,4 +347,13 @@ for architecture in amd64 arm64; do
   printf '%-8s %15d %15d %15d %9s%%\n' "$architecture" "$single_compressed" \
     "$multi_compressed" "$multi_unpacked" "$reduction"
   awk -v reduction="$reduction" 'BEGIN { exit !(reduction >= 10.0) }'
+  # Measurements and warm-cache checks for this architecture are complete.
+  # Free their large local exports before the next architecture needs space.
+  rm -rf -- "$cache_cold" "$cache_warm"
+  rm -f -- "$temporary/multi-$architecture.tar" "$temporary/single-$architecture.tar" \
+    "$temporary/multi-$architecture.tar.gz" "$temporary/single-$architecture.tar.gz"
+  # These unique tags are no longer used; EXIT cleanup retries if removal fails.
+  docker image rm --force "$environment" "$task" "$baseline" \
+    "$acceptance_task" "$acceptance_baseline" >/dev/null 2>&1 || \
+    echo "could not remove all completed $architecture image tags; EXIT cleanup will retry" >&2
 done

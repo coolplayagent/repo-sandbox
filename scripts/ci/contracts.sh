@@ -56,6 +56,11 @@ grep -Fq 'raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_COMMIT}/scrip
   "$release"
 grep -Fq 'version=$(scripts/ci/workspace-version.sh)' "$ci"
 grep -Fq 'docker buildx inspect "$builder" --bootstrap' "$ci"
+grep -Fq 'prepared_cache=$(mktemp -d "$RUNNER_TEMP/repo-sandbox-arm-cache.XXXXXXXX")' "$ci"
+grep -Fq 'REPO_SANDBOX_PREPARED_ARM_CACHE=$prepared_cache' "$ci"
+grep -Fq -- '--cache-to "type=local,dest=$prepared_cache,mode=max"' "$ci"
+grep -Fq 'test -s "$prepared_cache/index.json"' "$ci"
+grep -Fq 'name: Remove task-owned ARM preparation cache' "$ci"
 grep -Fq "Platforms:.*linux/amd64" "$ci"
 grep -Fq 'v0.15.1/buildx-v0.15.1.linux-amd64' "$euleros_installer"
 grep -Fq '8d486f0088b7407a90ad675525ba4a17d0a537741b9b33fe3391a88cafa2dd0b' \

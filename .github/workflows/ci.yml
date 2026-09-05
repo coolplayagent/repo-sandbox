@@ -113,15 +113,19 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/e2e/preparation
+          prepared_cache=$(mktemp -d "$RUNNER_TEMP/repo-sandbox-arm-cache.XXXXXXXX")
+          echo "REPO_SANDBOX_PREPARED_ARM_CACHE=$prepared_cache" >> "$GITHUB_ENV"
           timeout --signal=TERM --kill-after=30s 60s \
             docker buildx inspect "$REPO_SANDBOX_BUILDER" --bootstrap \
             2>&1 | tee target/e2e/preparation/builder.log
           timeout --signal=TERM --kill-after=30s 2700s \
             docker buildx build --builder "$REPO_SANDBOX_BUILDER" \
               --platform linux/arm64 --target environment --provenance=false \
+              --cache-to "type=local,dest=$prepared_cache,mode=max" \
               --output type=cacheonly --progress plain \
               templates/rust-bazel/context \
             2>&1 | tee target/e2e/preparation/arm64-environment.log
+          test -s "$prepared_cache/index.json"
       - name: Run required runner integration scenarios
         env:
           # Fixed non-production fixture value; matrix assertions require that it is redacted.
@@ -148,3 +152,12 @@ jobs:
       - name: Stop task-owned Docker daemon and remove quota storage
         if: always()
         run: sudo scripts/e2e/ci-quota-docker.sh stop "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+      - name: Remove task-owned ARM preparation cache
+        if: always()
+        run: |
+          if [[ -n ${REPO_SANDBOX_PREPARED_ARM_CACHE:-} ]]; then
+            case "$REPO_SANDBOX_PREPARED_ARM_CACHE" in
+              "$RUNNER_TEMP"/repo-sandbox-arm-cache.*) rm -rf -- "$REPO_SANDBOX_PREPARED_ARM_CACHE" ;;
+              *) echo 'refuse unexpected preparation cache path' >&2; exit 1 ;;
+            esac
+          fi
