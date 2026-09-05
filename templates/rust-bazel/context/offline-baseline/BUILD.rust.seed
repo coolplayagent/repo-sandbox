@@ -1,3 +1,5 @@
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
 load("@rules_rust//rust:defs.bzl", "rust_test")
 
 exports_files(["Cargo.toml", "Cargo.lock"])

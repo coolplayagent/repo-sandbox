@@ -9378,9 +9378,9 @@ mod tests {
         assert!(dockerfile.contains("io.repo-sandbox.repository-id"));
         assert!(!dockerfile.contains("ARG BAZEL_VERSION"));
         assert!(!dockerfile.contains("ARG BAZELISK_VERSION"));
-        assert!(dockerfile.contains("bazel_version=8.3.1"));
+        assert!(dockerfile.contains("bazel_version=9.2.0"));
         assert!(dockerfile.contains("bazelisk_version=1.27.0"));
-        assert!(dockerfile.contains("REPO_SANDBOX_BAZEL_VERSION=8.3.1"));
+        assert!(dockerfile.contains("REPO_SANDBOX_BAZEL_VERSION=9.2.0"));
         assert!(dockerfile.contains(" AS offline-seed"));
         assert!(dockerfile.contains("/toolchain/bazel-seed/cache/repos/"));
         assert!(dockerfile.contains("--output_user_root=/toolchain/bazel-seed"));
@@ -9392,14 +9392,14 @@ mod tests {
         assert!(!dockerfile.contains("offline-seed,target=/"));
         assert!(dockerfile.contains("sha256sum --check --strict"));
         assert!(
-            dockerfile.contains("17247e8a84245f59d3bc633d0cfe0a840992a7760a11af1a30012d03da31604c")
+            dockerfile.contains("7668a95db1250f12c40407251e4e203b4ec8bf39bc495d2f485b2d8c99048694")
         );
         assert!(
-            dockerfile.contains("52bb74f0880ee87b17e3a1aa41257d0dba9e9cb92df4e83f8f6c656a46df152d")
+            dockerfile.contains("049dd21f40ad979db11c3ee68c96a42ce75f1185e69ac61ab20de1501427a410")
         );
         let wrapper =
             fs::read_to_string(catalog.path().join("templates/rust-bazel/context/bazel")).unwrap();
-        assert!(wrapper.contains("/usr/local/libexec/repo-sandbox/bazel-8.3.1"));
+        assert!(wrapper.contains("/usr/local/libexec/repo-sandbox/bazel-9.2.0"));
         assert!(wrapper.contains("--ignore_all_rc_files"));
         assert!(wrapper.contains("--repository_disable_download"));
         for variable in ["USE_BAZEL_VERSION", "BAZELISK_HOME", "BAZEL_OPTS"] {
@@ -9414,13 +9414,29 @@ mod tests {
         let baseline: serde_json::Value = serde_json::from_str(&baseline).unwrap();
         let hashes = baseline["registryFileHashes"].as_object().unwrap();
         for required in [
-            "platforms/0.0.7/MODULE.bazel",
-            "rules_shell/0.2.0/MODULE.bazel",
-            "rules_java/8.12.0/MODULE.bazel",
+            "platforms/1.0.0/MODULE.bazel",
+            "rules_shell/0.6.1/MODULE.bazel",
+            "rules_java/9.1.0/MODULE.bazel",
+            "rules_cc/0.2.17/MODULE.bazel",
+            "platforms/1.0.0/source.json",
+            "rules_shell/0.6.1/source.json",
+            "rules_java/9.1.0/source.json",
+            "rules_cc/0.2.17/source.json",
         ] {
             assert!(hashes.keys().any(|key| key.ends_with(required)));
         }
-        assert_eq!(baseline["moduleExtensions"], serde_json::json!({}));
+        assert_eq!(baseline["lockFileVersion"], 28);
+        let extensions = baseline["moduleExtensions"].as_object().unwrap();
+        let required_extensions = [
+            "@@pybind11_bazel+//:internal_configure.bzl%internal_configure_extension",
+            "@@rules_kotlin+//src/main/starlark/core/repositories:bzlmod_setup.bzl%rules_kotlin_extensions",
+            "@@rules_python+//python/extensions:config.bzl%config",
+            "@@rules_python+//python/uv:uv.bzl%uv",
+        ];
+        assert_eq!(extensions.len(), required_extensions.len());
+        for extension in required_extensions {
+            assert!(extensions.contains_key(extension));
+        }
     }
 
     #[test]

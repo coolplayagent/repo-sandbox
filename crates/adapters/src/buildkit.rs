@@ -1695,7 +1695,7 @@ mod tests {
         assert!(!final_stage.contains("/run/secrets/github_token"));
         assert!(final_stage.contains("/var/cache/repo-sandbox/bazel/cache/repos/"));
         assert!(final_stage.contains("/usr/local/share/repo-sandbox/offline-baseline"));
-        assert!(final_stage.contains("/usr/local/libexec/repo-sandbox/bazel-8.3.1"));
+        assert!(final_stage.contains("/usr/local/libexec/repo-sandbox/bazel-9.2.0"));
         assert!(!final_stage.contains("/toolchain-downloads"));
         assert!(!final_stage.contains("BAZELISK_HOME="));
 

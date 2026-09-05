@@ -1,3 +1,5 @@
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
 genrule(
     name = "rust_binary",
     srcs = ["src/main.rs"],

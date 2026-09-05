@@ -241,7 +241,7 @@ for architecture in amd64 arm64; do
     test -z "$(find /root/.cache -mindepth 1 -print -quit 2>/dev/null)"
     test -d /var/cache/repo-sandbox/bazel/cache/repos/v1
     test -s /usr/local/share/repo-sandbox/offline-baseline/MODULE.bazel.lock
-    test -x /usr/local/libexec/repo-sandbox/bazel-8.3.1
+    test -x /usr/local/libexec/repo-sandbox/bazel-9.2.0
     test ! -e /root/.cache/bazel
     test ! -e /root/.cache/bazelisk
     test ! -e /toolchain-downloads
@@ -262,11 +262,11 @@ for architecture in amd64 arm64; do
   docker run --rm --network none --platform "$platform" \
     --env USE_BAZEL_VERSION=latest --env BAZEL_OPTS=--bazelrc=/workspace/.bazelrc \
     "$task" sh -ec '
-      bazel version | grep -Fx "Build label: 8.3.1"
+      bazel version | grep -Fx "Build label: 9.2.0"
       bazel --batch build //:rust_binary
       bazel --batch test //...
     '
-  printf '%s final-task Bazel closure: network=none pinned=8.3.1 rc=ignored passed\n' \
+  printf '%s final-task Bazel closure: network=none pinned=9.2.0 rc=ignored passed\n' \
     "$architecture"
 
   if [[ $architecture == amd64 ]]; then

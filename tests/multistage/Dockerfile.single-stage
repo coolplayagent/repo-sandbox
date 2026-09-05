@@ -8,7 +8,7 @@ FROM ${BASE_IMAGE} AS task
 ARG TARGETARCH
 ARG RUST_VERSION=1.97.0
 ARG BAZELISK_VERSION=1.27.0
-ARG BAZEL_VERSION=8.3.1
+ARG BAZEL_VERSION=9.2.0
 ARG SOURCE_DIGEST
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl git \
@@ -45,7 +45,7 @@ RUN set -eu; \
     cp MODULE.rust MODULE.bazel; \
     cp MODULE.rust.lock MODULE.bazel.lock; \
     cp BUILD.rust.seed BUILD.bazel; \
-    bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel fetch @crates//... //:rust_dependencies_full; \
+    bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel fetch @crates//... //:rust_dependencies_full --lockfile_mode=error; \
     bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel test //...; \
     if [ "$TARGETARCH" = amd64 ]; then bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel test //:rust_dependencies_full; fi; \
     rm /tmp/repo-sandbox-baseline.lock /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes; \
@@ -59,7 +59,7 @@ RUN set -eu; \
 # that expensive compilation under arm64 QEMU emulation.
 RUN --network=none set -eu; \
     cd /opt/repo-sandbox/offline-baseline; \
-    bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel fetch @crates//... //:rust_dependencies_full --repository_disable_download; \
+    bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel fetch @crates//... //:rust_dependencies_full --lockfile_mode=error --repository_disable_download; \
     bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel test //... --repository_disable_download; \
     if [ "$TARGETARCH" = amd64 ]; then bazel --batch --output_user_root=/var/cache/repo-sandbox/bazel test //:rust_dependencies_full --repository_disable_download; fi; \
     find /var/cache/repo-sandbox/bazel -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
@@ -76,7 +76,7 @@ RUN --network=none set -eu; \
 COPY bazel /tmp/repo-sandbox-bazel-wrapper
 RUN set -eu; \
     mkdir -p /usr/local/libexec/repo-sandbox; \
-    mv /usr/local/bin/bazel /usr/local/libexec/repo-sandbox/bazel-8.3.1; \
+    mv /usr/local/bin/bazel /usr/local/libexec/repo-sandbox/bazel-9.2.0; \
     install -m 0755 /tmp/repo-sandbox-bazel-wrapper /usr/local/bin/bazel; \
     rm /tmp/repo-sandbox-bazel-wrapper
 COPY --link source/ /workspace/

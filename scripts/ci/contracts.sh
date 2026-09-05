@@ -135,16 +135,15 @@ grep -Fq 'COPY --from=offline-seed /toolchain/bazel-seed/cache/repos/' \
   "$environment_dockerfile"
 ! sed -n '/FROM environment-base AS offline-seed/,/FROM environment-base AS environment/p' \
   "$environment_dockerfile" | grep -Fq 'github_token'
-grep -Fq '/usr/local/libexec/repo-sandbox/bazel-8.3.1' "$bazel_wrapper"
+grep -Fq '/usr/local/libexec/repo-sandbox/bazel-9.2.0' "$bazel_wrapper"
 grep -Fq -- '--output_user_root=/var/cache/repo-sandbox/bazel' "$bazel_wrapper"
 grep -Fq -- '--ignore_all_rc_files' "$bazel_wrapper"
 grep -Fq -- '--repository_disable_download' "$bazel_wrapper"
-grep -Fq '"https://bcr.bazel.build/modules/platforms/0.0.7/MODULE.bazel"' \
-  "$baseline_lock"
-grep -Fq '"https://bcr.bazel.build/modules/rules_shell/0.2.0/MODULE.bazel"' \
-  "$baseline_lock"
-grep -Fq '"https://bcr.bazel.build/modules/rules_java/8.12.0/MODULE.bazel"' \
-  "$baseline_lock"
+for module in platforms/1.0.0 rules_shell/0.6.1 rules_java/9.1.0 rules_cc/0.2.17; do
+  for metadata in MODULE.bazel source.json; do
+    grep -Fq "\"https://bcr.bazel.build/modules/$module/$metadata\"" "$baseline_lock"
+  done
+done
 grep -Fq '["--network", "none"]' "$root/crates/adapters/src/docker_runner.rs"
 grep -Fxq 'templates/rust-bazel/context/Dockerfile text eol=lf' "$root/.gitattributes"
 grep -Fxq 'templates/rust-bazel/context/bazel text eol=lf' "$root/.gitattributes"

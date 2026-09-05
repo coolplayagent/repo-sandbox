@@ -12,7 +12,7 @@ RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,s
     --mount=type=secret,id=github_token,required=false \
     set -eu; \
     bazelisk_version=1.27.0; \
-    bazel_version=8.3.1; \
+    bazel_version=9.2.0; \
     token_header=''; \
     if [ -s /run/secrets/github_token ]; then \
       token=$(cat /run/secrets/github_token); \
@@ -22,8 +22,8 @@ RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,s
     apt-get install --yes --no-install-recommends ca-certificates curl; \
     mkdir -p /toolchain/bin; \
     case "$TARGETARCH" in \
-      amd64) bazel_arch=x86_64; bazel_sha=17247e8a84245f59d3bc633d0cfe0a840992a7760a11af1a30012d03da31604c; bazelisk_sha=e1508323f347ad1465a887bc5d2bfb91cffc232d11e8e997b623227c6b32fb76 ;; \
-      arm64) bazel_arch=arm64; bazel_sha=52bb74f0880ee87b17e3a1aa41257d0dba9e9cb92df4e83f8f6c656a46df152d; bazelisk_sha=bb608519a440d45d10304eb684a73a2b6bb7699c5b0e5434361661b25f113a5d ;; \
+      amd64) bazel_arch=x86_64; bazel_sha=7668a95db1250f12c40407251e4e203b4ec8bf39bc495d2f485b2d8c99048694; bazelisk_sha=e1508323f347ad1465a887bc5d2bfb91cffc232d11e8e997b623227c6b32fb76 ;; \
+      arm64) bazel_arch=arm64; bazel_sha=049dd21f40ad979db11c3ee68c96a42ce75f1185e69ac61ab20de1501427a410; bazelisk_sha=bb608519a440d45d10304eb684a73a2b6bb7699c5b0e5434361661b25f113a5d ;; \
       *) exit 64 ;; \
     esac; \
     if [ -n "$token_header" ]; then header_args="--header=$token_header"; else header_args=''; fi; \
@@ -65,7 +65,7 @@ COPY --from=toolchain-build /toolchain/bin/bazel /usr/local/bin/bazel
 COPY --from=toolchain-build /toolchain/bin/bazelisk /usr/local/bin/bazelisk
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
-    REPO_SANDBOX_BAZEL_VERSION=8.3.1 \
+    REPO_SANDBOX_BAZEL_VERSION=9.2.0 \
     PATH=/usr/local/cargo/bin:${PATH}
 
 # Cargo network state is a reusable BuildKit cache, never an image layer. This
@@ -107,7 +107,7 @@ RUN set -eu; \
     cp MODULE.rust MODULE.bazel; \
     cp MODULE.rust.lock MODULE.bazel.lock; \
     cp BUILD.rust.seed BUILD.bazel; \
-    bazel --batch --output_user_root=/toolchain/bazel-seed fetch @crates//... //:rust_dependencies_full; \
+    bazel --batch --output_user_root=/toolchain/bazel-seed fetch @crates//... //:rust_dependencies_full --lockfile_mode=error; \
     bazel --batch --output_user_root=/toolchain/bazel-seed test //...; \
     if [ "$TARGETARCH" = amd64 ]; then bazel --batch --output_user_root=/toolchain/bazel-seed test //:rust_dependencies_full; fi; \
     rm /tmp/repo-sandbox-baseline.lock /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes; \
@@ -121,7 +121,7 @@ RUN set -eu; \
 # that expensive compilation under arm64 QEMU emulation.
 RUN --network=none set -eu; \
     cd /opt/repo-sandbox/offline-baseline; \
-    bazel --batch --output_user_root=/toolchain/bazel-seed fetch @crates//... //:rust_dependencies_full --repository_disable_download; \
+    bazel --batch --output_user_root=/toolchain/bazel-seed fetch @crates//... //:rust_dependencies_full --lockfile_mode=error --repository_disable_download; \
     bazel --batch --output_user_root=/toolchain/bazel-seed test //... --repository_disable_download; \
     if [ "$TARGETARCH" = amd64 ]; then bazel --batch --output_user_root=/toolchain/bazel-seed test //:rust_dependencies_full --repository_disable_download; fi; \
     find /toolchain/bazel-seed -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
@@ -139,10 +139,10 @@ COPY offline-baseline/MODULE.bazel.lock /usr/local/share/repo-sandbox/offline-ba
 COPY bazel /tmp/repo-sandbox-bazel-wrapper
 RUN set -eu; \
     mkdir -p /usr/local/libexec/repo-sandbox; \
-    mv /usr/local/bin/bazel /usr/local/libexec/repo-sandbox/bazel-8.3.1; \
+    mv /usr/local/bin/bazel /usr/local/libexec/repo-sandbox/bazel-9.2.0; \
     install -m 0755 /tmp/repo-sandbox-bazel-wrapper /usr/local/bin/bazel; \
     rm /tmp/repo-sandbox-bazel-wrapper; \
-    bazel version | grep -Fx 'Build label: 8.3.1'
+    bazel version | grep -Fx 'Build label: 9.2.0'
 
 # These values are part of the final image configuration. BuildKit can reuse
 # unchanged installation layers, while a template, component, or parameter

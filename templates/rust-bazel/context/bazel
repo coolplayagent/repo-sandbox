@@ -8,16 +8,16 @@ case "${1-}" in
   --help|--version)
     HOME=/var/cache/repo-sandbox/bazel/version-home
     export HOME
-    exec /usr/local/libexec/repo-sandbox/bazel-8.3.1 "$@"
+    exec /usr/local/libexec/repo-sandbox/bazel-9.2.0 "$@"
     ;;
   help|version)
-    exec /usr/local/libexec/repo-sandbox/bazel-8.3.1 \
+    exec /usr/local/libexec/repo-sandbox/bazel-9.2.0 \
       --ignore_all_rc_files \
       --output_user_root=/var/cache/repo-sandbox/bazel \
       "$@"
     ;;
 esac
-exec /usr/local/libexec/repo-sandbox/bazel-8.3.1 \
+exec /usr/local/libexec/repo-sandbox/bazel-9.2.0 \
   --ignore_all_rc_files \
   --output_user_root=/var/cache/repo-sandbox/bazel \
   "$@" \

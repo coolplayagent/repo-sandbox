@@ -283,7 +283,7 @@ case "$scenario" in
         "$fixture/.repo-sandbox.yaml"
     fi
     printf '.repo-sandbox/\nreport*.json\n.*.repo-sandbox-reservation\n' >"$fixture/.gitignore"
-    printf 'module(name = "repo_sandbox_e2e_fixture")\n' >"$fixture/MODULE.bazel"
+    printf 'module(name = "repo_sandbox_e2e_fixture")\nbazel_dep(name = "rules_cc", version = "0.2.17")\n' >"$fixture/MODULE.bazel"
     git -C "$fixture" init -q
     git -C "$fixture" config user.email e2e@example.invalid
     git -C "$fixture" config user.name repo-sandbox-e2e
@@ -291,6 +291,8 @@ case "$scenario" in
       printf 'this is not valid bazel syntax !!!\n' >"$fixture/BUILD.bazel"
     else
       cat >"$fixture/BUILD.bazel" <<'EOF'
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
 genrule(name = "build_ok", outs = ["built.txt"], cmd = "echo built > $@")
 cc_test(name = "tests", srcs = ["test.cc"])
 EOF
@@ -613,8 +615,10 @@ PYTAGS
     trap cleanup_remote_fixture EXIT
     cp "$root/.repo-sandbox.yaml.example" "$fixture/.repo-sandbox.yaml"
     printf '.repo-sandbox/\nreport*.json\n.*.repo-sandbox-reservation\n' >"$fixture/.gitignore"
-    printf 'module(name = "repo_sandbox_remote_fixture")\n' >"$fixture/MODULE.bazel"
+    printf 'module(name = "repo_sandbox_remote_fixture")\nbazel_dep(name = "rules_cc", version = "0.2.17")\n' >"$fixture/MODULE.bazel"
     cat >"$fixture/BUILD.bazel" <<'EOF'
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
 genrule(name = "build_ok", outs = ["built.txt"], cmd = "echo built > $@")
 cc_test(name = "tests", srcs = ["test.cc"])
 EOF
