@@ -480,10 +480,17 @@ EOF
         docker buildx imagetools inspect "$alias" --raw >"$result_directory/alias.json"
         [[ $(sha256sum "$result_directory/immutable.json" | awk '{print $1}') == \
           $(sha256sum "$result_directory/alias.json" | awk '{print $1}') ]]
-        grep -Fq '"schemaVersion":2' "$result_directory/immutable.json"
+        python3 - "$result_directory/immutable.json" <<'PYMANIFEST'
+import json, sys
+with open(sys.argv[1]) as source:
+    manifest = json.load(source)
+assert manifest["schemaVersion"] == 2
+assert manifest["mediaType"] in {
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+}
+PYMANIFEST
         ! docker image inspect "$immutable" >/dev/null 2>&1
-        grep -Eq '"mediaType":"application/vnd\.(oci\.image\.manifest|docker\.distribution\.manifest)\.' \
-          "$result_directory/immutable.json"
         docker pull --platform linux/amd64 "$immutable" >/dev/null
         docker image inspect --format '{{join .RepoDigests "\n"}}' "$immutable" | \
           grep -Fq "$registry_repository@$digest"
@@ -524,7 +531,11 @@ EOF
         ! grep -Fq '"published"' "$failure_report"
         tags_after=$(curl --fail --silent \
           "http://127.0.0.1:$registry_port/v2/repo-sandbox/e2e/tags/list")
-        [[ $tags_after == "$tags_before" ]]
+        python3 - "$tags_before" "$tags_after" <<'PYTAGS'
+import json, sys
+before, after = [set(json.loads(value).get("tags") or []) for value in sys.argv[1:]]
+assert {tag for tag in before if not tag.startswith("preflight-")} == {tag for tag in after if not tag.startswith("preflight-")}
+PYTAGS
         echo 'registry_cli=published immutable=verified multi_platform=verified primary_digest=runner-verified alias=verified pullback=verified failed_verify_publish=none'
         ;;
     esac

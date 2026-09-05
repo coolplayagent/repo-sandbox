@@ -2,8 +2,8 @@
 
 use crate::artifacts::{OWNER_MARKER, cleanup_owned_temp_source};
 use crate::buildkit::{
-    BuildKit, BuildOptions, BuildRequest, CacheConfig, Cancellation, ImageOutput, ProcessExecutor,
-    ProcessInvocation, Progress, SystemProcessExecutor,
+    BuildKit, BuildOptions, BuildRequest, Builder, CacheConfig, Cancellation, ImageOutput,
+    ProcessExecutor, ProcessInvocation, Progress, SystemProcessExecutor,
 };
 use crate::cancellation::{DeadlineCancellation, ProcessCancellation};
 use crate::docker_runner::{DockerExecutor, DockerRunner, SystemClock, SystemDockerExecutor};
@@ -47,6 +47,8 @@ impl WorkflowPort for SystemWorkflow {
         mode: WorkflowMode,
         plan: &ExecutionPlan,
     ) -> Result<WorkflowResult, AppError> {
+        plan.validate_mode(mode)?;
+        let created = workflow_created(SystemTime::now())?;
         let repository = repository_path(plan)?;
         let cancellation = plan.deadline.map_or_else(
             || {
@@ -81,6 +83,7 @@ impl WorkflowPort for SystemWorkflow {
         // parent or any reservation/state file.
         validate_outputs(plan)?;
         validate_required_secret_environment(plan)?;
+        validate_snapshot_output_boundary(plan, &repository, &cancellation)?;
         let oci_destination = plan
             .request
             .oci_layout
@@ -97,10 +100,31 @@ impl WorkflowPort for SystemWorkflow {
             let (state_guard, _workflow_lease, journal) =
                 prepare_leased_workflow_state(&repository, &state, &task_id)?;
             bound_state = Some(state_guard.clone());
+            if !plan
+                .request
+                .repository
+                .as_deref()
+                .is_some_and(is_remote_repository)
+            {
+                write_state_file(
+                    &state_guard.bound_path(&state.join("repository-id"))?,
+                    repository_id.as_bytes(),
+                )?;
+            }
             let registry = plan.template.execution.registry.as_ref();
-            preflight(plan, &repository, &task_id, &cancellation, |fact| {
-                early_publication_progress.push(fact);
-            })?;
+            let builder = resolve_workflow_builder(&SystemProcessExecutor, &cancellation)?;
+            preflight(
+                plan,
+                &repository,
+                &task_id,
+                &builder,
+                &repository_id,
+                &journal,
+                &cancellation,
+                |fact| {
+                    early_publication_progress.push(fact);
+                },
+            )?;
             let cache = state.join("cache");
             let cache_io = state_guard.bound_path(&cache)?;
             write_state_file(&cache_io.join(OWNER_MARKER), repository_id.as_bytes())?;
@@ -177,6 +201,7 @@ impl WorkflowPort for SystemWorkflow {
                         owned_environment_options(
                             BuildOptions {
                                 progress: Progress::Plain,
+                                builder: Builder::Existing(Some(builder.to_owned())),
                                 output: ImageOutput::OciDirectory(environment_layout.clone()),
                                 cache: cache_options,
                                 ..BuildOptions::default()
@@ -201,6 +226,28 @@ impl WorkflowPort for SystemWorkflow {
             let configuration_digest =
                 ConfigurationDigest::parse(&plan.digest).map_err(AppError::Configuration)?;
             let image_repository = "repo-sandbox-task";
+            let identity = repo_sandbox_core::task_image::task_image_identity(
+                &repo_sandbox_core::task_image::TaskImageInputs {
+                    environment_digest: &environment_image.digest,
+                    snapshot: &materialized.snapshot,
+                    template_id: &plan.template.template_id,
+                    template_version: &plan.template.template_version,
+                    configuration_digest: &configuration_digest,
+                    repository_id: &repository_id,
+                    created: &created,
+                },
+            );
+            let provisional_ref = ImageRef::new(format!("{image_repository}:{}", identity.tag()))
+                .map_err(AppError::Configuration)?;
+            let mut provisional_image = owned_task_image_candidate(
+                &task_id,
+                &repository_id,
+                &provisional_ref,
+                identity.oci_value(),
+            );
+            // Register before Buildx may load anything; a lost build response
+            // or cancelled inspection still leaves a discoverable owned tag.
+            journal.append(&[provisional_image.clone()])?;
             let task_image = TaskImageBuilder::new(SystemProcessExecutor)
                 .build(
                     TaskImageRequest {
@@ -213,10 +260,11 @@ impl WorkflowPort for SystemWorkflow {
                         platform: plan.request.platform,
                         configuration_digest: &configuration_digest,
                         repository_id: &repository_id,
-                        created: "1970-01-01T00:00:00Z",
+                        created: &created,
                         repository: image_repository,
                         options: TaskImageOptions {
                             progress: Progress::Plain,
+                            builder: Builder::Existing(Some(builder.to_owned())),
                             output: ImageOutput::Load,
                             ..TaskImageOptions::default()
                         },
@@ -237,11 +285,15 @@ impl WorkflowPort for SystemWorkflow {
                 ));
             }
 
+            provisional_image.state = ResourceState::Cleaned;
+            journal.append(&[provisional_image])?;
+
             let execution = &plan.template.execution;
             let secret_root = tempfile::Builder::new()
                 .prefix("repo-sandbox-secrets-")
                 .tempdir()
                 .map_err(environment("create runtime secret directory"))?;
+            let mut secret_files = SecretBackingFiles::default();
             let mut secret_mounts = Vec::new();
             for name in &execution.secret_environment {
                 let value = std::env::var_os(name).ok_or_else(|| {
@@ -251,8 +303,7 @@ impl WorkflowPort for SystemWorkflow {
                 })?;
                 let value = validated_secret_text(name, &value)?;
                 let path = secret_root.path().join(name);
-                fs::write(&path, value.as_bytes())
-                    .map_err(environment("materialize runtime secret"))?;
+                secret_files.write(&path, value.as_bytes())?;
                 secret_mounts.push(SecretMount {
                     environment: name.clone(),
                     source: path,
@@ -353,24 +404,27 @@ impl WorkflowPort for SystemWorkflow {
                 .publication_progress
                 .extend(early_publication_progress.clone());
 
-            let mut bookkeeping_errors = Vec::new();
+            let mut bookkeeping_errors = secret_files.scrub();
             if report.cleanup == repo_sandbox_core::runner::CleanupResult::RetainedOnFailure
                 && materialized.is_automatically_cleaned()
             {
                 let registration =
                     retain_source_after_registration(&mut materialized, |source_path| {
-                        fs::write(source_path.join(OWNER_MARKER), &task_id)
-                            .map_err(environment("mark retained source"))
-                            .and_then(|()| {
-                                journal.append(&[CleanCandidate {
-                                    task_id: task_id.clone(),
-                                    repository_id: repository_id.clone(),
-                                    kind: ResourceKind::Source,
-                                    identifier: source_path.display().to_string(),
-                                    owner: task_id.clone(),
-                                    state: ResourceState::Retained,
-                                }])
-                            })
+                        fs::write(
+                            source_path.join(OWNER_MARKER),
+                            source_cleanup_owner(&task_id, &repository_id),
+                        )
+                        .map_err(environment("mark retained source"))
+                        .and_then(|()| {
+                            journal.append(&[CleanCandidate {
+                                task_id: task_id.clone(),
+                                repository_id: repository_id.clone(),
+                                kind: ResourceKind::Source,
+                                identifier: source_path.display().to_string(),
+                                owner: task_id.clone(),
+                                state: ResourceState::Retained,
+                            }])
+                        })
                     });
                 if let Err(error) = registration {
                     bookkeeping_errors.push(error.to_string());
@@ -403,6 +457,8 @@ impl WorkflowPort for SystemWorkflow {
                 export_verified_oci(
                     plan,
                     &catalog_root,
+                    &builder,
+                    &created,
                     &materialized,
                     &environment_image,
                     &environment_layout,
@@ -429,6 +485,8 @@ impl WorkflowPort for SystemWorkflow {
                     build_multi_platform_task(
                         plan,
                         &catalog_root,
+                        &builder,
+                        &created,
                         &materialized,
                         &environment_image,
                         &environment_layout,
@@ -476,12 +534,26 @@ impl WorkflowPort for SystemWorkflow {
                     platform_digests: published_task.1.platform_digests,
                     aliases,
                 };
-                let publication_result = DockerRegistry::new(SystemRegistryExecutor)
-                    .publish_with_progress(&publish_request, &cancellation, |published| {
-                        report.published = Some(published.clone());
-                        completed_report = Some(report.clone());
-                    })
-                    .map_err(|error| bounded_error("publish", error, &cancellation));
+                let publication_result = {
+                    let observations =
+                        std::cell::RefCell::new((&mut report, &mut completed_report));
+                    DockerRegistry::new(SystemRegistryExecutor)
+                        .publish_with_observers(
+                            &publish_request,
+                            &cancellation,
+                            |published| {
+                                let mut observation = observations.borrow_mut();
+                                observation.0.published = Some(published.clone());
+                                *observation.1 = Some(observation.0.clone());
+                            },
+                            |fact| {
+                                let mut observation = observations.borrow_mut();
+                                observation.0.publication_progress.push(fact);
+                                *observation.1 = Some(observation.0.clone());
+                            },
+                        )
+                        .map_err(|error| bounded_error("publish", error, &cancellation))
+                };
                 let publication = match publication_result {
                     Ok(publication) => publication,
                     Err(primary) => {
@@ -748,7 +820,7 @@ impl CleanPort for SystemWorkflow {
                 }
             }
         }
-        for (_, candidate) in latest {
+        for (_, mut candidate) in latest {
             if candidate.state == ResourceState::Cleaned {
                 continue;
             }
@@ -758,12 +830,22 @@ impl CleanPort for SystemWorkflow {
                 continue;
             };
             let owned_state = manifest_root.parent().expect("tasks has parent");
-            if candidate.kind == ResourceKind::Cache
-                && Path::new(&candidate.identifier) != owned_state.join("cache")
-            {
-                plan.refused
-                    .push(format!("{}: cache boundary mismatch", candidate.identifier));
-                continue;
+            if candidate.kind == ResourceKind::Cache {
+                let recorded = Path::new(&candidate.identifier);
+                let current = owned_state.join("cache");
+                if recorded != current {
+                    // A cache is the singleton root of its trusted journal
+                    // store. After repository relocation, rebase only that
+                    // known layout; never remove the old absolute pathname.
+                    let same_layout = recorded.file_name().is_some_and(|name| name == "cache")
+                        && recorded.parent().and_then(Path::file_name) == owned_state.file_name();
+                    if !same_layout || candidate.owner != candidate.repository_id {
+                        plan.refused
+                            .push(format!("{}: cache boundary mismatch", candidate.identifier));
+                        continue;
+                    }
+                    candidate.identifier = current.display().to_string();
+                }
             }
             if candidate.kind == ResourceKind::Source && !trusted_source_path(&candidate.identifier)
             {
@@ -793,6 +875,10 @@ impl CleanPort for SystemWorkflow {
     }
 }
 
+fn policy_cleanup_exclusion(reason: &str) -> bool {
+    reason.ends_with(": images not requested") || reason.ends_with(": cache not requested")
+}
+
 fn execute_clean(
     plan: &CleanPlan,
     dry_run: bool,
@@ -809,7 +895,18 @@ fn execute_clean_with_hook(
 ) -> Result<CleanResult, AppError> {
     let mut result = CleanResult {
         dry_run,
-        skipped: plan.refused.clone(),
+        skipped: plan
+            .refused
+            .iter()
+            .filter(|reason| policy_cleanup_exclusion(reason))
+            .cloned()
+            .collect(),
+        failed: plan
+            .refused
+            .iter()
+            .filter(|reason| !policy_cleanup_exclusion(reason))
+            .cloned()
+            .collect(),
         ..CleanResult::default()
     };
     let bound_journals = if dry_run {
@@ -819,7 +916,9 @@ fn execute_clean_with_hook(
     };
     let _lease = if dry_run {
         None
-    } else if let Some(path) = &plan.lease_path {
+    } else if let Some(path) = &plan.lease_path
+        && !plan.candidates.is_empty()
+    {
         let lease_path = bound_journals
             .as_ref()
             .map(|bound| bound.lease.as_path())
@@ -1079,7 +1178,136 @@ fn preserve_requested_ref(
     }
 }
 
-fn validate_outputs(plan: &ExecutionPlan) -> Result<(), AppError> {
+fn source_cleanup_owner(task: &str, repository: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"repo-sandbox-source-owner-v2\0");
+    digest.update(task.as_bytes());
+    digest.update(b"\0");
+    digest.update(repository.as_bytes());
+    format!("{:x}", digest.finalize())[..48].to_owned()
+}
+
+fn validate_snapshot_output_boundary(
+    plan: &ExecutionPlan,
+    repository: &Path,
+    cancellation: &dyn Cancellation,
+) -> Result<(), AppError> {
+    if plan
+        .request
+        .repository
+        .as_deref()
+        .is_some_and(is_remote_repository)
+    {
+        return Ok(());
+    }
+    let root =
+        fs::canonicalize(repository).map_err(environment("resolve source output boundary"))?;
+    for output in [
+        plan.request.report.as_deref(),
+        plan.request.oci_layout.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let absolute = resolved_future_path(output)?;
+        if !absolute.starts_with(&root) || absolute.starts_with(root.join(".repo-sandbox")) {
+            continue;
+        }
+        let output = SystemProcessExecutor
+            .execute(
+                &ProcessInvocation {
+                    program: "git".into(),
+                    args: vec![
+                        "check-ignore".into(),
+                        "--quiet".into(),
+                        "--".into(),
+                        absolute.to_string_lossy().into_owned(),
+                    ],
+                    current_dir: Some(root.clone()),
+                },
+                cancellation,
+            )
+            .map_err(environment("check source output ignore policy"))?;
+        if output.interrupted || output.exit_code != Some(0) {
+            return Err(AppError::Configuration(format!(
+                "workflow output {} is inside the source repository and is not Git-ignored; add its output directory to .gitignore or use a destination outside the repository",
+                absolute.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_secret_daemon(
+    executor: &impl ProcessExecutor,
+    cancellation: &dyn Cancellation,
+) -> Result<(), AppError> {
+    let context = std::env::var("DOCKER_CONTEXT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let host = std::env::var("DOCKER_HOST")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let endpoint = if let (None, Some(host)) = (&context, host) {
+        host
+    } else {
+        let mut args = vec![
+            "context".into(),
+            "inspect".into(),
+            "--format={{.Endpoints.docker.Host}}".into(),
+        ];
+        if let Some(context) = context {
+            args.push(context);
+        }
+        let output = executor
+            .execute(
+                &ProcessInvocation {
+                    program: "docker".into(),
+                    args,
+                    current_dir: None,
+                },
+                cancellation,
+            )
+            .map_err(environment("inspect Docker secret bind endpoint"))?;
+        if output.interrupted || output.exit_code != Some(0) {
+            return Err(AppError::Environment(
+                "cannot establish local Docker endpoint for runtime secret mounts".into(),
+            ));
+        }
+        output.stdout.trim().to_owned()
+    };
+    if !local_secret_endpoint(&endpoint) {
+        return Err(AppError::Configuration("secret-bearing jobs require a local Docker socket; remote daemon bind mounts cannot read client-side secrets".into()));
+    }
+    Ok(())
+}
+
+fn local_secret_endpoint(endpoint: &str) -> bool {
+    endpoint.starts_with("unix:///") || endpoint.starts_with("npipe:////./pipe/")
+}
+
+pub fn validate_outputs(plan: &ExecutionPlan) -> Result<(), AppError> {
+    if let Some(output) = plan.request.oci_layout.as_deref()
+        && output
+            .as_os_str()
+            .to_string_lossy()
+            .contains([',', '\n', '\r'])
+    {
+        return Err(AppError::Configuration(
+            "OCI layout path must not contain commas or newlines".into(),
+        ));
+    }
+    #[cfg(windows)]
+    if repository_path(plan)?
+        .as_os_str()
+        .to_string_lossy()
+        .contains([',', '\n', '\r'])
+    {
+        return Err(AppError::Configuration(
+            "repository cache paths must not contain commas or newlines on Windows".into(),
+        ));
+    }
+
     if let Some(repository) = plan.request.repository.as_deref()
         && is_remote_repository(repository)
     {
@@ -1376,6 +1604,8 @@ fn failure_phase(error: &AppError) -> &'static str {
 fn build_multi_platform_task(
     plan: &ExecutionPlan,
     catalog_root: &Path,
+    builder: &str,
+    created: &str,
     materialized: &crate::snapshot::MaterializedSnapshot,
     primary_environment: &BuiltImage,
     primary_environment_layout: &Path,
@@ -1392,10 +1622,11 @@ fn build_multi_platform_task(
             BuildRequest::environment(
                 &plan.template,
                 catalog_root,
-                environment_ref,
+                environment_ref.clone(),
                 owned_environment_options(
                     BuildOptions {
                         progress: Progress::Plain,
+                        builder: Builder::Existing(Some(builder.to_owned())),
                         output: ImageOutput::Push,
                         platforms: plan.request.platforms.clone(),
                         ..BuildOptions::default()
@@ -1405,11 +1636,18 @@ fn build_multi_platform_task(
             ),
             cancellation,
         )
-        .map_err(|error| bounded_error("multi-platform environment", error, cancellation))?;
+        .map_err(|error| {
+            reconcile_staging_write(
+                &environment_ref,
+                PublicationFactKind::EnvironmentStaging,
+                &mut on_progress,
+            );
+            bounded_error("multi-platform environment", error, cancellation)
+        })?;
     on_progress(RemotePublicationFact {
         kind: PublicationFactKind::EnvironmentStaging,
         reference: environment.image.clone(),
-        digest: environment.digest.clone(),
+        digest: Some(environment.digest.clone()),
         verified: true,
         finality: PublicationFinality::Staging,
     });
@@ -1442,6 +1680,19 @@ fn build_multi_platform_task(
             environment_manifest,
             *platform == plan.request.platform,
         );
+        let task_identity = repo_sandbox_core::task_image::task_image_identity(
+            &repo_sandbox_core::task_image::TaskImageInputs {
+                environment_digest: &platform_environment.digest,
+                snapshot: &materialized.snapshot,
+                template_id: &plan.template.template_id,
+                template_version: &plan.template.template_version,
+                configuration_digest,
+                repository_id,
+                created,
+            },
+        );
+        let staging_ref = ImageRef::new(format!("{}:{}", repository.as_str(), task_identity.tag()))
+            .map_err(AppError::Configuration)?;
         let task = TaskImageBuilder::new(SystemProcessExecutor)
             .build(
                 TaskImageRequest {
@@ -1455,10 +1706,11 @@ fn build_multi_platform_task(
                     platform: *platform,
                     configuration_digest,
                     repository_id,
-                    created: "1970-01-01T00:00:00Z",
+                    created,
                     repository: repository.as_str(),
                     options: TaskImageOptions {
                         progress: Progress::Plain,
+                        builder: Builder::Existing(Some(builder.to_owned())),
                         output: ImageOutput::Push,
                         platforms: vec![*platform],
                         ..TaskImageOptions::default()
@@ -1467,6 +1719,11 @@ fn build_multi_platform_task(
                 cancellation,
             )
             .map_err(|error| {
+                reconcile_staging_write(
+                    &staging_ref,
+                    PublicationFactKind::TaskStaging,
+                    &mut on_progress,
+                );
                 bounded_error(
                     &format!("multi-platform task image for {platform}"),
                     error,
@@ -1481,7 +1738,7 @@ fn build_multi_platform_task(
         on_progress(RemotePublicationFact {
             kind: PublicationFactKind::TaskStaging,
             reference: task.image.image.clone(),
-            digest: task.image.digest.clone(),
+            digest: Some(task.image.digest.clone()),
             verified: true,
             finality: PublicationFinality::Staging,
         });
@@ -1497,11 +1754,11 @@ fn build_multi_platform_task(
         materialized.snapshot.id.as_str(),
         &sources,
     )?;
-    let digest = create_multi_platform_index(&index, &sources, cancellation)?;
+    let digest = create_multi_platform_index(&index, &sources, cancellation, &mut on_progress)?;
     on_progress(RemotePublicationFact {
         kind: PublicationFactKind::TaskIndexStaging,
         reference: index.clone(),
-        digest: digest.clone(),
+        digest: Some(digest.clone()),
         verified: true,
         finality: PublicationFinality::Staging,
     });
@@ -1541,6 +1798,8 @@ fn multi_platform_index_ref(
 fn export_verified_oci(
     plan: &ExecutionPlan,
     catalog_root: &Path,
+    builder: &str,
+    created: &str,
     materialized: &crate::snapshot::MaterializedSnapshot,
     primary_environment: &BuiltImage,
     primary_environment_layout: &Path,
@@ -1573,6 +1832,7 @@ fn export_verified_oci(
                             owned_environment_options(
                                 BuildOptions {
                                     progress: Progress::Plain,
+                                    builder: Builder::Existing(Some(builder.to_owned())),
                                     output: ImageOutput::OciDirectory(environment_layout.clone()),
                                     platforms: vec![platform],
                                     ..BuildOptions::default()
@@ -1605,10 +1865,11 @@ fn export_verified_oci(
                     platform,
                     configuration_digest,
                     repository_id,
-                    created: "1970-01-01T00:00:00Z",
+                    created,
                     repository: "repo-sandbox-task-oci",
                     options: TaskImageOptions {
                         progress: Progress::Plain,
+                        builder: Builder::Existing(Some(builder.to_owned())),
                         output: ImageOutput::OciDirectory(layout.clone()),
                         platforms: vec![platform],
                         ..TaskImageOptions::default()
@@ -1849,17 +2110,123 @@ fn copy_tree(
     Ok(())
 }
 
+fn resolve_workflow_builder(
+    executor: &impl ProcessExecutor,
+    cancellation: &dyn Cancellation,
+) -> Result<String, AppError> {
+    let output = executor
+        .execute(
+            &ProcessInvocation {
+                program: "docker".into(),
+                args: vec!["buildx".into(), "inspect".into()],
+                current_dir: None,
+            },
+            cancellation,
+        )
+        .map_err(environment("resolve workflow Buildx builder"))?;
+    let name = output
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Name:").map(str::trim))
+        .unwrap_or_default();
+    if output.interrupted
+        || output.exit_code != Some(0)
+        || name.is_empty()
+        || name.starts_with('-')
+        || name.chars().any(char::is_whitespace)
+    {
+        return Err(AppError::Environment(format!(
+            "cannot resolve workflow Buildx builder: {}",
+            output.stderr.trim()
+        )));
+    }
+    Ok(name.to_owned())
+}
+
+// Gregorian calendar conversion from Unix days; capture this once per workflow
+// so every export of the verified image has the same truthful OCI timestamp.
+fn workflow_created(time: SystemTime) -> Result<String, AppError> {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            AppError::Environment(format!("workflow clock precedes Unix epoch: {error}"))
+        })?
+        .as_secs();
+    let days = i64::try_from(seconds / 86400)
+        .map_err(|error| AppError::Environment(format!("workflow date out of range: {error}")))?;
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3600 % 24,
+        seconds / 60 % 60,
+        seconds % 60
+    ))
+}
+
+#[derive(Default)]
+struct SecretBackingFiles(Vec<fs::File>);
+
+impl SecretBackingFiles {
+    fn write(&mut self, path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(environment("create runtime secret"))?;
+        self.0.push(file);
+        self.0
+            .last_mut()
+            .expect("inserted file")
+            .write_all(bytes)
+            .map_err(environment("materialize runtime secret"))
+    }
+
+    fn scrub(&mut self) -> Vec<String> {
+        self.0
+            .iter()
+            .filter_map(|file| {
+                // Truncate the open inode, even if a surviving container's bind
+                // mount or an unlinked path is the only other reference to it.
+                file.set_len(0)
+                    .and_then(|()| file.sync_all())
+                    .err()
+                    .map(|error| format!("zero runtime secret backing file: {error}"))
+            })
+            .collect()
+    }
+}
+
+impl Drop for SecretBackingFiles {
+    fn drop(&mut self) {
+        let _ = self.scrub();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn preflight(
     plan: &ExecutionPlan,
     repository: &Path,
     task_id: &str,
+    builder: &str,
+    repository_id: &str,
+    journal: &ManifestJournal,
     cancellation: &DeadlineCancellation,
     on_publication: impl FnMut(RemotePublicationFact),
 ) -> Result<(), AppError> {
     let mut outputs = Vec::new();
     for args in [
         ["info", "--format", "{{.Architecture}}"].as_slice(),
-        ["buildx", "inspect"].as_slice(),
+        ["buildx", "inspect", builder].as_slice(),
     ] {
         let invocation = ProcessInvocation {
             program: "docker".into(),
@@ -1895,18 +2262,36 @@ fn preflight(
             )));
         }
     }
-    let free = workflow_available_space(repository, cancellation)?;
+    if !plan.template.execution.secret_environment.is_empty() {
+        validate_secret_daemon(&SystemProcessExecutor, cancellation)?;
+    }
     let required = (1024_u64 * 1024 * 1024)
         .max(u64::from(plan.template.execution.resources.temporary_storage_mb) * 2 * 1024 * 1024);
-    if free < required {
-        return Err(AppError::Environment(format!(
-            "disk preflight requires {required} bytes free, found {free} bytes"
-        )));
+    for path in [repository, std::env::temp_dir().as_path()] {
+        let free = workflow_available_space(path, cancellation)?;
+        if free < required {
+            return Err(AppError::Environment(format!(
+                "disk preflight for {} requires {required} bytes free, found {free} bytes",
+                path.display()
+            )));
+        }
     }
-    preflight_writable_layer_quota(
+    preflight_writable_layer_quota_recorded(
         &SystemProcessExecutor,
         plan.template.execution.resources.temporary_storage_mb,
         cancellation,
+        task_id,
+        repository_id,
+        |kind, id, state| {
+            journal.append(&[CleanCandidate {
+                task_id: task_id.to_owned(),
+                repository_id: repository_id.to_owned(),
+                kind,
+                identifier: id.to_owned(),
+                owner: task_id.to_owned(),
+                state,
+            }])
+        },
     )?;
     if plan.request.push {
         let policy = plan
@@ -1915,11 +2300,14 @@ fn preflight(
             .registry
             .as_ref()
             .expect("validated before preflight");
-        preflight_registry_publication_with(
+        require_registry_carbon_copy_capability(&SystemProcessExecutor, cancellation)?;
+        preflight_registry_with_builder(
             &SystemProcessExecutor,
             &policy.repository,
             task_id,
             plan.request.platforms.len() > 1,
+            Some(builder),
+            Some((repository_id, journal)),
             cancellation,
             on_publication,
         )?;
@@ -1927,6 +2315,7 @@ fn preflight(
     Ok(())
 }
 
+#[cfg(test)]
 fn preflight_registry_publication_with(
     executor: &impl ProcessExecutor,
     repository: &str,
@@ -1975,17 +2364,61 @@ fn require_registry_carbon_copy_capability(
     }
 }
 
+#[cfg(test)]
 fn preflight_registry_with(
     executor: &impl ProcessExecutor,
     repository: &str,
     task_id: &str,
     buildx_boundary: bool,
     cancellation: &DeadlineCancellation,
+    on_publication: impl FnMut(RemotePublicationFact),
+) -> Result<(), AppError> {
+    preflight_registry_with_builder(
+        executor,
+        repository,
+        task_id,
+        buildx_boundary,
+        None,
+        None,
+        cancellation,
+        on_publication,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_registry_with_builder(
+    executor: &impl ProcessExecutor,
+    repository: &str,
+    task_id: &str,
+    buildx_boundary: bool,
+    builder: Option<&str>,
+    cleanup_journal: Option<(&str, &ManifestJournal)>,
+    cancellation: &DeadlineCancellation,
     mut on_publication: impl FnMut(RemotePublicationFact),
 ) -> Result<(), AppError> {
     let repository = RegistryRepository::new(repository).map_err(AppError::Configuration)?;
     let tag = RegistryTag::new(format!("preflight-{task_id}")).map_err(AppError::Configuration)?;
     let probe = repository.tagged(&tag);
+    let provisional = cleanup_journal
+        .filter(|_| !buildx_boundary)
+        .map(|(owner, journal)| {
+            let candidate = CleanCandidate {
+                task_id: task_id.to_owned(),
+                repository_id: owner.to_owned(),
+                kind: ResourceKind::Image,
+                identifier: probe.to_string(),
+                owner: task_id.to_owned(),
+                state: ResourceState::Registered,
+            };
+            journal.append(std::slice::from_ref(&candidate))?;
+            Ok::<_, AppError>((candidate, journal))
+        })
+        .transpose()?;
+    let local_ownership = cleanup_journal
+        .map(|(owner, _)| {
+            format!(" io.repo-sandbox.repository-id={owner} io.repo-sandbox.owner={task_id}")
+        })
+        .unwrap_or_default();
     let temporary = tempfile::Builder::new()
         .prefix("repo-sandbox-registry-preflight-")
         .tempdir()
@@ -1993,7 +2426,7 @@ fn preflight_registry_with(
     fs::write(
         temporary.path().join("Dockerfile"),
         format!(
-            "FROM scratch\nLABEL io.repo-sandbox.kind=registry-preflight io.repo-sandbox.task-id={task_id}\n"
+            "FROM scratch\nLABEL io.repo-sandbox.kind=registry-preflight io.repo-sandbox.task-id={task_id}{local_ownership}\n"
         ),
     )
     .map_err(environment("write registry preflight Dockerfile"))?;
@@ -2001,20 +2434,19 @@ fn preflight_registry_with(
     let mut push_attempted = buildx_boundary;
     let metadata = temporary.path().join("metadata.json");
     let push = if buildx_boundary {
-        quota_command(
-            executor,
-            vec![
-                "buildx".into(),
-                "build".into(),
-                "--progress=plain".into(),
-                "--metadata-file".into(),
-                docker_host_path(&metadata),
-                "--output".into(),
-                format!("type=image,name={probe},push=true"),
-                docker_host_path(temporary.path()),
-            ],
-            cancellation,
-        )
+        let mut args = vec!["buildx".into(), "build".into()];
+        if let Some(builder) = builder {
+            args.extend(["--builder".into(), builder.to_owned()]);
+        }
+        args.extend([
+            "--progress=plain".into(),
+            "--metadata-file".into(),
+            docker_host_path(&metadata),
+            "--output".into(),
+            format!("type=image,name={probe},push=true"),
+            docker_host_path(temporary.path()),
+        ]);
+        quota_command(executor, args, cancellation)
     } else {
         let build = quota_command(
             executor,
@@ -2155,12 +2587,20 @@ fn preflight_registry_with(
                 &local_removal_deadline,
             ) {
                 Ok(output) => {
-                    if let Err(error) = quota_command_result(
+                    match quota_command_result(
                         "remove local registry preflight image",
                         &output,
                         &local_removal_deadline,
                     ) {
-                        add_primary_error(&mut primary, error);
+                        Err(error) => add_primary_error(&mut primary, error),
+                        Ok(()) => {
+                            if let Some((mut candidate, journal)) = provisional {
+                                candidate.state = ResourceState::Cleaned;
+                                if let Err(error) = journal.append(&[candidate]) {
+                                    add_primary_error(&mut primary, error);
+                                }
+                            }
+                        }
                     }
                 }
                 Err(error) => add_primary_error(&mut primary, error),
@@ -2282,7 +2722,7 @@ fn registry_preflight_fact(
     RemotePublicationFact {
         kind: PublicationFactKind::RegistryPreflightStaging,
         reference: reference.clone(),
-        digest,
+        digest: Some(digest),
         verified,
         finality: PublicationFinality::Staging,
     }
@@ -2356,19 +2796,30 @@ fn registry_push_digest(
     None
 }
 
-fn preflight_writable_layer_quota(
-    executor: &impl ProcessExecutor,
-    storage_mb: u32,
-    cancellation: &dyn Cancellation,
-) -> Result<(), AppError> {
-    preflight_writable_layer_quota_with_identity(executor, storage_mb, cancellation, &task_id())
-}
-
+#[cfg(test)]
 fn preflight_writable_layer_quota_with_identity(
     executor: &impl ProcessExecutor,
     storage_mb: u32,
     cancellation: &dyn Cancellation,
     identity: &str,
+) -> Result<(), AppError> {
+    preflight_writable_layer_quota_recorded(
+        executor,
+        storage_mb,
+        cancellation,
+        identity,
+        "",
+        |_, _, _| Ok(()),
+    )
+}
+
+fn preflight_writable_layer_quota_recorded(
+    executor: &impl ProcessExecutor,
+    storage_mb: u32,
+    cancellation: &dyn Cancellation,
+    identity: &str,
+    repository_id: &str,
+    mut record: impl FnMut(ResourceKind, &str, ResourceState) -> Result<(), AppError>,
 ) -> Result<(), AppError> {
     let temporary = tempfile::Builder::new()
         .prefix("repo-sandbox-quota-preflight-")
@@ -2376,6 +2827,14 @@ fn preflight_writable_layer_quota_with_identity(
         .map_err(environment("create quota preflight directory"))?;
     let image = format!("repo-sandbox-quota-probe:{identity}");
     let container = format!("repo-sandbox-quota-probe-{identity}");
+    // Register deterministic names before any daemon request. If ownership
+    // reconciliation itself fails, later clean can still discover the probe.
+    record(ResourceKind::Image, &image, ResourceState::Registered)?;
+    record(
+        ResourceKind::Container,
+        &container,
+        ResourceState::Registered,
+    )?;
     let kind_label_key = "io.repo-sandbox.kind";
     let task_label_key = "io.repo-sandbox.task-id";
     let kind_label = format!("{kind_label_key}=quota-probe");
@@ -2383,7 +2842,7 @@ fn preflight_writable_layer_quota_with_identity(
     let dockerfile = temporary.path().join("Dockerfile");
     fs::write(
         &dockerfile,
-        format!("FROM scratch\nLABEL {kind_label} {task_label}\n"),
+        format!("FROM scratch\nLABEL {kind_label} {task_label} io.repo-sandbox.owner={identity} io.repo-sandbox.repository-id={repository_id}\n"),
     )
     .map_err(environment("write quota probe Dockerfile"))?;
     let build = quota_command(
@@ -2434,6 +2893,8 @@ fn preflight_writable_layer_quota_with_identity(
                 kind_label.clone(),
                 "--label".into(),
                 task_label.clone(),
+                "--label".into(),
+                format!("io.repo-sandbox.repository-id={repository_id}"),
                 "--storage-opt".into(),
                 format!("size={storage_mb}m"),
                 image.clone(),
@@ -2475,12 +2936,32 @@ fn preflight_writable_layer_quota_with_identity(
     let mut cleanup_errors = Vec::new();
     for (kind, id) in [("container", container_id), ("image", image_id)] {
         if let Some(id) = id {
+            let resource = if kind == "container" {
+                ResourceKind::Container
+            } else {
+                ResourceKind::Image
+            };
+            if let Err(error) = record(resource.clone(), &id, ResourceState::Registered) {
+                cleanup_errors.push(error.to_string());
+            }
             match quota_command(
                 executor,
-                vec![kind.into(), "rm".into(), "--force".into(), id],
+                vec![kind.into(), "rm".into(), "--force".into(), id.clone()],
                 &removal_deadline,
             ) {
-                Ok(output) if output.exit_code == Some(0) => {}
+                Ok(output) if output.exit_code == Some(0) => {
+                    if let Err(error) = record(resource.clone(), &id, ResourceState::Cleaned) {
+                        cleanup_errors.push(error.to_string());
+                    }
+                    let name = if kind == "container" {
+                        &container
+                    } else {
+                        &image
+                    };
+                    if let Err(error) = record(resource, name, ResourceState::Cleaned) {
+                        cleanup_errors.push(error.to_string());
+                    }
+                }
                 Ok(output) => cleanup_errors.push(format!(
                     "Docker quota probe cleanup failed: {}",
                     output.stderr.trim()
@@ -2745,6 +3226,52 @@ fn trusted_catalog() -> Result<tempfile::TempDir, AppError> {
             include_bytes!("../../../templates/rust-bazel/context/offline-baseline/test.cc"),
         ),
         (
+            "templates/rust-bazel/context/offline-baseline/Cargo.toml",
+            include_bytes!("../../../templates/rust-bazel/context/offline-baseline/Cargo.toml"),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/Cargo.lock",
+            include_bytes!("../../../templates/rust-bazel/context/offline-baseline/Cargo.lock"),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/apps/cli/Cargo.toml",
+            include_bytes!(
+                "../../../templates/rust-bazel/context/offline-baseline/apps/cli/Cargo.toml"
+            ),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/crates/core/Cargo.toml",
+            include_bytes!(
+                "../../../templates/rust-bazel/context/offline-baseline/crates/core/Cargo.toml"
+            ),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/crates/adapters/Cargo.toml",
+            include_bytes!(
+                "../../../templates/rust-bazel/context/offline-baseline/crates/adapters/Cargo.toml"
+            ),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/rust_test.rs",
+            include_bytes!("../../../templates/rust-bazel/context/offline-baseline/rust_test.rs"),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/MODULE.rust",
+            include_bytes!("../../../templates/rust-bazel/context/offline-baseline/MODULE.rust"),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/MODULE.rust.lock",
+            include_bytes!(
+                "../../../templates/rust-bazel/context/offline-baseline/MODULE.rust.lock"
+            ),
+        ),
+        (
+            "templates/rust-bazel/context/offline-baseline/BUILD.rust.seed",
+            include_bytes!(
+                "../../../templates/rust-bazel/context/offline-baseline/BUILD.rust.seed"
+            ),
+        ),
+        (
             "templates/components/base-tools/context/Dockerfile",
             include_bytes!("../../../templates/components/base-tools/context/Dockerfile"),
         ),
@@ -2789,7 +3316,8 @@ fn is_scp_remote(value: &str) -> bool {
             .split_once('@')
             .is_some_and(|(user, host)| !user.is_empty() && !host.is_empty())
             && !path.is_empty()
-            && !path.starts_with(['\\', '/'])
+            && !authority.contains(['/', '\\'])
+            && !path.starts_with('\\')
     })
 }
 fn source_repository(source: &SourceSpec) -> &str {
@@ -2982,6 +3510,15 @@ struct CacheLease {
     _file: fs::File,
 }
 
+impl Drop for CacheLease {
+    fn drop(&mut self) {
+        // A concurrent fork can briefly inherit this open file description
+        // before exec closes it. Release the lease explicitly instead of
+        // waiting for every inherited descriptor to close.
+        let _ = self._file.unlock();
+    }
+}
+
 impl CacheLease {
     fn shared(cache: &Path, cancellation: &dyn Cancellation) -> Result<Self, AppError> {
         Self::acquire(cache, cancellation, true)
@@ -3060,10 +3597,52 @@ fn multi_environment_ref(
     .map_err(AppError::Configuration)
 }
 
+fn reconcile_staging_write(
+    reference: &ImageRef,
+    kind: PublicationFactKind,
+    mut on_progress: impl FnMut(RemotePublicationFact),
+) {
+    on_progress(RemotePublicationFact {
+        kind,
+        reference: reference.clone(),
+        digest: None,
+        verified: false,
+        finality: PublicationFinality::Staging,
+    });
+    let token = PostCancellationDeadline::new(registry_reconciliation_timeout());
+    let mut delay = registry_reconciliation_initial_delay();
+    while !token.is_cancelled() {
+        if let Ok(output) = quota_command(
+            &SystemProcessExecutor,
+            vec![
+                "buildx".into(),
+                "imagetools".into(),
+                "inspect".into(),
+                reference.to_string(),
+            ],
+            &token,
+        ) && output.exit_code == Some(0)
+            && let Some(digest) = registry_push_digest(&output)
+        {
+            on_progress(RemotePublicationFact {
+                kind,
+                reference: reference.clone(),
+                digest: Some(digest),
+                verified: false,
+                finality: PublicationFinality::Staging,
+            });
+            break;
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(std::time::Duration::from_secs(1));
+    }
+}
+
 fn create_multi_platform_index(
     target: &ImageRef,
     sources: &[String],
     cancellation: &dyn Cancellation,
+    mut on_progress: impl FnMut(RemotePublicationFact),
 ) -> Result<repo_sandbox_core::build::ImageDigest, AppError> {
     let mut args = vec![
         "buildx".into(),
@@ -3092,7 +3671,21 @@ fn create_multi_platform_index(
         }
         Ok(output)
     };
-    run(args, "create multi-platform task index")?;
+    if let Err(error) = run(args, "create multi-platform task index") {
+        reconcile_staging_write(
+            target,
+            PublicationFactKind::TaskIndexStaging,
+            &mut on_progress,
+        );
+        return Err(error);
+    }
+    on_progress(RemotePublicationFact {
+        kind: PublicationFactKind::TaskIndexStaging,
+        reference: target.clone(),
+        digest: None,
+        verified: false,
+        finality: PublicationFinality::Staging,
+    });
     let inspected = run(
         vec![
             "buildx".into(),
@@ -3101,7 +3694,14 @@ fn create_multi_platform_index(
             target.to_string(),
         ],
         "inspect multi-platform task index",
-    )?;
+    )
+    .inspect_err(|_| {
+        reconcile_staging_write(
+            target,
+            PublicationFactKind::TaskIndexStaging,
+            &mut on_progress,
+        );
+    })?;
     let digest = inspected
         .stdout
         .lines()
@@ -3212,8 +3812,66 @@ fn task_id() -> String {
     format!("{}-{process_nonce:016x}-{unique}", std::process::id())
 }
 fn repository_id(repository: &Path) -> Result<String, AppError> {
+    let state = repository.join(".repo-sandbox");
+    validate_state_root(repository, &state)?;
+    // The cache marker migrates journals created before the stable identity
+    // file existed, including repositories already moved to a new location.
+    for path in [
+        state.join("repository-id"),
+        state.join("cache").join(OWNER_MARKER),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if is_link_or_reparse(&metadata) || !metadata.is_file() {
+                    return Err(AppError::Environment(
+                        "repository identity must be a regular unlinked file".into(),
+                    ));
+                }
+                let mut options = OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    const O_NOFOLLOW: i32 = 0x0002_0000;
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    const O_NOFOLLOW: i32 = 0x0000_0100;
+                    options.custom_flags(O_NOFOLLOW);
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    options.custom_flags(0x0020_0000);
+                }
+                let mut file = options
+                    .open(&path)
+                    .map_err(environment("read repository identity"))?;
+                if !state_file_has_single_link(
+                    &file,
+                    &file
+                        .metadata()
+                        .map_err(environment("inspect repository identity"))?,
+                ) {
+                    return Err(AppError::Environment(
+                        "repository identity must be a single-link file".into(),
+                    ));
+                }
+                let mut identity = String::new();
+                file.read_to_string(&mut identity)
+                    .map_err(environment("read repository identity"))?;
+                if !valid_quota_resource_id("image", &identity) {
+                    return Err(AppError::Environment(
+                        "invalid persisted repository identity".into(),
+                    ));
+                }
+                return Ok(identity);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(environment("inspect repository identity")(error)),
+        }
+    }
     let mut h = Sha256::new();
-    h.update(repository.to_string_lossy().as_bytes());
+    h.update(repository.as_os_str().as_encoded_bytes());
     Ok(format!("sha256:{:x}", h.finalize()))
 }
 
@@ -3432,10 +4090,32 @@ fn bound_directory_path(handle: &fs::File) -> Result<PathBuf, AppError> {
     )))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
 fn bound_directory_path(handle: &fs::File) -> Result<PathBuf, AppError> {
-    use std::os::fd::AsRawFd;
-    Ok(PathBuf::from(format!("/dev/fd/{}", handle.as_raw_fd())))
+    use std::os::unix::fs::MetadataExt;
+    let metadata = handle
+        .metadata()
+        .map_err(environment("inspect bound directory"))?;
+    // Darwin's volfs resolves file IDs independently of their current names.
+    // The held descriptor pins this inode against recycling; unlike /dev/fd,
+    // volfs supports descendant lookup and is reachable by child processes.
+    let path = PathBuf::from(format!("/.vol/{}/{}", metadata.dev(), metadata.ino()));
+    let resolved = path
+        .metadata()
+        .map_err(environment("resolve bound directory through volfs"))?;
+    if !resolved.is_dir() || resolved.dev() != metadata.dev() || resolved.ino() != metadata.ino() {
+        return Err(AppError::Environment(
+            "filesystem cannot provide a stable bound directory through volfs".into(),
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn bound_directory_path(_handle: &fs::File) -> Result<PathBuf, AppError> {
+    Err(AppError::Environment(
+        "this Unix platform has no supported directory-handle path".into(),
+    ))
 }
 
 #[cfg(unix)]
@@ -4055,7 +4735,8 @@ fn bounded_error(
 /// kept outside the source repository so it can never alter snapshot identity.
 #[derive(Debug)]
 pub struct OutputReservation {
-    _file: fs::File,
+    file: Option<fs::File>,
+    path: PathBuf,
 }
 
 impl OutputReservation {
@@ -4089,14 +4770,12 @@ impl OutputReservation {
         display: &Path,
         description: &str,
     ) -> Result<Self, AppError> {
-        let file = Self::open_identity(identity, display, description)?;
-        file.try_lock().map_err(|error| {
+        Self::try_identity(identity, display, description)?.ok_or_else(|| {
             AppError::Configuration(format!(
-                "cannot reserve {description} {}: {error}",
+                "cannot reserve {description} {}: already reserved",
                 display.display()
             ))
-        })?;
-        Ok(Self { _file: file })
+        })
     }
 
     fn wait_identity(
@@ -4105,52 +4784,75 @@ impl OutputReservation {
         description: &str,
         cancellation: &dyn Cancellation,
     ) -> Result<Self, AppError> {
-        let file = Self::open_identity(identity, display, description)?;
         loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(std::fs::TryLockError::WouldBlock) if !cancellation.is_cancelled() => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(AppError::Environment(format!(
-                        "workflow cancelled while waiting to reserve {description} {}",
-                        display.display()
-                    )));
-                }
-                Err(std::fs::TryLockError::Error(error)) => {
-                    return Err(AppError::Environment(format!(
-                        "lock {description} {}: {error}",
-                        display.display()
-                    )));
-                }
+            if cancellation.is_cancelled() {
+                return Err(AppError::Environment(format!(
+                    "workflow cancelled while waiting to reserve {description} {}",
+                    display.display()
+                )));
             }
+            if let Some(reservation) = Self::try_identity(identity, display, description)? {
+                return Ok(reservation);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
-    fn open_identity(
+    fn try_identity(
         identity: &str,
         display: &Path,
         description: &str,
-    ) -> Result<fs::File, AppError> {
-        let mut digest = Sha256::new();
-        digest.update(identity.as_bytes());
+    ) -> Result<Option<Self>, AppError> {
         let root = output_reservation_root()?;
-        let path = root.join(format!("{:x}.lock", digest.finalize()));
+        // Serialize opening/locking and unlinking. No waiter may retain a
+        // handle to an unlocked inode after it has been removed from the name.
+        let _gate = reservation_gate(&root)?;
+        let path = root.join(format!("{:x}.lock", Sha256::digest(identity.as_bytes())));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
-            .map_err(|error| {
-                AppError::Environment(format!(
-                    "cannot reserve {description} {}: {error}",
-                    display.display()
-                ))
-            })?;
-        Ok(file)
+            .map_err(environment("open output reservation"))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self {
+                file: Some(file),
+                path,
+            })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(error) => Err(AppError::Environment(format!(
+                "cannot reserve {description} {}: {error}",
+                display.display()
+            ))),
+        }
     }
+}
+
+impl Drop for OutputReservation {
+    fn drop(&mut self) {
+        if let Some(parent) = self.path.parent()
+            && let Ok(_gate) = reservation_gate(parent)
+        {
+            // Close before unlink for Windows, while the gate prevents any
+            // process from reopening this path in between.
+            drop(self.file.take());
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn reservation_gate(root: &Path) -> Result<fs::File, AppError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("namespace.lock"))
+        .map_err(environment("open reservation namespace lock"))?;
+    file.lock()
+        .map_err(environment("lock reservation namespace"))?;
+    Ok(file)
 }
 
 fn output_reservation_root() -> Result<PathBuf, AppError> {
@@ -4612,7 +5314,7 @@ fn seed_registry_with(
         RemotePublicationFact {
             kind: PublicationFactKind::TaskStaging,
             reference: content.clone(),
-            digest: digest.clone(),
+            digest: Some(digest.clone()),
             verified: false,
             finality: PublicationFinality::Staging,
         },
@@ -4686,7 +5388,7 @@ fn reconcile_registry_seed(
         on_progress(RemotePublicationFact {
             kind: PublicationFactKind::TaskStaging,
             reference: reference.clone(),
-            digest: remote_digest.clone(),
+            digest: Some(remote_digest.clone()),
             verified: true,
             finality: PublicationFinality::Staging,
         });
@@ -4913,7 +5615,7 @@ fn remove_candidate(
                     "container",
                     "inspect",
                     "--format",
-                    "{{ index .Config.Labels \"io.repo-sandbox.task-id\" }}",
+                    "{{.Id}}|{{ index .Config.Labels \"io.repo-sandbox.task-id\" }}|{{ index .Config.Labels \"io.repo-sandbox.repository-id\" }}",
                     &candidate.identifier,
                 ],
                 cancellation,
@@ -4928,31 +5630,13 @@ fn remove_candidate(
                     ))
                 };
             }
-            let repository = docker_output(
-                &[
-                    "container",
-                    "inspect",
-                    "--format",
-                    "{{ index .Config.Labels \"io.repo-sandbox.repository-id\" }}",
-                    &candidate.identifier,
-                ],
-                cancellation,
-            )?;
-            if repository.exit_code != Some(0) {
-                return Err(format!(
-                    "inspect container repository owner: {}",
-                    repository.stderr.trim()
-                ));
-            }
-            if inspected.stdout.trim() != candidate.owner
-                || repository.stdout.trim() != candidate.repository_id
-            {
+            let (container_id, owner, repository) =
+                parse_owned_inspection("container", &inspected.stdout)?;
+            if owner != candidate.owner || repository != candidate.repository_id {
                 return Err("owner label mismatch".into());
             }
-            let removed = docker_output(
-                &["container", "rm", "--force", &candidate.identifier],
-                cancellation,
-            )?;
+            let removed =
+                docker_output(&["container", "rm", "--force", container_id], cancellation)?;
             if removed.exit_code == Some(0) {
                 Ok(RemovalOutcome::Removed)
             } else {
@@ -4965,7 +5649,7 @@ fn remove_candidate(
                     "image",
                     "inspect",
                     "--format",
-                    "{{ index .Config.Labels \"io.repo-sandbox.owner\" }}",
+                    "{{.Id}}|{{ index .Config.Labels \"io.repo-sandbox.owner\" }}|{{ index .Config.Labels \"io.repo-sandbox.repository-id\" }}",
                     &candidate.identifier,
                 ],
                 cancellation,
@@ -4977,25 +5661,8 @@ fn remove_candidate(
                     Err(format!("inspect owned image: {}", inspected.stderr.trim()))
                 };
             }
-            let repository = docker_output(
-                &[
-                    "image",
-                    "inspect",
-                    "--format",
-                    "{{ index .Config.Labels \"io.repo-sandbox.repository-id\" }}",
-                    &candidate.identifier,
-                ],
-                cancellation,
-            )?;
-            if repository.exit_code != Some(0) {
-                return Err(format!(
-                    "inspect image repository owner: {}",
-                    repository.stderr.trim()
-                ));
-            }
-            if inspected.stdout.trim() != candidate.owner
-                || repository.stdout.trim() != candidate.repository_id
-            {
+            let (image_id, owner, repository) = parse_owned_inspection("image", &inspected.stdout)?;
+            if owner != candidate.owner || repository != candidate.repository_id {
                 return Err("image owner label mismatch".into());
             }
             let references = docker_output(
@@ -5005,7 +5672,7 @@ fn remove_candidate(
                     "--all",
                     "--quiet",
                     "--filter",
-                    &format!("ancestor={}", candidate.identifier),
+                    &format!("ancestor={image_id}"),
                 ],
                 cancellation,
             )?;
@@ -5018,7 +5685,7 @@ fn remove_candidate(
             if !references.stdout.trim().is_empty() {
                 return Ok(RemovalOutcome::Referenced);
             }
-            let removed = docker_output(&["image", "rm", &candidate.identifier], cancellation)?;
+            let removed = docker_output(&["image", "rm", image_id], cancellation)?;
             if removed.exit_code == Some(0) {
                 Ok(RemovalOutcome::Removed)
             } else {
@@ -5031,26 +5698,132 @@ fn remove_candidate(
                 return Ok(RemovalOutcome::Absent);
             }
             let parent = path.parent().ok_or("source has no parent")?;
-            cleanup_owned_temp_source(parent, &path, &candidate.owner)
-                .map(|_| RemovalOutcome::Removed)
-                .map_err(|e| e.to_string())
+            cleanup_owned_temp_source(
+                parent,
+                &path,
+                &source_cleanup_owner(&candidate.owner, &candidate.repository_id),
+            )
+            .map(|_| RemovalOutcome::Removed)
+            .map_err(|e| e.to_string())
         }
-        ResourceKind::Cache => {
-            let path = PathBuf::from(&candidate.identifier);
-            if !path.exists() {
-                return Ok(RemovalOutcome::Absent);
-            }
-            let owner = fs::read_to_string(path.join(OWNER_MARKER)).map_err(|e| e.to_string())?;
-            if owner != candidate.owner {
-                return Err("cache owner marker mismatch".into());
-            }
-            fs::remove_dir_all(path)
-                .map(|_| RemovalOutcome::Removed)
-                .map_err(|e| e.to_string())
-        }
+        ResourceKind::Cache => remove_owned_cache(candidate, cancellation, || {}),
         ResourceKind::Builder => {
             Err("builder cleanup requires an exact adapter ownership record".into())
         }
+    }
+}
+
+fn parse_owned_inspection<'a>(
+    kind: &str,
+    output: &'a str,
+) -> Result<(&'a str, &'a str, &'a str), String> {
+    let mut parts = output.trim().split('|');
+    let id = parts.next().unwrap_or_default();
+    let owner = parts.next().unwrap_or_default();
+    let repository = parts.next().unwrap_or_default();
+    if !valid_quota_resource_id(kind, id)
+        || owner.is_empty()
+        || repository.is_empty()
+        || parts.next().is_some()
+    {
+        return Err("invalid owned resource inspection".into());
+    }
+    Ok((id, owner, repository))
+}
+
+fn remove_owned_cache(
+    candidate: &CleanCandidate,
+    cancellation: &dyn Cancellation,
+    after_owner: impl FnOnce(),
+) -> Result<RemovalOutcome, String> {
+    let path = Path::new(&candidate.identifier);
+    if !path.try_exists().map_err(|error| error.to_string())? {
+        return Ok(RemovalOutcome::Absent);
+    }
+    let handle = bind_state_directory(path).map_err(|error| error.to_string())?;
+    let identity = state_identity_from_handle(&handle).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    let bound = bound_directory_path(&handle).map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    let bound = path.to_path_buf();
+    let marker = bound.join(OWNER_MARKER);
+    let metadata = fs::symlink_metadata(&marker).map_err(|error| error.to_string())?;
+    if is_link_or_reparse(&metadata) || !metadata.is_file() {
+        return Err("cache owner marker must be an unlinked regular file".into());
+    }
+    let marker_file = fs::File::open(&marker).map_err(|error| error.to_string())?;
+    if !state_file_has_single_link(&marker_file, &metadata) {
+        return Err("cache owner marker must have exactly one link".into());
+    }
+    let owner = fs::read_to_string(&marker).map_err(|error| error.to_string())?;
+    if owner != candidate.owner {
+        return Err("cache owner marker mismatch".into());
+    }
+    drop(marker_file);
+    after_owner();
+    if cancellation.is_cancelled() {
+        return Err("cache cleanup cancelled".into());
+    }
+    // Move into a private directory and compare the moved inode before any
+    // deletion. A replacement at the original name is never traversed.
+    let parent = path.parent().ok_or("cache has no parent")?;
+    let tombstone = tempfile::Builder::new()
+        .prefix(".repo-sandbox-cache-clean-")
+        .tempdir_in(parent)
+        .map_err(|error| error.to_string())?;
+    let moved = tombstone.path().join("cache");
+    drop(handle); // Windows directory handles prevent rename while open.
+    fs::rename(path, &moved).map_err(|error| error.to_string())?;
+    // Keep the directory until explicitly emptied: TempDir must never delete
+    // an object whose identity or ownership has not passed this check.
+    let tombstone = tombstone.keep();
+    let operation = (|| {
+        if state_identity(&moved).map_err(|error| error.to_string())? != identity {
+            return Err("cache directory changed after ownership verification".to_owned());
+        }
+        remove_cache_tree(&moved, cancellation)
+    })();
+    if let Err(error) = operation {
+        let restored = rename_directory_no_replace(&moved, path);
+        if restored.is_ok() {
+            let _ = fs::remove_dir(&tombstone);
+        }
+        return Err(match restored {
+            Ok(()) => error,
+            Err(restore) => format!(
+                "{error}; cache preserved at {} (restore failed: {restore})",
+                moved.display()
+            ),
+        });
+    }
+    fs::remove_dir(tombstone).map_err(|error| error.to_string())?;
+    Ok(RemovalOutcome::Removed)
+}
+
+fn remove_cache_tree(path: &Path, cancellation: &dyn Cancellation) -> Result<(), String> {
+    if cancellation.is_cancelled() {
+        return Err("cache cleanup cancelled".into());
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.is_dir() && !is_link_or_reparse(&metadata) {
+        let mut marker = None;
+        for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry.file_name() == OWNER_MARKER {
+                marker = Some(entry.path());
+            } else {
+                remove_cache_tree(&entry.path(), cancellation)?;
+            }
+        }
+        if cancellation.is_cancelled() {
+            return Err("cache cleanup cancelled".into());
+        }
+        if let Some(marker) = marker {
+            fs::remove_file(marker).map_err(|error| error.to_string())?;
+        }
+        fs::remove_dir(path).map_err(|error| error.to_string())
+    } else {
+        fs::remove_file(path).map_err(|error| error.to_string())
     }
 }
 
@@ -5303,6 +6076,340 @@ mod tests {
                 other => panic!("unexpected registry probe invocation: {other:?}"),
             })
         }
+    }
+
+    #[test]
+    fn moving_repository_preserves_identity_and_rebases_only_its_cache() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("original");
+        fs::create_dir(&original).unwrap();
+        let id = repository_id(&original).unwrap();
+        let state = original.join(".repo-sandbox");
+        let (guard, lease, journal) =
+            prepare_leased_workflow_state(&original, &state, "task").unwrap();
+        write_state_file(
+            &guard.bound_path(&state.join("repository-id")).unwrap(),
+            id.as_bytes(),
+        )
+        .unwrap();
+        write_state_file(
+            &guard
+                .bound_path(&state.join("cache").join(OWNER_MARKER))
+                .unwrap(),
+            id.as_bytes(),
+        )
+        .unwrap();
+        journal
+            .append(&[CleanCandidate {
+                task_id: "task".into(),
+                repository_id: id.clone(),
+                kind: ResourceKind::Cache,
+                identifier: state.join("cache").display().to_string(),
+                owner: id.clone(),
+                state: ResourceState::Registered,
+            }])
+            .unwrap();
+        drop(journal);
+        drop(lease);
+        drop(guard);
+        let moved = temporary.path().join("moved");
+        fs::rename(&original, &moved).unwrap();
+        assert_eq!(repository_id(&moved).unwrap(), id);
+        let plan = CleanPort::plan(
+            &SystemWorkflow,
+            &CleanRequest {
+                repository: moved.clone(),
+                all: false,
+                include_images: false,
+                include_cache: true,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        assert!(plan.refused.is_empty());
+        assert_eq!(
+            plan.candidates[0].identifier,
+            moved
+                .canonicalize()
+                .unwrap()
+                .join(".repo-sandbox/cache")
+                .display()
+                .to_string()
+        );
+        assert!(
+            CleanPort::execute(&SystemWorkflow, &plan, false)
+                .unwrap()
+                .complete()
+        );
+        assert!(!moved.join(".repo-sandbox/cache").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_repository_paths_have_distinct_ownership() {
+        use std::os::unix::ffi::OsStringExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![b'r', 0x80]));
+        let second = temporary
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![b'r', 0x81]));
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(
+            repository_id(&first).unwrap(),
+            repository_id(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn source_cleanup_refuses_another_repositorys_retained_snapshot() {
+        let temporary = tempfile::Builder::new()
+            .prefix("repo-sandbox-source-")
+            .tempdir()
+            .unwrap();
+        let source = temporary.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(
+            source.join(OWNER_MARKER),
+            source_cleanup_owner("task", "repo-b"),
+        )
+        .unwrap();
+        let mut candidate = CleanCandidate {
+            task_id: "task".into(),
+            repository_id: "repo-a".into(),
+            kind: ResourceKind::Source,
+            identifier: source.display().to_string(),
+            owner: "task".into(),
+            state: ResourceState::Retained,
+        };
+        assert!(remove_candidate(&candidate, &NeverCancelled).is_err());
+        assert!(source.exists());
+        candidate.repository_id = "repo-b".into();
+        assert_eq!(
+            remove_candidate(&candidate, &NeverCancelled).unwrap(),
+            RemovalOutcome::Removed
+        );
+    }
+
+    #[test]
+    fn clean_integrity_refusals_are_failures_and_empty_clean_creates_nothing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let plan = CleanPlan {
+            refused: vec![
+                "image: images not requested".into(),
+                "cache: owner mismatch".into(),
+            ],
+            lease_path: Some(temporary.path().join(".repo-sandbox/.workflow.lock")),
+            ..CleanPlan::default()
+        };
+        let result = execute_clean(&plan, false, &NeverCancelled).unwrap();
+        assert!(!result.complete());
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.failed.len(), 1);
+        assert!(!temporary.path().join(".repo-sandbox").exists());
+    }
+
+    #[test]
+    fn snapshot_outputs_require_ignore_rules_inside_the_repository() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(temporary.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut plan = default_execution_plan();
+        plan.request.repository = Some(temporary.path().display().to_string());
+        plan.request.report = Some(temporary.path().join(".reports/result.json"));
+        assert!(
+            validate_snapshot_output_boundary(&plan, temporary.path(), &NeverCancelled).is_err()
+        );
+        fs::write(temporary.path().join(".gitignore"), ".reports/\n").unwrap();
+        validate_snapshot_output_boundary(&plan, temporary.path(), &NeverCancelled).unwrap();
+        plan.request.oci_layout = Some(temporary.path().join("unignored-layout"));
+        assert!(
+            validate_snapshot_output_boundary(&plan, temporary.path(), &NeverCancelled).is_err()
+        );
+    }
+
+    #[test]
+    fn workflow_creation_time_matches_utc_calendar() {
+        assert_eq!(
+            workflow_created(UNIX_EPOCH).unwrap(),
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            workflow_created(UNIX_EPOCH + std::time::Duration::from_secs(1_709_208_000)).unwrap(),
+            "2024-02-29T12:00:00Z"
+        );
+        assert_eq!(
+            workflow_created(UNIX_EPOCH + std::time::Duration::from_secs(1_783_814_400)).unwrap(),
+            "2026-07-12T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn secrets_are_scrubbed_through_open_inodes_even_after_unlink() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("secret");
+        let mut secrets = SecretBackingFiles::default();
+        secrets.write(&path, b"credential\n").unwrap();
+        let mut mounted = fs::File::open(&path).unwrap();
+        #[cfg(unix)]
+        fs::remove_file(&path).unwrap();
+        drop(secrets);
+        let mut bytes = Vec::new();
+        mounted.read_to_end(&mut bytes).unwrap();
+        assert!(
+            bytes.is_empty(),
+            "surviving mount must expose no secret bytes"
+        );
+    }
+
+    #[test]
+    fn workflow_builder_uses_the_root_inspection_name() {
+        let executor = FixedExecutor(crate::buildkit::ProcessOutput {
+            exit_code: Some(0), interrupted: false, stderr: String::new(),
+            stdout: "Name:          selected\nDriver: docker-container\nNodes:\nName:          selected0\n".into(),
+        });
+        assert_eq!(
+            resolve_workflow_builder(&executor, &NeverCancelled).unwrap(),
+            "selected"
+        );
+    }
+
+    #[test]
+    fn output_reservation_removes_only_its_unlocked_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("report.json");
+        let reservation = OutputReservation::report(&output).unwrap();
+        let lock = reservation.path.clone();
+        assert!(lock.exists());
+        assert!(OutputReservation::report(&output).is_err());
+        drop(reservation);
+        assert!(!lock.exists());
+        let next = OutputReservation::report(&output).unwrap();
+        assert!(lock.exists());
+        drop(next);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn remote_daemons_are_rejected_for_secret_mounts() {
+        assert!(local_secret_endpoint("unix:///var/run/docker.sock"));
+        assert!(local_secret_endpoint("npipe:////./pipe/docker_engine"));
+        for endpoint in [
+            "tcp://localhost:2375",
+            "ssh://host",
+            "",
+            "npipe:////remote/pipe/docker_engine",
+        ] {
+            assert!(!local_secret_endpoint(endpoint));
+        }
+    }
+
+    #[test]
+    fn retained_source_owner_is_bound_to_both_task_and_repository() {
+        assert_ne!(
+            source_cleanup_owner("same-task", "repo-a"),
+            source_cleanup_owner("same-task", "repo-b")
+        );
+        assert_ne!(
+            source_cleanup_owner("task-a", "repo"),
+            source_cleanup_owner("task-b", "repo")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_replacement_after_owner_read_is_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join(OWNER_MARKER), "owner").unwrap();
+        let candidate = CleanCandidate {
+            task_id: "task".into(),
+            repository_id: "repo".into(),
+            kind: ResourceKind::Cache,
+            identifier: cache.display().to_string(),
+            owner: "owner".into(),
+            state: ResourceState::Registered,
+        };
+        let error = remove_owned_cache(&candidate, &NeverCancelled, || {
+            fs::rename(&cache, root.path().join("original")).unwrap();
+            fs::create_dir(&cache).unwrap();
+            fs::write(cache.join("foreign"), "keep me").unwrap();
+        })
+        .unwrap_err();
+        assert!(error.contains("changed after ownership verification"));
+        assert_eq!(
+            fs::read_to_string(cache.join("foreign")).unwrap(),
+            "keep me"
+        );
+        assert!(root.path().join("original").join(OWNER_MARKER).exists());
+    }
+
+    #[test]
+    fn failed_quota_removal_keeps_a_registered_cleanup_candidate() {
+        let ok = |stdout: String| crate::buildkit::ProcessOutput {
+            exit_code: Some(0),
+            stdout,
+            stderr: String::new(),
+            interrupted: false,
+        };
+        let image = format!("sha256:{}", "a".repeat(64));
+        let container = "b".repeat(64);
+        let executor = SequenceExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            outputs: std::sync::Mutex::new(
+                [
+                    ok(String::new()),
+                    ok(format!("{image}|quota-probe|fixture")),
+                    ok(String::new()),
+                    ok(format!("{container}|quota-probe|fixture")),
+                    crate::buildkit::ProcessOutput {
+                        exit_code: Some(1),
+                        stderr: "daemon unavailable".into(),
+                        ..ok(String::new())
+                    },
+                    ok(String::new()),
+                ]
+                .into(),
+            ),
+        };
+        let mut events = Vec::new();
+        let error = preflight_writable_layer_quota_recorded(
+            &executor,
+            384,
+            &NeverCancelled,
+            "fixture",
+            "repository",
+            |kind, id, state| {
+                events.push((kind, id.to_owned(), state));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cleanup failed"));
+        assert!(events.contains(&(
+            ResourceKind::Container,
+            container.clone(),
+            ResourceState::Registered
+        )));
+        assert!(!events.contains(&(ResourceKind::Container, container, ResourceState::Cleaned)));
+        assert!(events.contains(&(ResourceKind::Image, image, ResourceState::Cleaned)));
+        let calls = executor.calls.lock().unwrap();
+        assert!(
+            calls[2]
+                .args
+                .contains(&"io.repo-sandbox.repository-id=repository".into())
+        );
     }
 
     #[test]
@@ -6363,7 +7470,10 @@ mod tests {
                 .any(|arg| arg.contains("type=image") && arg.contains("push=true"))
         );
         assert_eq!(&calls[1].args[..3], ["buildx", "imagetools", "inspect"]);
-        assert_eq!(facts.last().unwrap().digest.as_str(), digest);
+        assert_eq!(
+            facts.last().unwrap().digest.as_ref().unwrap().as_str(),
+            digest
+        );
     }
 
     #[test]
@@ -6457,7 +7567,7 @@ mod tests {
         assert_eq!(facts.len(), 2);
         assert!(!facts[0].verified);
         assert!(facts[1].verified);
-        assert_eq!(facts[1].digest.as_str(), digest);
+        assert_eq!(facts[1].digest.as_ref().unwrap().as_str(), digest);
     }
 
     #[test]
@@ -6499,7 +7609,7 @@ mod tests {
         assert!(error.to_string().contains("lost buildx result"));
         assert_eq!(facts.len(), 1);
         assert!(facts[0].verified);
-        assert_eq!(facts[0].digest.as_str(), digest);
+        assert_eq!(facts[0].digest.as_ref().unwrap().as_str(), digest);
     }
 
     #[test]
@@ -6585,7 +7695,7 @@ mod tests {
         assert!(error.to_string().contains("push registry preflight image"));
         assert_eq!(facts.len(), 1);
         assert!(facts[0].verified);
-        assert_eq!(facts[0].digest.as_str(), digest);
+        assert_eq!(facts[0].digest.as_ref().unwrap().as_str(), digest);
     }
 
     #[test]
@@ -6629,7 +7739,7 @@ mod tests {
         assert_eq!(facts.len(), 2);
         assert!(!facts[0].verified);
         assert!(facts[1].verified);
-        assert_eq!(facts[1].digest.as_str(), digest);
+        assert_eq!(facts[1].digest.as_ref().unwrap().as_str(), digest);
     }
 
     #[test]
@@ -7220,7 +8330,7 @@ mod tests {
             RemotePublicationFact {
                 kind: PublicationFactKind::TaskStaging,
                 reference: reference.clone(),
-                digest: local.clone(),
+                digest: Some(local.clone()),
                 verified: false,
                 finality: PublicationFinality::Staging,
             },
@@ -7237,9 +8347,9 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("result was lost"));
         assert_eq!(facts.len(), 2);
         assert!(!facts[0].verified);
-        assert_eq!(facts[0].digest, local);
+        assert_eq!(facts[0].digest, Some(local));
         assert!(facts[1].verified);
-        assert_eq!(facts[1].digest, remote);
+        assert_eq!(facts[1].digest, Some(remote));
         assert!(
             facts
                 .iter()
@@ -7282,7 +8392,7 @@ mod tests {
                 RemotePublicationFact {
                     kind: PublicationFactKind::TaskStaging,
                     reference: reference.clone(),
-                    digest: seed_digest('a'),
+                    digest: Some(seed_digest('a')),
                     verified: false,
                     finality: PublicationFinality::Staging,
                 },
@@ -7320,7 +8430,7 @@ mod tests {
             RemotePublicationFact {
                 kind: PublicationFactKind::TaskStaging,
                 reference: reference.clone(),
-                digest: local.clone(),
+                digest: Some(local.clone()),
                 verified: false,
                 finality: PublicationFinality::Staging,
             },
@@ -7545,7 +8655,7 @@ mod tests {
         report.publication_progress = vec![RemotePublicationFact {
             kind: PublicationFactKind::TaskStaging,
             reference: seed,
-            digest: report.image_digest.clone(),
+            digest: Some(report.image_digest.clone()),
             verified: true,
             finality: PublicationFinality::Staging,
         }];
@@ -7707,7 +8817,8 @@ mod tests {
         plan.request.repository = Some(repository.path().to_string_lossy().into_owned());
         plan.request.oci_layout = Some(file_parent.join("layout"));
         let plan = ExecutionPlan::new(plan.template, plan.request);
-        let error = WorkflowPort::execute(&SystemWorkflow, WorkflowMode::Build, &plan).unwrap_err();
+        let error =
+            WorkflowPort::execute(&SystemWorkflow, WorkflowMode::Verify, &plan).unwrap_err();
         assert!(
             error.to_string().contains("OCI layout destination parent"),
             "unexpected error category: {error}"
@@ -7764,7 +8875,8 @@ mod tests {
         plan.request.report = Some(report_parent.join("result.json"));
         plan.request.push = true;
         let plan = ExecutionPlan::new(plan.template, plan.request);
-        let error = WorkflowPort::execute(&SystemWorkflow, WorkflowMode::Build, &plan).unwrap_err();
+        let error =
+            WorkflowPort::execute(&SystemWorkflow, WorkflowMode::Verify, &plan).unwrap_err();
         assert!(error.to_string().contains("--push requires"));
         assert!(!report_parent.exists());
         assert!(!repository.path().join(".repo-sandbox").exists());
@@ -7862,7 +8974,8 @@ mod tests {
         plan.request.repository = Some(repository.path().to_string_lossy().into_owned());
         plan.request.push = true;
         let plan = ExecutionPlan::new(plan.template, plan.request);
-        let error = WorkflowPort::execute(&SystemWorkflow, WorkflowMode::Build, &plan).unwrap_err();
+        let error =
+            WorkflowPort::execute(&SystemWorkflow, WorkflowMode::Verify, &plan).unwrap_err();
         assert!(error.to_string().contains("--push requires"));
         assert!(!repository.path().join(".repo-sandbox").exists());
     }
@@ -8308,6 +9421,8 @@ mod tests {
     fn scp_style_remote_classification_matches_snapshot_transport() {
         assert!(is_remote_repository("person@example.test:org/repo.git"));
         assert!(is_remote_repository("git@example.test:repo.git"));
+        assert!(is_remote_repository("git@example.test:/srv/repo.git"));
+        assert!(!is_remote_repository("folder/user@example.test:repo.git"));
         assert!(!is_remote_repository("C:\\work\\repo"));
         assert!(!is_remote_repository("relative:directory"));
     }

@@ -34,6 +34,21 @@ pub struct ExecutionPlan {
 }
 
 impl ExecutionPlan {
+    /// Enforce verified-output semantics before entering infrastructure.
+    pub fn validate_mode(&self, mode: WorkflowMode) -> Result<(), AppError> {
+        if mode == WorkflowMode::Build && (self.request.push || self.request.oci_layout.is_some()) {
+            return Err(AppError::Configuration(
+                "--push and --oci-layout require verify mode".into(),
+            ));
+        }
+        if self.request.push && self.request.oci_layout.is_some() {
+            return Err(AppError::Configuration(
+                "--push and --oci-layout must be requested in separate workflows".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn new(template: TemplatePlan, request: ExecutionRequest) -> Self {
         let mut hasher = Sha256::new();
         hash(&mut hasher, "repo-sandbox-execution-plan-v1");
@@ -201,24 +216,42 @@ pub struct WorkflowFailureStatus {
 static FAILURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn write_failure_report(report: &WorkflowFailureReport, path: &Path) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let bytes = serde_json::to_vec_pretty(report).map_err(std::io::Error::other)?;
+    write_failure_bytes(&bytes, path, &FAILURE_SEQUENCE)
+}
+
+fn write_failure_bytes(bytes: &[u8], path: &Path, sequence: &AtomicU64) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let name = path
         .file_name()
         .and_then(|v| v.to_str())
         .unwrap_or("report.json");
-    let temporary = parent.join(format!(
-        ".{name}.failure.{}.{}.tmp",
-        std::process::id(),
-        FAILURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    file.write_all(&serde_json::to_vec_pretty(report).map_err(std::io::Error::other)?)?;
-    file.sync_all()?;
-    let result = fs::hard_link(&temporary, path);
+    let (temporary, mut file) = loop {
+        let temporary = parent.join(format!(
+            ".{name}.failure.{}.{}.tmp",
+            std::process::id(),
+            sequence.fetch_add(1, Ordering::Relaxed)
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&temporary, path)
+    })();
     let _ = fs::remove_file(temporary);
     result
 }
@@ -236,6 +269,7 @@ impl<'a, P: WorkflowPort + ?Sized> BuildUseCase<'a, P> {
         Self { port }
     }
     pub fn execute(&self, plan: &ExecutionPlan) -> Result<WorkflowResult, AppError> {
+        plan.validate_mode(WorkflowMode::Build)?;
         self.port.execute(WorkflowMode::Build, plan)
     }
 }
@@ -248,6 +282,7 @@ impl<'a, P: WorkflowPort + ?Sized> VerifyUseCase<'a, P> {
         Self { port }
     }
     pub fn execute(&self, plan: &ExecutionPlan) -> Result<WorkflowResult, AppError> {
+        plan.validate_mode(WorkflowMode::Verify)?;
         self.port.execute(WorkflowMode::Verify, plan)
     }
 }
@@ -363,5 +398,75 @@ mod clean_result_tests {
             ..CleanResult::default()
         };
         assert!(!incomplete.complete());
+    }
+}
+
+#[cfg(test)]
+mod workflow_contract_tests {
+    use super::*;
+    use crate::config::{CliOverrides, Config};
+    use crate::template::TemplateCatalog;
+
+    fn plan() -> ExecutionPlan {
+        let config = Config::parse_yaml(
+            "version: 1\ntemplate:\n  id: rust-bazel\n  parameters:\n    platform: linux/amd64\n",
+        )
+        .unwrap();
+        let request = ExecutionRequest::resolve(&config, CliOverrides::default());
+        let template = TemplateCatalog::builtin()
+            .unwrap()
+            .plan(&config.template, request.platform)
+            .unwrap();
+        ExecutionPlan::new(template, request)
+    }
+
+    struct MustNotExecute;
+    impl WorkflowPort for MustNotExecute {
+        fn execute(&self, _: WorkflowMode, _: &ExecutionPlan) -> Result<WorkflowResult, AppError> {
+            panic!("invalid output request reached infrastructure")
+        }
+    }
+
+    #[test]
+    fn output_contracts_reject_untested_and_combined_outputs_before_infrastructure() {
+        let mut plan = plan();
+        assert!(plan.validate_mode(WorkflowMode::Build).is_ok());
+        plan.request.oci_layout = Some("layout".into());
+        assert!(BuildUseCase::new(&MustNotExecute).execute(&plan).is_err());
+        assert!(plan.validate_mode(WorkflowMode::Verify).is_ok());
+        plan.request.push = true;
+        assert!(VerifyUseCase::new(&MustNotExecute).execute(&plan).is_err());
+        plan.request.oci_layout = None;
+        assert!(BuildUseCase::new(&MustNotExecute).execute(&plan).is_err());
+        assert!(plan.validate_mode(WorkflowMode::Verify).is_ok());
+    }
+
+    #[test]
+    fn failure_writer_retries_stale_names_and_preserves_existing_reports() {
+        let root = std::env::temp_dir().join(format!(
+            "failure-report-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let destination = root.join("failure.json");
+        let stale = root.join(format!(
+            ".failure.json.failure.{}.0.tmp",
+            std::process::id()
+        ));
+        fs::write(&stale, b"stale").unwrap();
+        let sequence = AtomicU64::new(0);
+        write_failure_bytes(b"{\"status\":\"failed\"}", &destination, &sequence).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"{\"status\":\"failed\"}");
+        assert_eq!(fs::read(&stale).unwrap(), b"stale");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        let error = write_failure_bytes(b"replacement", &destination, &sequence).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&destination).unwrap(), b"{\"status\":\"failed\"}");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

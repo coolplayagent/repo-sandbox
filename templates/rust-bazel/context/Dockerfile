@@ -29,12 +29,12 @@ RUN --mount=type=cache,id=repo-sandbox-apt-${TARGETARCH},target=/var/cache/apt,s
     if [ -n "$token_header" ]; then header_args="--header=$token_header"; else header_args=''; fi; \
     bazelisk_download="/toolchain-downloads/bazelisk-${bazelisk_version}-${TARGETARCH}"; \
     bazel_download="/toolchain-downloads/bazel-${bazel_version}-${bazel_arch}"; \
-    if [ ! -s "$bazelisk_download" ]; then \
+    if ! printf '%s  %s\n' "$bazelisk_sha" "$bazelisk_download" | sha256sum --check --strict >/dev/null 2>&1; then \
       curl --fail --location --show-error $header_args \
         "https://github.com/bazelbuild/bazelisk/releases/download/v${bazelisk_version}/bazelisk-linux-${TARGETARCH}" \
         --output "$bazelisk_download"; \
     fi; \
-    if [ ! -s "$bazel_download" ]; then \
+    if ! printf '%s  %s\n' "$bazel_sha" "$bazel_download" | sha256sum --check --strict >/dev/null 2>&1; then \
       curl --fail --location --show-error $header_args \
         "https://github.com/bazelbuild/bazel/releases/download/${bazel_version}/bazel-${bazel_version}-linux-${bazel_arch}" \
         --output "$bazel_download"; \
@@ -90,6 +90,12 @@ COPY offline-baseline/ /opt/repo-sandbox/offline-baseline/
 RUN set -eu; \
     cd /opt/repo-sandbox/offline-baseline; \
     cp BUILD.seed BUILD.bazel; \
+    cp MODULE.bazel MODULE.cpp; \
+    cp MODULE.bazel.lock MODULE.cpp.lock; \
+    mkdir -p apps/cli/src crates/core/src crates/adapters/src crates/adapters/e2e; \
+    for source in apps/cli/src/lib.rs apps/cli/src/main.rs crates/core/src/lib.rs crates/adapters/src/lib.rs crates/adapters/e2e/e2e_matrix.rs; do \
+      printf 'fn main() {}\n' > "$source"; \
+    done; \
     mkdir -p /toolchain/bazel-seed; \
     cp MODULE.bazel.lock /tmp/repo-sandbox-baseline.lock; \
     bazel --batch --output_user_root=/toolchain/bazel-seed mod graph >/dev/null; \
@@ -98,7 +104,26 @@ RUN set -eu; \
     test -s /tmp/repo-sandbox-expected-hashes; \
     cmp /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes; \
     bazel --batch --output_user_root=/toolchain/bazel-seed test //...; \
+    cp MODULE.rust MODULE.bazel; \
+    cp MODULE.rust.lock MODULE.bazel.lock; \
+    cp BUILD.rust.seed BUILD.bazel; \
+    bazel --batch --output_user_root=/toolchain/bazel-seed fetch @crates//...; \
+    bazel --batch --output_user_root=/toolchain/bazel-seed test //...; \
     rm /tmp/repo-sandbox-baseline.lock /tmp/repo-sandbox-expected-hashes /tmp/repo-sandbox-actual-hashes; \
+    find /toolchain/bazel-seed -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
+    find /toolchain/bazel-seed/cache -mindepth 1 -maxdepth 1 ! -name repos -exec rm -rf '{}' +
+
+# Prove that the repository CAS alone is sufficient after discarding the seed's
+# installed toolchains, extracted repositories and action outputs.
+RUN --network=none set -eu; \
+    cd /opt/repo-sandbox/offline-baseline; \
+    bazel --batch --output_user_root=/toolchain/bazel-seed test //... --repository_disable_download; \
+    find /toolchain/bazel-seed -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
+    find /toolchain/bazel-seed/cache -mindepth 1 -maxdepth 1 ! -name repos -exec rm -rf '{}' +; \
+    cp MODULE.cpp MODULE.bazel; \
+    cp MODULE.cpp.lock MODULE.bazel.lock; \
+    cp BUILD.seed BUILD.bazel; \
+    bazel --batch --output_user_root=/toolchain/bazel-seed test //... --repository_disable_download; \
     find /toolchain/bazel-seed -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf '{}' +; \
     find /toolchain/bazel-seed/cache -mindepth 1 -maxdepth 1 ! -name repos -exec rm -rf '{}' +
 

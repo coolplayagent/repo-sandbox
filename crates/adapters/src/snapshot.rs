@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::process::{Command, Output};
@@ -43,7 +43,8 @@ impl MaterializedSnapshot {
             return;
         };
         let kept = temporary.keep();
-        self.path = kept.join("source");
+        // Keep the canonical source path already established at creation.
+        let _ = kept;
     }
 
     /// Recompute the #5 normalized manifest while copying the snapshot.
@@ -52,7 +53,20 @@ impl MaterializedSnapshot {
     /// mode changes made after materialization. The destination may contain
     /// partial data on error and must remain private until this returns `Ok`.
     pub fn copy_verified_to(&self, destination: &Path) -> Result<usize, SnapshotError> {
-        copy_and_verify_materialized(&self.path, destination, &self.manifest, &self.snapshot.id)
+        self.copy_verified_to_cancellable(destination, &NeverCancelled)
+    }
+    pub fn copy_verified_to_cancellable(
+        &self,
+        destination: &Path,
+        cancellation: &dyn Cancellation,
+    ) -> Result<usize, SnapshotError> {
+        copy_and_verify_materialized(
+            &self.path,
+            destination,
+            &self.manifest,
+            &self.snapshot.id,
+            cancellation,
+        )
     }
 }
 
@@ -152,7 +166,25 @@ impl GitSnapshotter {
                     &authentication,
                     cancellation,
                 )?;
-                let commit = resolve_commit(&clone, git_ref, cancellation)?;
+                let resolved_ref = if git_ref.starts_with("refs/") {
+                    git_remote(
+                        &clone,
+                        [
+                            OsString::from("fetch"),
+                            OsString::from("--no-tags"),
+                            OsString::from("--"),
+                            OsString::from(repository),
+                            OsString::from(format!("+{git_ref}:refs/repo-sandbox/requested")),
+                        ],
+                        "fetch requested remote ref",
+                        &authentication,
+                        cancellation,
+                    )?;
+                    "refs/repo-sandbox/requested"
+                } else {
+                    git_ref.as_str()
+                };
+                let commit = resolve_commit(&clone, resolved_ref, cancellation)?;
                 git(
                     &clone,
                     [
@@ -208,6 +240,7 @@ impl GitSnapshotter {
                 (kept.join("source"), None)
             }
         };
+        let path = fs::canonicalize(path).map_err(io_error("bind private snapshot root"))?;
         Ok(MaterializedSnapshot {
             snapshot: SourceSnapshot {
                 id,
@@ -505,14 +538,125 @@ fn ensure_snapshot_not_cancelled(cancellation: &dyn Cancellation) -> Result<(), 
     }
 }
 
+fn open_source_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        unsafe extern "C" {
+            fn openat(fd: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+        }
+        #[cfg(target_os = "linux")]
+        const NOFOLLOW: i32 = 0x0002_0000;
+        #[cfg(not(target_os = "linux"))]
+        const NOFOLLOW: i32 = 0x0000_0100;
+        #[cfg(target_os = "linux")]
+        const DIRECTORY: i32 = 0x0001_0000;
+        #[cfg(not(target_os = "linux"))]
+        const DIRECTORY: i32 = 0x0010_0000;
+        #[cfg(target_os = "linux")]
+        const CLOEXEC: i32 = 0x0008_0000;
+        #[cfg(not(target_os = "linux"))]
+        const CLOEXEC: i32 = 0x0100_0000;
+        let mut current = File::open("/")?;
+        let parts = path
+            .components()
+            .filter_map(|part| match part {
+                Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (index, part) in parts.iter().enumerate() {
+            let name = CString::new(part.as_bytes()).map_err(io::Error::other)?;
+            let flags = NOFOLLOW
+                | CLOEXEC
+                | if index + 1 == parts.len() {
+                    0
+                } else {
+                    DIRECTORY
+                };
+            let fd = unsafe { openat(current.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            current = unsafe { File::from_raw_fd(fd) };
+        }
+        if !current.metadata()?.is_file() {
+            return Err(io::Error::other("source is not a regular file"));
+        }
+        Ok(current)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, io::AsRawHandle};
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("source is not a regular file"));
+        }
+        unsafe extern "system" {
+            fn GetFinalPathNameByHandleW(
+                handle: *mut std::ffi::c_void,
+                buffer: *mut u16,
+                count: u32,
+                flags: u32,
+            ) -> u32;
+        }
+        let mut buffer = vec![0_u16; 32768];
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                0,
+            )
+        };
+        if length == 0 || length as usize >= buffer.len() {
+            return Err(io::Error::last_os_error());
+        }
+        let actual = PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
+        let expected = fs::canonicalize(path)?;
+        if !actual
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected.to_string_lossy())
+            || !actual
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .eq_ignore_ascii_case(path.to_string_lossy().trim_start_matches(r"\\?\"))
+        {
+            return Err(io::Error::other("source path changed while opening"));
+        }
+        Ok(file)
+    }
+}
+
 fn reject_lfs(files: &[SourceFile], cancellation: &dyn Cancellation) -> Result<(), SnapshotError> {
+    for file in files {
+        ensure_snapshot_not_cancelled(cancellation)?;
+        if let Some(source) = &file.source {
+            let mut input = open_source_file(source).map_err(io_error("inspect LFS pointer"))?;
+            let mut header = [0_u8; 128];
+            let count = input
+                .read(&mut header)
+                .map_err(io_error("inspect LFS pointer"))?;
+            if header[..count].starts_with(b"version https://git-lfs.github.com/spec/v1") {
+                return Err(SnapshotError::Unsupported(
+                    "Git LFS sources are not supported in v1".into(),
+                ));
+            }
+        }
+    }
     for file in files
         .iter()
         .filter(|file| file.relative.ends_with(".gitattributes"))
     {
         ensure_snapshot_not_cancelled(cancellation)?;
         let Some(source) = &file.source else { continue };
-        let mut input = File::open(source).map_err(io_error("inspect Git attributes for LFS"))?;
+        let mut input =
+            open_source_file(source).map_err(io_error("inspect Git attributes for LFS"))?;
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 64 * 1024];
         loop {
@@ -559,7 +703,7 @@ fn copy_and_digest(
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(io_error("create snapshot directory"))?;
             }
-            let mut input = File::open(source).map_err(io_error("read source file"))?;
+            let mut input = open_source_file(source).map_err(io_error("read source file"))?;
             let mut output = File::create(&target).map_err(io_error("create snapshot file"))?;
             let mut buffer = [0_u8; 64 * 1024];
             loop {
@@ -610,9 +754,10 @@ fn copy_and_verify_materialized(
     destination: &Path,
     expected: &[SnapshotManifestEntry],
     expected_id: &SnapshotId,
+    cancellation: &dyn Cancellation,
 ) -> Result<usize, SnapshotError> {
     let mut actual = Vec::new();
-    collect_materialized_files(source, Path::new(""), &mut actual)?;
+    collect_materialized_files(source, Path::new(""), &mut actual, cancellation)?;
     actual.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     let expected_paths = expected
         .iter()
@@ -635,6 +780,7 @@ fn copy_and_verify_materialized(
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut digest = Sha256::new();
     for entry in expected {
+        ensure_snapshot_not_cancelled(cancellation)?;
         let (length, content_digest) = if let Some(content) = &entry.virtual_content {
             (content.len() as u64, Sha256::digest(content))
         } else {
@@ -651,13 +797,14 @@ fn copy_and_verify_materialized(
                     .map_err(io_error("create verified snapshot directory"))?;
             }
             let mut input =
-                File::open(path).map_err(io_error("read materialized snapshot file"))?;
+                open_source_file(path).map_err(io_error("read materialized snapshot file"))?;
             let mut output =
                 File::create(&target).map_err(io_error("copy verified snapshot file"))?;
             let mut content = Sha256::new();
             let mut length = 0_u64;
             let mut buffer = [0_u8; 64 * 1024];
             loop {
+                ensure_snapshot_not_cancelled(cancellation)?;
                 let count = input
                     .read(&mut buffer)
                     .map_err(io_error("read materialized snapshot file"))?;
@@ -694,8 +841,11 @@ fn collect_materialized_files(
     root: &Path,
     prefix: &Path,
     files: &mut Vec<(String, PathBuf, u32)>,
+    cancellation: &dyn Cancellation,
 ) -> Result<(), SnapshotError> {
+    ensure_snapshot_not_cancelled(cancellation)?;
     for entry in fs::read_dir(root).map_err(io_error("read materialized snapshot"))? {
+        ensure_snapshot_not_cancelled(cancellation)?;
         let entry = entry.map_err(io_error("read materialized snapshot entry"))?;
         let relative = prefix.join(entry.file_name());
         let metadata = fs::symlink_metadata(entry.path())
@@ -707,7 +857,7 @@ fn collect_materialized_files(
             )));
         }
         if metadata.is_dir() {
-            collect_materialized_files(&entry.path(), &relative, files)?;
+            collect_materialized_files(&entry.path(), &relative, files, cancellation)?;
         } else if metadata.is_file() {
             files.push((
                 normalized_path(&relative)?,
@@ -898,23 +1048,42 @@ impl AuthenticationContext {
                 }
                 let askpass = write_askpass(temporary_root)?;
                 Ok(Self {
-                    environment: vec![
-                        ("GIT_ASKPASS".into(), askpass.into_os_string()),
-                        ("REPO_SANDBOX_GIT_TOKEN".into(), token.as_str().into()),
-                        // A short-lived token must never be approved into a configured
-                        // persistent helper.
-                        ("GIT_CONFIG_COUNT".into(), "2".into()),
-                        ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
-                        ("GIT_CONFIG_VALUE_0".into(), "".into()),
-                        ("GIT_CONFIG_KEY_1".into(), "credential.username".into()),
-                        ("GIT_CONFIG_VALUE_1".into(), username.into()),
-                    ],
+                    environment: {
+                        let mut environment = unauthenticated_environment(temporary_root)?;
+                        environment.extend(vec![
+                            ("GIT_ASKPASS".into(), askpass.into_os_string()),
+                            ("REPO_SANDBOX_GIT_TOKEN".into(), token.as_str().into()),
+                            // A short-lived token must never be approved into a configured
+                            // persistent helper.
+                            ("GIT_CONFIG_COUNT".into(), "2".into()),
+                            ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
+                            ("GIT_CONFIG_VALUE_0".into(), "".into()),
+                            ("GIT_CONFIG_KEY_1".into(), "credential.username".into()),
+                            ("GIT_CONFIG_VALUE_1".into(), username.into()),
+                        ]);
+                        environment
+                    },
                     secrets: vec![token],
                 })
             }
             GitAuthentication::HttpsCredentialHelper => {
                 require_https_repository(repository)?;
-                Ok(Self::default())
+                let config = temporary_root.join("https-no-ssh-config");
+                fs::write(&config, "Host *\n  BatchMode yes\n  IdentitiesOnly yes\n  IdentityAgent none\n  IdentityFile none\n  StrictHostKeyChecking yes\n").map_err(io_error("write HTTPS SSH isolation"))?;
+                Ok(Self {
+                    environment: vec![
+                        (
+                            "GIT_SSH_COMMAND".into(),
+                            "ssh -F \"$REPO_SANDBOX_SSH_CONFIG\"".into(),
+                        ),
+                        (
+                            "REPO_SANDBOX_SSH_CONFIG".into(),
+                            ssh_config_path(&config)?.into(),
+                        ),
+                        ("GIT_SSH_VARIANT".into(), "ssh".into()),
+                    ],
+                    secrets: Vec::new(),
+                })
             }
         }
     }
@@ -1044,19 +1213,18 @@ fn unauthenticated_environment(
         ("USERPROFILE".into(), home.as_os_str().to_owned()),
         ("XDG_CONFIG_HOME".into(), home.as_os_str().to_owned()),
         ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+        ("GIT_CONFIG_PARAMETERS".into(), "".into()),
         ("GIT_CONFIG_GLOBAL".into(), global_config.into_os_string()),
         ("GIT_CONFIG_COUNT".into(), "1".into()),
         ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
         ("GIT_CONFIG_VALUE_0".into(), "".into()),
-        // Anonymous mode must not leak credentials embedded in inherited proxy
-        // URLs. Callers that require a proxy must select an explicit
-        // authentication mode and provide its external credential references.
-        ("HTTP_PROXY".into(), "".into()),
-        ("HTTPS_PROXY".into(), "".into()),
-        ("ALL_PROXY".into(), "".into()),
-        ("http_proxy".into(), "".into()),
-        ("https_proxy".into(), "".into()),
-        ("all_proxy".into(), "".into()),
+        // Preserve proxy routing without inheriting credentials embedded in URLs.
+        ("HTTP_PROXY".into(), credential_free_proxy("HTTP_PROXY")),
+        ("HTTPS_PROXY".into(), credential_free_proxy("HTTPS_PROXY")),
+        ("ALL_PROXY".into(), credential_free_proxy("ALL_PROXY")),
+        ("http_proxy".into(), credential_free_proxy("http_proxy")),
+        ("https_proxy".into(), credential_free_proxy("https_proxy")),
+        ("all_proxy".into(), credential_free_proxy("all_proxy")),
         (
             "GIT_SSH_COMMAND".into(),
             "ssh -F \"$REPO_SANDBOX_SSH_CONFIG\"".into(),
@@ -1067,6 +1235,12 @@ fn unauthenticated_environment(
         ),
         ("GIT_SSH_VARIANT".into(), "ssh".into()),
     ])
+}
+
+fn credential_free_proxy(name: &str) -> OsString {
+    env::var_os(name)
+        .filter(|value| !value.to_string_lossy().contains('@'))
+        .unwrap_or_default()
 }
 
 fn ssh_config_path(path: &Path) -> Result<String, SnapshotError> {
@@ -1582,6 +1756,99 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    #[test]
+    fn materialized_copy_honors_cancellation_during_traversal() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let id = SnapshotId::parse("0".repeat(64)).unwrap();
+        let error =
+            copy_and_verify_materialized(source.path(), target.path(), &[], &id, &AlwaysCancelled)
+                .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_handle_rejects_replaced_parent_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret"), "private").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("changed")).unwrap();
+        assert!(open_source_file(&root.path().join("changed/secret")).is_err());
+    }
+
+    #[test]
+    fn lfs_pointer_is_rejected_without_attributes() {
+        let source = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            source.path(),
+            "version https://git-lfs.github.com/spec/v1\noid sha256:0000\nsize 9\n",
+        )
+        .unwrap();
+        let files = vec![SourceFile {
+            relative: "data.bin".into(),
+            source: Some(fs::canonicalize(source.path()).unwrap()),
+            virtual_content: None,
+            mode: 0o100644,
+        }];
+        assert!(
+            reject_lfs(&files, &NeverCancelled)
+                .unwrap_err()
+                .to_string()
+                .contains("LFS")
+        );
+    }
+
+    #[test]
+    fn isolated_auth_overrides_inherited_git_configuration_parameters() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = AuthenticationContext::prepare(
+            &GitAuthentication::None,
+            directory.path(),
+            "https://example.test/repo",
+        )
+        .unwrap();
+        let result = Command::new("git")
+            .args(["config", "--get-all", "http.extraHeader"])
+            .current_dir(directory.path())
+            .env(
+                "GIT_CONFIG_PARAMETERS",
+                "'http.extraHeader=Authorization: leaked'",
+            )
+            .envs(context.environment.iter().map(|(key, value)| (key, value)))
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(1));
+        assert!(result.stdout.is_empty());
+    }
+
+    #[test]
+    fn https_helper_preserves_git_config_but_disables_ssh_authentication() {
+        let root = tempfile::tempdir().unwrap();
+        let context = AuthenticationContext::prepare(
+            &GitAuthentication::HttpsCredentialHelper,
+            root.path(),
+            "https://example.test/repo",
+        )
+        .unwrap();
+        let config = context
+            .environment
+            .iter()
+            .find(|(key, _)| key == "REPO_SANDBOX_SSH_CONFIG")
+            .unwrap();
+        assert!(
+            fs::read_to_string(&config.1)
+                .unwrap()
+                .contains("IdentityAgent none")
+        );
+        assert!(
+            !context
+                .environment
+                .iter()
+                .any(|(key, _)| key == "GIT_CONFIG_PARAMETERS")
+        );
+    }
+
     struct AlwaysCancelled;
 
     impl Cancellation for AlwaysCancelled {
@@ -1604,7 +1871,7 @@ mod tests {
         let error = copy_and_digest(
             vec![SourceFile {
                 relative: "large.bin".into(),
-                source: Some(source.path().to_path_buf()),
+                source: Some(fs::canonicalize(source.path()).unwrap()),
                 virtual_content: None,
                 mode: 0o100644,
             }],

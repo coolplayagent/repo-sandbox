@@ -48,6 +48,7 @@ jobs:
         run: scripts/ci/release-bazel.sh
       - name: Rust formatting and lint contracts
         run: |
+          scripts/ci/offline-baseline-contract.sh
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           bash -n scripts/ci/*.sh scripts/e2e/*.sh scripts/docker/multistage-acceptance.sh

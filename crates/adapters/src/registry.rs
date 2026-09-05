@@ -9,7 +9,8 @@ use crate::snapshot::{ProcessTree, configure_process_tree};
 use repo_sandbox_core::build::{ImageDigest, ImageRef, PlatformDigest};
 use repo_sandbox_core::config::Platform;
 use repo_sandbox_core::registry::{
-    PublishRequest, PublishedImage, PullRequest, PulledImage, RegistryTag,
+    PublicationFactKind, PublicationFinality, PublishRequest, PublishedImage, PullRequest,
+    PulledImage, RegistryTag, RemotePublicationFact,
 };
 use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -326,37 +327,77 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
         &self,
         request: &PublishRequest,
         cancellation: &dyn Cancellation,
+        progress: impl FnMut(&PublishedImage),
+    ) -> Result<PublishedImage, RegistryError> {
+        self.publish_with_observers(request, cancellation, progress, |_| {})
+    }
+
+    pub fn publish_with_observers(
+        &self,
+        request: &PublishRequest,
+        cancellation: &dyn Cancellation,
         mut progress: impl FnMut(&PublishedImage),
+        mut facts: impl FnMut(RemotePublicationFact),
     ) -> Result<PublishedImage, RegistryError> {
         validate_publish(request)?;
         self.require_carbon_copy_capability(cancellation)?;
-        let content_tag = RegistryTag::for_digest(&request.digest);
-        let immutable = request.repository.tagged(&content_tag);
+        let immutable = request
+            .repository
+            .tagged(&RegistryTag::for_digest(&request.digest));
         let source = digest_ref(&request.source, &request.digest)?;
-        self.copy_manifest(&source, &immutable, &[], cancellation)?;
         let mut published = PublishedImage {
             immutable: immutable.clone(),
             aliases: Vec::new(),
             digest: request.digest.clone(),
             platform_digests: request.platform_digests.clone(),
         };
-        // A successful copy is an irreversible remote fact even if the
-        // following verification request fails. Surface it immediately.
-        progress(&published);
-        let inspected = self.inspect_digest(&immutable, &request.platform_digests, cancellation)?;
-        ensure_digest(&request.digest, &inspected.digest, "published content tag")?;
-        published.digest = inspected.digest;
-        published.platform_digests = inspected.platforms;
-        progress(&published);
-        for alias in &request.aliases {
-            let target = request.repository.tagged(alias);
-            let pinned = digest_ref(&immutable, &request.digest)?;
-            self.copy_manifest(&pinned, &target, &[], cancellation)?;
-            published.aliases.push(target.clone());
-            progress(&published);
-            let alias_manifest =
+        for (target, kind) in std::iter::once((immutable.clone(), PublicationFactKind::Immutable))
+            .chain(
+                request
+                    .aliases
+                    .iter()
+                    .map(|alias| (request.repository.tagged(alias), PublicationFactKind::Alias)),
+            )
+        {
+            facts(RemotePublicationFact {
+                kind,
+                reference: target.clone(),
+                digest: None,
+                verified: false,
+                finality: PublicationFinality::Final,
+            });
+            if let Err(error) = self.copy_manifest(&source, &target, &[], cancellation) {
+                struct Reconciliation(std::time::Instant);
+                impl Cancellation for Reconciliation {
+                    fn is_cancelled(&self) -> bool {
+                        std::time::Instant::now() >= self.0
+                    }
+                }
+                let token = Reconciliation(std::time::Instant::now() + Duration::from_secs(30));
+                if let Ok(observed) = self.inspect_digest(&target, &[], &token) {
+                    facts(RemotePublicationFact {
+                        kind,
+                        reference: target,
+                        digest: Some(observed.digest),
+                        verified: false,
+                        finality: PublicationFinality::Final,
+                    });
+                }
+                return Err(error);
+            }
+            let inspected =
                 self.inspect_digest(&target, &request.platform_digests, cancellation)?;
-            ensure_digest(&request.digest, &alias_manifest.digest, "published alias")?;
+            ensure_digest(&request.digest, &inspected.digest, "published reference")?;
+            facts(RemotePublicationFact {
+                kind,
+                reference: target.clone(),
+                digest: Some(inspected.digest),
+                verified: true,
+                finality: PublicationFinality::Final,
+            });
+            if kind == PublicationFactKind::Alias {
+                published.aliases.push(target);
+            }
             progress(&published);
         }
         Ok(published)
@@ -611,7 +652,7 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
             "imagetools".into(),
             "inspect".into(),
             "--raw".into(),
-            image.to_string(),
+            digest_ref(image, &digest)?.to_string(),
         ]);
         let raw = self.run("inspect raw manifest", &raw_invocation, None, cancellation)?;
         let mut platforms = parse_platforms(&raw.stdout)?;
@@ -623,6 +664,19 @@ impl<E: RegistryExecutor> DockerRegistry<E> {
         }
         if !expected.is_empty() {
             verify_platforms(&platforms, expected)?;
+        }
+        if !image.as_str().contains('@') {
+            let current = self.run(
+                "recheck manifest descriptor",
+                &digest_invocation,
+                None,
+                cancellation,
+            )?;
+            ensure_digest(
+                &digest,
+                &parse_descriptor_digest(&current.stdout)?,
+                "mutable manifest reference",
+            )?;
         }
         Ok(InspectedManifest { digest, platforms })
     }
@@ -1136,6 +1190,24 @@ mod tests {
     }
 
     #[test]
+    fn mutable_alias_inspection_pins_raw_and_rejects_concurrent_retag() {
+        let registry = DockerRegistry::new(FakeExecutor::new(vec![
+            ok(described()),
+            ok(multiarch()),
+            ok(format!("Digest: {AMD}\n")),
+        ]));
+        let image = ImageRef::new("registry.test/team/image:latest").unwrap();
+        assert!(
+            registry
+                .inspect_digest(&image, &platform_digests(), &NeverCancelled)
+                .is_err()
+        );
+        let calls = registry.executor.invocations.lock().unwrap();
+        assert!(calls[1].0.args.last().unwrap().ends_with(ROOT));
+        assert_eq!(calls[2].0.args.last().unwrap(), image.as_str());
+    }
+
+    #[test]
     fn password_login_uses_stdin_and_redacts_all_surfaces() {
         let password = "top-secret-token";
         let executor = FakeExecutor::new(vec![ok("")]);
@@ -1204,9 +1276,11 @@ mod tests {
             ok(""),
             ok(described()),
             ok(multiarch()),
+            ok(described()),
             ok(""),
             ok(described()),
             ok(multiarch()),
+            ok(described()),
         ]);
         let registry = DockerRegistry::new(executor);
         let request = PublishRequest {
@@ -1252,6 +1326,7 @@ mod tests {
             ok(""),
             ok(described()),
             ok(single_manifest()),
+            ok(described()),
             failed("alias copy denied"),
         ]);
         let registry = DockerRegistry::new(executor);
@@ -1272,7 +1347,7 @@ mod tests {
                     .push(state.clone()))
                 .is_err()
         );
-        assert_eq!(observed.len(), 2);
+        assert_eq!(observed.len(), 1);
         assert_eq!(observed.last().unwrap().digest, root_digest());
         assert!(observed.last().unwrap().aliases.is_empty());
     }
@@ -1284,9 +1359,11 @@ mod tests {
             ok(""),
             ok(described()),
             ok(multiarch()),
+            ok(described()),
             ok(""),
             ok(described()),
             ok(multiarch()),
+            ok(described()),
             ok(""),
             failed("alias inspect transport failure"),
         ]);
@@ -1308,15 +1385,15 @@ mod tests {
                     .push(state.clone()))
                 .is_err()
         );
-        assert_eq!(observed.len(), 5);
+        assert_eq!(observed.len(), 2);
         assert!(observed[0].aliases.is_empty());
-        assert_eq!(observed[3].aliases.len(), 1);
-        assert!(observed[3].aliases[0].as_str().ends_with(":stable"));
-        assert_eq!(observed.last().unwrap().aliases.len(), 2);
+        assert_eq!(observed[1].aliases.len(), 1);
+        assert!(observed[1].aliases[0].as_str().ends_with(":stable"));
+        assert_eq!(observed.last().unwrap().aliases.len(), 1);
         assert!(
-            observed.last().unwrap().aliases[1]
+            observed.last().unwrap().aliases[0]
                 .as_str()
-                .ends_with(":latest")
+                .ends_with(":stable")
         );
         assert_eq!(
             observed.last().unwrap().platform_digests,
@@ -1340,15 +1417,54 @@ mod tests {
             aliases: Vec::new(),
         };
         let mut observed = Vec::new();
+        let mut facts = Vec::new();
         assert!(
             registry
-                .publish_with_progress(&request, &NeverCancelled, |state| observed
-                    .push(state.clone()))
+                .publish_with_observers(
+                    &request,
+                    &NeverCancelled,
+                    |state| observed.push(state.clone()),
+                    |fact| facts.push(fact)
+                )
                 .is_err()
         );
-        assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].digest, request.digest);
-        assert_eq!(observed[0].platform_digests, request.platform_digests);
+        assert!(observed.is_empty());
+        assert_eq!(facts.len(), 1);
+        assert!(!facts[0].verified);
+        assert_eq!(facts[0].digest, None);
+    }
+
+    #[test]
+    fn ambiguous_copy_preserves_unknown_fact_when_reconciliation_fails() {
+        let executor = FakeExecutor::new(vec![
+            ok("--prefer-index\n"),
+            failed("copy response lost"),
+            failed("inspect timed out"),
+        ]);
+        let registry = DockerRegistry::new(executor);
+        let request = PublishRequest {
+            source: ImageRef::new("registry.test/source/image:build").unwrap(),
+            repository: RegistryRepository::new("registry.test/team/image").unwrap(),
+            digest: root_digest(),
+            platform_digests: platform_digests(),
+            aliases: Vec::new(),
+        };
+        let mut observed = Vec::new();
+        let mut facts = Vec::new();
+        assert!(
+            registry
+                .publish_with_observers(
+                    &request,
+                    &NeverCancelled,
+                    |state| observed.push(state.clone()),
+                    |fact| facts.push(fact)
+                )
+                .is_err()
+        );
+        assert!(observed.is_empty());
+        assert_eq!(facts.len(), 1);
+        assert!(!facts[0].verified);
+        assert_eq!(facts[0].digest, None);
     }
 
     #[test]
@@ -1356,12 +1472,14 @@ mod tests {
         let executor = FakeExecutor::new(vec![
             ok(described()),
             ok(multiarch()),
+            ok(described()),
             ok(""),
             ok("linux/amd64\n"),
             ok(""),
             ok("linux/arm64\n"),
             ok(described()),
             ok(multiarch()),
+            ok(described()),
         ]);
         let registry = DockerRegistry::new(executor);
         let request = PullRequest {
@@ -1423,6 +1541,7 @@ mod tests {
         let rejected = DockerRegistry::new(FakeExecutor::new(vec![
             ok(described()),
             ok(single_manifest()),
+            ok(described()),
         ]));
         let error = rejected
             .pull_and_verify(
@@ -1439,10 +1558,12 @@ mod tests {
         let accepted = DockerRegistry::new(FakeExecutor::new(vec![
             ok(described()),
             ok(single_manifest()),
+            ok(described()),
             ok(""),
             ok("linux/amd64\n"),
             ok(described()),
             ok(single_manifest()),
+            ok(described()),
         ]));
         accepted
             .pull_and_verify(
@@ -1463,6 +1584,7 @@ mod tests {
             ok(""),
             ok(described()),
             ok(single_manifest()),
+            ok(described()),
         ]);
         let registry = DockerRegistry::new(executor);
         let request = PublishRequest {

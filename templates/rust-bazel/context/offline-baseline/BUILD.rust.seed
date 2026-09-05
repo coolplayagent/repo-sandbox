@@ -1,0 +1,15 @@
+load("@rules_rust//rust:defs.bzl", "rust_test")
+
+exports_files(["Cargo.toml", "Cargo.lock"])
+rust_test(
+    name = "rust_dependencies",
+    srcs = ["rust_test.rs"],
+    edition = "2024",
+    deps = ["@crates//:" + name for name in [
+        "clap", "ctrlc", "serde", "serde_json", "serde_path_to_error",
+        "serde_yaml", "sha2", "tempfile", "tracing-subscriber",
+    ]],
+)
+
+genrule(name = "build_ok", outs = ["built.txt"], cmd = "echo built > $@")
+cc_test(name = "tests", srcs = ["test.cc"])

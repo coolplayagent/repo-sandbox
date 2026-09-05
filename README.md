@@ -61,8 +61,14 @@ with the environment exit code (`3`). `plan` resolves the selected central
 template and displays its stable dependency graph and execution profile.
 `build` runs the central build phase; `verify` runs build then test. Both create
 immutable snapshots/task images, stream logs, write no-overwrite JSON reports,
-and precisely remove their one-shot container. `--push` publishes only after
-success. `clean` removes only manifest-recorded, owner-verified resources:
+and precisely remove their one-shot container. `--push` and `--oci-layout`
+require `verify` and cannot be combined in one invocation; both emit an image
+only after successful verification. `clean` removes only manifest-recorded, owner-verified resources:
+
+Add `.reports/` to the repository’s `.gitignore` before using these examples.
+Explicit report and OCI destinations inside the repository must be Git-ignored
+so later source snapshots cannot include earlier reports or images. Destinations
+outside the repository are also supported.
 
 ```bash
 repo-sandbox build --repository . --report-path .reports/build.json

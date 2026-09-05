@@ -165,7 +165,7 @@ impl<E: ProcessExecutor> TaskImageBuilder<E> {
         let image = ImageRef::new(format!("{}:{}", request.repository, identity.tag()))
             .map_err(TaskImageError::InvalidRequest)?;
         let context = tempfile::tempdir().map_err(context_error("create task build context"))?;
-        write_context(context.path(), &request, &identity)?;
+        write_context(context.path(), &request, &identity, cancellation)?;
 
         let environment = immutable_environment_ref(request.environment)?;
         let platforms = if request.options.platforms.is_empty() {
@@ -304,6 +304,7 @@ fn write_context(
     root: &Path,
     request: &TaskImageRequest<'_>,
     identity: &TaskImageIdentity,
+    cancellation: &dyn Cancellation,
 ) -> Result<(), TaskImageError> {
     fs::write(root.join("Dockerfile"), dockerfile())
         .map_err(context_error("write task Dockerfile"))?;
@@ -311,10 +312,10 @@ fn write_context(
         .map_err(context_error("write task .dockerignore"))?;
     let destination = root.join("source");
     fs::create_dir(&destination).map_err(context_error("create source context"))?;
-    validate_context_paths(request.materialized.path())?;
+    validate_context_paths(request.materialized.path(), cancellation)?;
     let copied = request
         .materialized
-        .copy_verified_to(&destination)
+        .copy_verified_to_cancellable(&destination, cancellation)
         .map_err(TaskImageError::Snapshot)?;
     if copied != request.materialized.snapshot.file_count {
         return Err(TaskImageError::InvalidRequest(format!(
@@ -396,7 +397,15 @@ fn labels(
     ]
 }
 
-fn validate_context_paths(source: &Path) -> Result<(), TaskImageError> {
+fn validate_context_paths(
+    source: &Path,
+    cancellation: &dyn Cancellation,
+) -> Result<(), TaskImageError> {
+    if cancellation.is_cancelled() {
+        return Err(TaskImageError::InvalidRequest(
+            "task context creation cancelled".into(),
+        ));
+    }
     for entry in fs::read_dir(source).map_err(context_error("read source snapshot"))? {
         let entry = entry.map_err(context_error("read source snapshot entry"))?;
         let name = entry.file_name();
@@ -414,7 +423,7 @@ fn validate_context_paths(source: &Path) -> Result<(), TaskImageError> {
             ));
         }
         if metadata.is_dir() {
-            validate_context_paths(&entry.path())?;
+            validate_context_paths(&entry.path(), cancellation)?;
         } else if metadata.is_file() {
         } else {
             return Err(TaskImageError::InvalidRequest(

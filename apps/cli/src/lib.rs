@@ -39,8 +39,9 @@ impl Cli {
     /// Ctrl-C behavior for its blocking prerequisite probes.
     pub fn requires_interrupt_handler(&self) -> bool {
         matches!(
-            self.command,
-            Some(Commands::Plan(_) | Commands::Build(_) | Commands::Verify(_) | Commands::Clean(_))
+            &self.command,
+            Some(Commands::Plan(_) | Commands::Build(_) | Commands::Verify(_))
+        ) || matches!(&self.command, Some(Commands::Clean(args)) if args.yes || args.dry_run
         )
     }
 }
@@ -203,6 +204,8 @@ pub fn run_with_probe(cli: Cli, probe: &impl DoctorProbe) -> Result<RunOutput, A
             REMOTE_PREPARATION_TIMEOUT,
         );
         let execution = prepare_execution_cancellable(arguments, &cancellation)?;
+        repo_sandbox_adapters::workflow::validate_outputs(&execution)?;
+        execution.validate_mode(repo_sandbox_core::application::WorkflowMode::Verify)?;
         return Ok(RunOutput {
             message: Some(render_plan(&execution.template)),
             exit_code: ExitCode::Success,
@@ -238,6 +241,11 @@ pub fn run_with_probe(cli: Cli, probe: &impl DoctorProbe) -> Result<RunOutput, A
                         exit_code: ExitCode::Success,
                     });
                 }
+            }
+            if !request.dry_run && !arguments.yes {
+                repo_sandbox_adapters::cancellation::install().map_err(|error| {
+                    AppError::Environment(format!("cannot install interrupt handler: {error}"))
+                })?;
             }
             let result = use_case.execute(&plan, request.dry_run)?;
             let message = render_clean_result(&plan, &result);
@@ -326,7 +334,6 @@ fn run_runtime(
         Err(error) => {
             if let Some(path) = requested_report.as_deref()
                 && !path.exists()
-                && report_parent_exists(path)
             {
                 write_cli_failure_report(path, "unavailable", preparation_phase(&error), &error)?;
             }
@@ -349,7 +356,6 @@ fn run_runtime(
         Err(error) => {
             if let Some(path) = &execution.request.report
                 && !path.exists()
-                && report_parent_exists(path)
             {
                 write_cli_failure_report(path, &execution.digest, "orchestration", &error)?;
             }
@@ -413,7 +419,9 @@ fn prepare_execution_cancellable(
                     git_ref: arguments.git_ref.clone().unwrap_or_else(|| "HEAD".into()),
                 },
                 SnapshotOptions {
-                    recurse_submodules: arguments.recurse_submodules,
+                    // Configuration discovery only needs the root tree. The execution
+                    // snapshot materializes submodules once, using the pinned commit.
+                    recurse_submodules: false,
                     cleanup: CleanupPolicy::Delete,
                 },
                 cancellation,
@@ -484,6 +492,15 @@ fn write_cli_failure_report(
     phase: &'static str,
     error: &AppError,
 ) -> Result<(), AppError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent).map_err(|write| {
+        AppError::Environment(format!(
+            "create failure report parent: {write}; primary: {error}"
+        ))
+    })?;
     let report = WorkflowFailureReport {
         schema_version: 1,
         task_id: "unassigned".into(),
@@ -515,12 +532,6 @@ fn write_cli_failure_report(
     write_failure_report(&report, path).map_err(|write| {
         AppError::Environment(format!("write failure report: {write}; primary: {error}"))
     })
-}
-
-fn report_parent_exists(path: &std::path::Path) -> bool {
-    path.parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .is_dir()
 }
 
 fn execution_plan_from_source(
@@ -597,8 +608,11 @@ pub fn plan_from_source(source: &str, arguments: RuntimeArgs) -> Result<RunOutpu
     let plan = catalog
         .plan(&config.template, request.platform)
         .map_err(|error| AppError::Configuration(error.to_string()))?;
+    let execution = ExecutionPlan::new(plan, request);
+    repo_sandbox_adapters::workflow::validate_outputs(&execution)?;
+    execution.validate_mode(repo_sandbox_core::application::WorkflowMode::Verify)?;
     Ok(RunOutput {
-        message: Some(render_plan(&plan)),
+        message: Some(render_plan(&execution.template)),
         exit_code: ExitCode::Success,
     })
 }
@@ -812,8 +826,18 @@ mod tests {
             let command = "doctor";
             let cli = Cli::try_parse_from(["repo-sandbox", command]).unwrap();
             assert!(!cli.requires_interrupt_handler(), "{command}");
+            assert!(
+                !Cli::try_parse_from(["repo-sandbox", "clean"])
+                    .unwrap()
+                    .requires_interrupt_handler()
+            );
+            assert!(
+                Cli::try_parse_from(["repo-sandbox", "clean", "--yes"])
+                    .unwrap()
+                    .requires_interrupt_handler()
+            );
         }
-        for command in ["plan", "build", "verify", "clean"] {
+        for command in ["plan", "build", "verify"] {
             let cli = Cli::try_parse_from(["repo-sandbox", command]).unwrap();
             assert!(cli.requires_interrupt_handler(), "{command}");
         }
@@ -961,7 +985,55 @@ test: [{ name: test, run: cargo test }]
     }
 
     #[test]
-    fn configuration_failure_does_not_create_a_missing_report_parent() {
+    fn configuration_failure_writes_a_bare_relative_report() {
+        let name = format!(
+            "cli-failure-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let cli = Cli::try_parse_from([
+            "repo-sandbox",
+            "build",
+            "--repository",
+            "/nonexistent-repo-sandbox-cli-fixture",
+            "--report-path",
+            &name,
+        ])
+        .unwrap();
+        assert_eq!(run(cli).unwrap_err().exit_code(), ExitCode::Configuration);
+        assert!(fs::read_to_string(&name).unwrap().contains("configuration"));
+        fs::remove_file(name).unwrap();
+    }
+
+    #[test]
+    fn plans_reject_invalid_output_overrides() {
+        let source = "version: 1\ntemplate:\n  id: rust-bazel\n";
+        for arguments in [
+            RuntimeArgs {
+                platform: vec![Platform::LinuxAmd64, Platform::LinuxAmd64],
+                ..Default::default()
+            },
+            RuntimeArgs {
+                platform: vec![Platform::LinuxAmd64, Platform::LinuxArm64],
+                ..Default::default()
+            },
+            RuntimeArgs {
+                push: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                plan_from_source(source, arguments).unwrap_err().exit_code(),
+                ExitCode::Configuration
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_failure_creates_the_requested_report_parent() {
         let temporary = std::env::temp_dir().join(format!(
             "repo-sandbox-cli-no-parent-{}-{}",
             std::process::id(),
@@ -989,7 +1061,7 @@ test: [{ name: test, run: cargo test }]
         .unwrap();
         let error = run(cli).unwrap_err();
         assert_eq!(error.exit_code(), ExitCode::Configuration);
-        assert!(!parent.exists());
+        assert!(report.is_file());
         fs::remove_dir_all(temporary).unwrap();
     }
 

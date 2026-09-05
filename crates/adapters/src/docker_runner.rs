@@ -18,7 +18,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const TASK_LABEL: &str = "io.repo-sandbox.task-id";
 pub const REPOSITORY_LABEL: &str = "io.repo-sandbox.repository-id";
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
-const CREATE_RECONCILE_ABSENCE_GRACE: Duration = Duration::from_millis(500);
 
 fn docker_container_absent(stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
@@ -304,12 +303,18 @@ impl SystemDockerExecutor {
         live: Option<(&dyn LogSink, StepPhase, &str)>,
         observe_user_cancellation: bool,
     ) -> io::Result<StreamedProcessOutput> {
-        let mut child = Command::new(&invocation.program)
+        let mut command = Command::new(&invocation.program);
+        command
             .args(&invocation.args)
             .current_dir(invocation.current_dir.as_deref().unwrap_or(Path::new(".")))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        crate::snapshot::configure_process_tree(&mut command);
+        let mut child = command.spawn()?;
+        let process_tree = crate::snapshot::ProcessTree::attach(&mut child).inspect_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         thread::scope(|scope| {
@@ -330,7 +335,7 @@ impl SystemDockerExecutor {
             let deadline = Instant::now() + timeout;
             let (status, interrupted) = loop {
                 if Instant::now() >= deadline || (observe_user_cancellation && is_cancelled()) {
-                    child.kill()?;
+                    process_tree.terminate();
                     break (child.wait()?, true);
                 }
                 if let Some(status) = child.try_wait()? {
@@ -338,6 +343,7 @@ impl SystemDockerExecutor {
                 }
                 thread::sleep(Duration::from_millis(20));
             };
+            process_tree.terminate();
             let stdout_bytes = join_scoped(stdout_reader)?;
             let stderr_bytes = join_scoped(stderr_reader)?;
             Ok(StreamedProcessOutput {
@@ -503,7 +509,7 @@ pub fn plan(spec: &RunSpec) -> Result<DockerRunPlan, PlanError> {
                 "/bin/sh",
                 "-c",
                 &if spec.secret_mounts.is_empty() { step.command.clone() } else {
-                    format!("for f in /run/repo-sandbox-secrets/*; do n=${{f##*/}}; v=; IFS= read -r v < \"$f\" || [ -n \"$v\" ]; export \"$n=$v\"; done; {}", step.command)
+                    format!("for f in /run/repo-sandbox-secrets/*; do n=${{f##*/}}; v=$(cat \"$f\" && printf .) || exit 125; v=${{v%.}}; export \"$n=$v\"; done; {}", step.command)
                 },
             ]),
         })
@@ -666,6 +672,38 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
             publication_progress: Vec::new(),
         };
 
+        let platform_inspect = docker(vec![
+            "image",
+            "inspect",
+            "--format",
+            "{{.Os}}/{{.Architecture}}",
+            spec.image.as_str(),
+        ]);
+        match self.execute_remaining(&platform_inspect, spec, started.monotonic_ms) {
+            Ok(output) if output.interrupted => {
+                report.status = interrupted_run_status(None, None);
+                return Ok(self.finish(report, started));
+            }
+            Ok(output)
+                if output.exit_code == Some(0)
+                    && output.stdout.trim() == spec.platform.as_str() => {}
+            Ok(output) => {
+                report.status = infrastructure(
+                    "validate runner platform",
+                    format!(
+                        "expected {}, inspected {}: {}",
+                        spec.platform.as_str(),
+                        output.stdout.trim(),
+                        output.stderr.trim()
+                    ),
+                );
+                return Ok(self.finish(report, started));
+            }
+            Err(error) => {
+                report.status = infrastructure("validate runner platform", error.to_string());
+                return Ok(self.finish(report, started));
+            }
+        }
         if let Err(status) = self.ensure_unowned(&run_plan, spec, started.monotonic_ms) {
             report.status = status;
             return Ok(self.finish(report, started));
@@ -764,10 +802,13 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
             &run_plan.container_name,
         ]);
         let deadline = Instant::now() + CLEANUP_TIMEOUT;
-        let mut absence_observed_at = None;
+        let mut absence_observed = false;
         let output = loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                if absence_observed {
+                    return;
+                }
                 report.cleanup = CleanupResult::Failed;
                 report.cleanup_error =
                     Some("reconcile interrupted container creation timed out".into());
@@ -776,10 +817,7 @@ impl<E: DockerExecutor, C: Clock, S: LogSink> DockerRunner<E, C, S> {
             match self.executor.execute_cleanup(&inspect, remaining) {
                 Ok(output) if output.exit_code == Some(0) => break output,
                 Ok(output) if docker_container_absent(&output.stderr) => {
-                    let first = absence_observed_at.get_or_insert_with(Instant::now);
-                    if first.elapsed() >= CREATE_RECONCILE_ABSENCE_GRACE {
-                        return;
-                    }
+                    absence_observed = true;
                     thread::sleep(Duration::from_millis(50));
                 }
                 Ok(output) => {
@@ -1217,6 +1255,12 @@ mod tests {
             invocation: &ProcessInvocation,
             timeout: Duration,
         ) -> io::Result<ProcessOutput> {
+            if invocation
+                .args
+                .starts_with(&["image".into(), "inspect".into()])
+            {
+                return Ok(output(0, "linux/amd64", ""));
+            }
             self.invocations
                 .borrow_mut()
                 .push((invocation.clone(), timeout));
@@ -1267,9 +1311,15 @@ mod tests {
     impl DockerExecutor for &RawStepExecutor {
         fn execute(
             &self,
-            _invocation: &ProcessInvocation,
+            invocation: &ProcessInvocation,
             _timeout: Duration,
         ) -> io::Result<ProcessOutput> {
+            if invocation
+                .args
+                .starts_with(&["image".into(), "inspect".into()])
+            {
+                return Ok(output(0, "linux/amd64", ""));
+            }
             self.clock.set(self.clock.get() + 10);
             let call = self.control_calls.get();
             self.control_calls.set(call + 1);
@@ -1403,14 +1453,63 @@ mod tests {
             .unwrap();
         let invocations = format!("{:?}", executor.invocations());
         let json = serde_json::to_string(&report).unwrap();
-        assert!(invocations.contains("IFS= read -r"));
-        assert!(!invocations.contains("$(cat"));
+        assert!(invocations.contains("printf ."));
+        assert!(invocations.contains("v=${v%.}"));
         assert!(!invocations.contains("token-super-secret"));
         assert!(!json.contains("token-super-secret"));
         assert!(
             !String::from_utf8_lossy(&sink.stdout.lock().unwrap()).contains("token-super-secret")
         );
         assert!(json.contains("[REDACTED]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_secret_loading_preserves_embedded_and_trailing_newlines() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("TOKEN");
+        let secret = b"first\nsecond\n\n";
+        fs::write(&source, secret).unwrap();
+        let mut run = spec(true);
+        run.secret_mounts = vec![SecretMount {
+            environment: "TOKEN".into(),
+            source,
+        }];
+        run.build[0].command = "printf %s \"$TOKEN\"".into();
+        let script = plan(&run).unwrap().steps[0]
+            .invocation
+            .args
+            .last()
+            .unwrap()
+            .replace(
+                "/run/repo-sandbox-secrets",
+                &directory.path().to_string_lossy(),
+            );
+        let result = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, secret);
+        assert_eq!(
+            redact_bytes(&result.stdout, &[secret.to_vec()]),
+            b"[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn runner_rejects_mismatched_image_platform_before_container_creation() {
+        let clock = FakeClock(Rc::new(Cell::new(0)));
+        let executor = FakeExecutor::new(&clock, vec![]);
+        let mut run = spec(true);
+        run.platform = repo_sandbox_core::config::Platform::LinuxArm64;
+        let runner = DockerRunner::new(&executor, clock);
+        let report = runner.run(&run).unwrap();
+        assert!(matches!(
+            report.status,
+            RunStatus::InfrastructureFailed { .. }
+        ));
+        assert!(executor.invocations().is_empty());
     }
 
     #[test]

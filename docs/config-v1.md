@@ -75,7 +75,7 @@ The `plan`, `build`, and `verify` routes accept only these runtime options:
 | `--git-ref REF` | Git ref to check out |
 | `--platform PLATFORM` | target platform; repeat for multi-platform output; the first platform is verified locally |
 | `--oci-layout DIRECTORY` | atomically export a verified OCI layout; required for multi-platform output without `--push` |
-| `--push` | publish a successful/verified task image using the central Registry policy |
+| `--push` | publish a verified task image using the central Registry policy |
 | `--report-path PATH` | atomic, no-overwrite JSON report destination |
 | `--keep-on-failure` | retain a failed sandbox |
 | `--recurse-submodules` | recursively materialize Git submodules in the source snapshot |
@@ -90,7 +90,9 @@ enter the plan digest.
 
 When `--platform` is absent, the configured platform parameter is used. Multiple
 platforms require `--push` or `--oci-layout`; publication/export happens only
-after the primary platform passes the central runner. No CLI option can replace
+after the primary platform passes build and test in `verify` mode. `build`
+rejects both output options, and `--push` and `--oci-layout` are mutually
+exclusive; request them in separate workflows. No CLI option can replace
 the central image, component graph, or build contexts.
 
 ## Exit codes

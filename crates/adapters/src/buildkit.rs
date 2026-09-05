@@ -117,15 +117,21 @@ fn configure_oci_fd_inheritance(
     invocation: &ProcessInvocation,
 ) -> io::Result<()> {
     use std::os::unix::process::CommandExt;
-    let Some(fd) = invocation
+    let fds = invocation
         .args
         .iter()
-        .find_map(|argument| argument.strip_prefix("type=oci,dest=/dev/fd/"))
-        .and_then(|tail| tail.split(['/', ',']).next())
-        .and_then(|value| value.parse::<i32>().ok())
-    else {
-        return Ok(());
-    };
+        .flat_map(|argument| {
+            argument
+                .match_indices("/dev/fd/")
+                .filter_map(move |(offset, _)| {
+                    argument[offset + 8..]
+                        .split(['/', ','])
+                        .next()?
+                        .parse::<i32>()
+                        .ok()
+                })
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     unsafe extern "C" {
         fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
     }
@@ -134,21 +140,31 @@ fn configure_oci_fd_inheritance(
     const FD_CLOEXEC: i32 = 1;
     // Check the retained fd in the parent, but clear CLOEXEC only in the
     // forked Docker child. Unrelated concurrent children never inherit it.
-    if unsafe { fcntl(fd, F_GETFD, 0) } < 0 {
-        return Err(io::Error::last_os_error());
+    for fd in &fds {
+        if unsafe { fcntl(*fd, F_GETFD, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     // SAFETY: pre_exec performs only async-signal-safe fcntl and captures an fd.
     unsafe {
         command.pre_exec(move || {
-            let flags = fcntl(fd, F_GETFD, 0);
-            if flags < 0 || fcntl(fd, F_SETFD, flags & !FD_CLOEXEC) < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
+            for fd in &fds {
+                let flags = fcntl(*fd, F_GETFD, 0);
+                if flags < 0 || fcntl(*fd, F_SETFD, flags & !FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
+            Ok(())
         });
     }
     Ok(())
+}
+
+struct CleanupDeadline(std::time::Instant);
+impl Cancellation for CleanupDeadline {
+    fn is_cancelled(&self) -> bool {
+        std::time::Instant::now() >= self.0
+    }
 }
 
 fn read_stream(mut stream: impl Read) -> io::Result<Vec<u8>> {
@@ -399,16 +415,34 @@ impl<E> BuildKit<E> {
 impl<E: ProcessExecutor> BuildKit<E> {
     pub fn build(
         &self,
-        request: BuildRequest<'_>,
+        mut request: BuildRequest<'_>,
         cancellation: &dyn Cancellation,
     ) -> Result<BuiltImage, BuildError> {
         let platforms = validate_request(&request)?;
+        let nonce = if let Builder::Ephemeral { name } = &request.options.builder {
+            self.ensure_builder_name_is_available(name)?;
+            let directory = tempfile::tempdir().map_err(|source| BuildError::Process {
+                operation: "reserve ephemeral builder identity",
+                source,
+            })?;
+            let suffix = directory
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace('.', "");
+            request.options.builder = Builder::Ephemeral {
+                name: format!("{}-{}", &name[..name.len().min(40)], suffix),
+            };
+            Some(directory)
+        } else {
+            None
+        };
         let ephemeral = match &request.options.builder {
             Builder::Ephemeral { name } => Some(name.as_str()),
             Builder::Existing(_) => None,
         };
         if let Some(name) = ephemeral {
-            self.ensure_builder_name_is_available(name)?;
             let create = ProcessInvocation {
                 program: "docker".to_owned(),
                 args: vec![
@@ -421,15 +455,26 @@ impl<E: ProcessExecutor> BuildKit<E> {
                 ],
                 current_dir: None,
             };
-            // Ownership starts only after buildx confirms successful creation. A failed
-            // create can be an already-existing builder race, so deleting by name here
-            // could remove a resource owned by another task.
-            self.run("create Buildx builder", &create, cancellation)?;
+            // The unpredictable per-invocation name makes ambiguous creation ours to
+            // reconcile without touching a caller-selected/shared builder.
+            if let Err(primary) = self.run("create Buildx builder", &create, cancellation) {
+                let conflict = primary
+                    .stderr()
+                    .is_some_and(|text| text.to_ascii_lowercase().contains("already exists"));
+                if !conflict && let Err(cleanup) = self.reconcile_builder_creation(name) {
+                    return Err(BuildError::CleanupAfter {
+                        primary: Box::new(primary),
+                        cleanup: Box::new(cleanup),
+                    });
+                }
+                return Err(primary);
+            }
         }
 
         let primary = self
             .ensure_platform_capabilities(&request.options.builder, &platforms, cancellation)
             .and_then(|()| self.build_inner(&request, &platforms, cancellation));
+        drop(nonce);
         let cleanup = ephemeral.map(|name| self.remove_builder(name));
         match (primary, cleanup) {
             (result, None) | (result, Some(Ok(()))) => result,
@@ -566,6 +611,40 @@ impl<E: ProcessExecutor> BuildKit<E> {
         parse_platform_digests(&manifest, platforms)
     }
 
+    fn reconcile_builder_creation(&self, name: &str) -> Result<(), BuildError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let cancellation = CleanupDeadline(deadline);
+        let invocation = ProcessInvocation {
+            program: "docker".into(),
+            args: vec!["buildx".into(), "inspect".into(), name.into()],
+            current_dir: None,
+        };
+        loop {
+            let output = self
+                .executor
+                .execute(&invocation, &cancellation)
+                .map_err(|source| BuildError::Process {
+                    operation: "reconcile owned builder creation",
+                    source,
+                })?;
+            if output.exit_code == Some(0) {
+                return self.remove_builder(name);
+            }
+            if !builder_is_missing(&output.stderr) {
+                return Err(BuildError::Failed {
+                    operation: "reconcile owned builder creation",
+                    exit_code: output.exit_code,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn remove_builder(&self, name: &str) -> Result<(), BuildError> {
         let invocation = ProcessInvocation {
             program: "docker".to_owned(),
@@ -577,7 +656,11 @@ impl<E: ProcessExecutor> BuildKit<E> {
             ],
             current_dir: None,
         };
-        self.run("remove owned Buildx builder", &invocation, &NeverCancelled)
+        self.run(
+            "remove owned Buildx builder",
+            &invocation,
+            &CleanupDeadline(std::time::Instant::now() + Duration::from_secs(30)),
+        )
     }
 
     fn ensure_builder_name_is_available(&self, name: &str) -> Result<(), BuildError> {
@@ -588,7 +671,10 @@ impl<E: ProcessExecutor> BuildKit<E> {
         };
         let output = self
             .executor
-            .execute(&invocation, &NeverCancelled)
+            .execute(
+                &invocation,
+                &CleanupDeadline(std::time::Instant::now() + Duration::from_secs(30)),
+            )
             .map_err(|source| BuildError::Process {
                 operation: "inspect requested Buildx builder name",
                 source,
@@ -783,13 +869,24 @@ fn build_invocation(
         request.target.as_str().to_owned(),
     ]);
     match &request.options.output {
-        ImageOutput::Load => args.push("--load".to_owned()),
-        ImageOutput::Push => args.push("--push".to_owned()),
+        ImageOutput::Load => push_pair(
+            &mut args,
+            "--output",
+            "type=docker,oci-mediatypes=true".into(),
+        ),
+        ImageOutput::Push => push_pair(
+            &mut args,
+            "--output",
+            "type=registry,oci-mediatypes=true".into(),
+        ),
         ImageOutput::OciDirectory(path) => {
             push_pair(
                 &mut args,
                 "--output",
-                format!("type=oci,dest={},tar=false", path.to_string_lossy()),
+                format!(
+                    "type=oci,dest={},tar=false,oci-mediatypes=true",
+                    path.to_string_lossy()
+                ),
             );
         }
     }
@@ -1310,6 +1407,31 @@ mod tests {
     }
 
     #[test]
+    fn every_exporter_preserves_the_same_oci_manifest_media_types() {
+        let plan = plan();
+        for output in [
+            ImageOutput::Load,
+            ImageOutput::Push,
+            ImageOutput::OciDirectory(PathBuf::from("layout")),
+        ] {
+            let request = request(
+                &plan,
+                BuildOptions {
+                    output,
+                    ..Default::default()
+                },
+            );
+            let invocation = build_invocation(
+                &request,
+                &[Platform::LinuxAmd64],
+                Path::new("metadata.json"),
+            )
+            .unwrap();
+            assert!(value_after(&invocation.args, "--output").ends_with("oci-mediatypes=true"));
+        }
+    }
+
+    #[test]
     fn cold_and_warm_builds_use_the_same_cache_contract_and_return_digest() {
         let executor = FakeExecutor::new(BuildBehavior::Success);
         let adapter = amd64_adapter(&executor);
@@ -1543,7 +1665,10 @@ mod tests {
             value_after(&build.args, "--platform"),
             "linux/amd64,linux/arm64"
         );
-        assert!(build.args.contains(&"--push".to_owned()));
+        assert_eq!(
+            value_after(&build.args, "--output"),
+            "type=registry,oci-mediatypes=true"
+        );
         assert!(invocations.iter().any(|call| call.args.starts_with(&[
             "buildx".to_owned(),
             "imagetools".to_owned(),
@@ -1727,10 +1852,8 @@ mod tests {
         assert!(matches!(error, BuildError::Interrupted { .. }));
         let invocations = executor.invocations();
         assert_eq!(invocations.len(), 4);
-        assert_eq!(
-            invocations[3].args,
-            ["buildx", "rm", "--force", "repo-sandbox-task-7"]
-        );
+        assert_eq!(&invocations[3].args[..3], ["buildx", "rm", "--force"]);
+        assert!(invocations[3].args[3].starts_with("repo-sandbox-task-7-"));
         assert!(
             invocations
                 .iter()
@@ -1763,6 +1886,65 @@ mod tests {
             value_after(&invocations[0].args, "--builder"),
             "shared-builder"
         );
+    }
+
+    #[test]
+    fn interrupted_builder_creation_reconciles_the_unique_owned_name() {
+        struct Executor(Mutex<Vec<ProcessInvocation>>);
+        impl ProcessExecutor for Executor {
+            fn execute(
+                &self,
+                invocation: &ProcessInvocation,
+                cancellation: &dyn Cancellation,
+            ) -> io::Result<ProcessOutput> {
+                let mut calls = self.0.lock().unwrap();
+                calls.push(invocation.clone());
+                let mut output = ProcessOutput {
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    interrupted: false,
+                };
+                match calls.len() {
+                    1 => {
+                        output.exit_code = Some(1);
+                        output.stderr = "ERROR: no builder found".into();
+                    }
+                    2 => {
+                        output.exit_code = None;
+                        output.interrupted = true;
+                    }
+                    _ => {
+                        assert!(!cancellation.is_cancelled());
+                    }
+                }
+                Ok(output)
+            }
+        }
+        let executor = Executor(Mutex::new(Vec::new()));
+        let template = plan();
+        let error = BuildKit::new(&executor)
+            .with_native_platform(Platform::LinuxAmd64)
+            .build(
+                request(
+                    &template,
+                    BuildOptions {
+                        builder: Builder::Ephemeral {
+                            name: "requested".into(),
+                        },
+                        ..Default::default()
+                    },
+                ),
+                &NeverCancelled,
+            )
+            .unwrap_err();
+        assert!(matches!(error, BuildError::Interrupted { .. }));
+        let calls = executor.0.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        let created = value_after(&calls[1].args, "--name");
+        assert!(created.starts_with("requested-"));
+        assert_eq!(calls[2].args.last().unwrap(), created);
+        assert_eq!(calls[3].args.last().unwrap(), created);
     }
 
     #[test]
@@ -1848,10 +2030,8 @@ mod tests {
         assert_eq!(error.exit_code(), Some(42));
         let invocations = executor.invocations();
         assert_eq!(invocations.len(), 4);
-        assert_eq!(
-            invocations[3].args,
-            ["buildx", "rm", "--force", "repo-sandbox-task-8"]
-        );
+        assert_eq!(&invocations[3].args[..3], ["buildx", "rm", "--force"]);
+        assert!(invocations[3].args[3].starts_with("repo-sandbox-task-8-"));
     }
 
     /// Optional host integration check; unit and CI suites never require Docker.

@@ -149,6 +149,8 @@ pub enum PublicationFactKind {
     EnvironmentStaging,
     TaskStaging,
     TaskIndexStaging,
+    Immutable,
+    Alias,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -158,13 +160,14 @@ pub enum PublicationFinality {
     Final,
 }
 
-/// An irreversible remote side effect observed before final publication.
-/// These facts never masquerade as the final immutable/alias contract.
+/// A remote side effect attempted or observed during publication.
+/// An unverified fact never establishes the final immutable/alias contract.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RemotePublicationFact {
     pub kind: PublicationFactKind,
     pub reference: ImageRef,
-    pub digest: ImageDigest,
+    /// Absent when a remote write may have committed but inspection failed.
+    pub digest: Option<ImageDigest>,
     pub verified: bool,
     pub finality: PublicationFinality,
 }

@@ -1,0 +1,23 @@
+[package]
+name = "repo-sandbox-adapters"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "repo_sandbox_adapters"
+path = "src/lib.rs"
+
+[[bin]]
+name = "e2e-matrix"
+path = "e2e/e2e_matrix.rs"
+
+[dependencies]
+repo-sandbox-core = { path = "../core" }
+ctrlc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
