@@ -53,18 +53,36 @@ assert any(artifact != root and artifact.is_relative_to(root) for root in roots)
 PYEXPORT
 }
 
+cache_boundary_builder_name() {
+  python3 -c 'import uuid; print("repo-sandbox-cache-" + uuid.uuid4().hex)'
+}
+
 start_cache_boundary_builder() {
-  cache_boundary_builder="repo-sandbox-cache-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  cache_boundary_builder=$(cache_boundary_builder_name)
   cache_boundary_owned=
   cache_boundary_saved_buildx=${BUILDX_BUILDER-}
   cache_boundary_had_buildx=${BUILDX_BUILDER+x}
   cache_boundary_saved_repo=${REPO_SANDBOX_BUILDER-}
   cache_boundary_had_repo=${REPO_SANDBOX_BUILDER+x}
+  # Establish absence before recording intent. A failed listing is not proof
+  # that the generated name is free, and a collision must never be removed.
+  local existing_builders
+  existing_builders=$(docker buildx ls --format '{{.Name}}') || return
+  if grep -Fxq "$cache_boundary_builder" <<<"$existing_builders"; then
+    echo 'cache-boundary builder name already exists' >&2
+    return 1
+  fi
+  cache_boundary_owned=$cache_boundary_builder
+  cache_boundary_create_complete=
+  # EXIT cleanup can now reconcile even if create persists its local builder
+  # metadata but fails or is interrupted before returning a successful result.
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   # Do not select this builder globally: other matrix scenarios retain the
   # shared builder and its expensive ARM preparation cache.
   docker buildx create --name "$cache_boundary_builder" --driver docker-container \
     --driver-opt network=host >/dev/null || return
-  cache_boundary_owned=$cache_boundary_builder
+  cache_boundary_create_complete=1
   export BUILDX_BUILDER=$cache_boundary_owned
   export REPO_SANDBOX_BUILDER=$cache_boundary_owned
   docker buildx inspect "$cache_boundary_owned" --bootstrap >/dev/null
@@ -77,7 +95,15 @@ prune_cache_boundary_builder() {
 
 cleanup_cache_boundary_builder() {
   [[ -n ${cache_boundary_owned:-} ]] || return 0
-  docker buildx rm --force "$cache_boundary_owned" >/dev/null 2>&1 || true
+  local attempts=1 attempt
+  # An interrupted create can finish after the first remove observes absence.
+  # Reconcile only this unpredictable, prechecked name for a bounded settle
+  # window; successful creates need just the ordinary exact-name removal.
+  [[ ${cache_boundary_create_complete:-} ]] || attempts=20
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    docker buildx rm --force "$cache_boundary_owned" >/dev/null 2>&1 || true
+    if ((attempt < attempts)); then sleep 0.25; fi
+  done
   cache_boundary_owned=
   if [[ $cache_boundary_had_buildx ]]; then
     export BUILDX_BUILDER=$cache_boundary_saved_buildx
@@ -89,6 +115,30 @@ cleanup_cache_boundary_builder() {
   else
     unset REPO_SANDBOX_BUILDER
   fi
+}
+
+assert_multi_platform_manifest() {
+  python3 - "$1" "$2" <<'PYMANIFEST'
+import json, re, sys
+with open(sys.argv[1]) as source:
+    index = json.load(source)
+primary = sys.argv[2]
+assert re.fullmatch(r"sha256:[0-9a-f]{64}", primary), "invalid verified primary digest"
+assert index["schemaVersion"] == 2, "expected manifest schema version 2"
+assert index["mediaType"] in (
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+), "expected an OCI index or Docker manifest list"
+manifests = index["manifests"]
+assert len(manifests) == 2, "expected exactly two platform manifests"
+for architecture in ("amd64", "arm64"):
+    matches = [item for item in manifests
+               if item.get("platform", {}).get("os") == "linux"
+               and item["platform"].get("architecture") == architecture]
+    assert len(matches) == 1, f"expected exactly one linux/{architecture} manifest"
+    if architecture == "amd64":
+        assert matches[0]["digest"] == primary, "amd64 manifest differs from runner-verified primary digest"
+PYMANIFEST
 }
 
 if [[ ${1-} == --self-test-task-id ]]; then
@@ -137,11 +187,38 @@ PYFIXTURE
       exit 1
     fi
   done
-  builder_calls="$selection_fixture/builders.log"
-  builder_failure=
+  export builder_calls="$selection_fixture/builders.log"
+  export builder_present="$selection_fixture/builder-present"
+  export builder_late_marker="$selection_fixture/builder-late"
+  export builder_failure=
+  cache_boundary_builder_name() { printf '%s\n' repo-sandbox-cache-fixture; }
+  sleep() { :; }
   docker() {
     printf '%s\n' "$*" >>"$builder_calls"
-    [[ ${2-} != "$builder_failure" ]]
+    case ${2-} in
+      ls)
+        [[ $builder_failure != listing ]] || return 67
+        [[ ! -f $builder_present ]] || cat "$builder_present"
+        ;;
+      create)
+        [[ $builder_failure != create-empty && $builder_failure != create-late ]] || return 66
+        printf '%s\n' repo-sandbox-cache-fixture >"$builder_present"
+        case $builder_failure in
+          create-persisted) return 66 ;;
+          interrupt) kill -TERM "$$"; return 66 ;;
+          interrupt-int) kill -INT "$$"; return 66 ;;
+        esac
+        ;;
+      inspect) [[ $builder_failure != inspect ]] || return 66 ;;
+      rm)
+        rm -f "$builder_present"
+        if [[ $builder_failure == create-late && ! -f $builder_late_marker ]]; then
+          # Simulate create committing just after the first removal saw no state.
+          printf '%s\n' repo-sandbox-cache-fixture >"$builder_present"
+          : >"$builder_late_marker"
+        fi
+        ;;
+    esac
   }
   export BUILDX_BUILDER=shared-buildx REPO_SANDBOX_BUILDER=shared-repo
   start_cache_boundary_builder
@@ -155,24 +232,97 @@ PYFIXTURE
   grep -Fxq "buildx inspect $owned --bootstrap" "$builder_calls"
   grep -Fxq "buildx prune --builder $owned --all --force" "$builder_calls"
   grep -Fxq "buildx rm --force $owned" "$builder_calls"
-  [[ $(wc -l <"$builder_calls") -eq 4 ]]
+  [[ $(wc -l <"$builder_calls") -eq 5 && ! -f $builder_present ]]
+
+  for builder_failure in create-empty create-persisted create-late inspect; do
+    : >"$builder_calls"
+    if start_cache_boundary_builder; then exit 1; else [[ $? -eq 66 ]]; fi
+    [[ -n $cache_boundary_owned ]]
+    cleanup_cache_boundary_builder
+    grep -Fxq "buildx rm --force $owned" "$builder_calls"
+    [[ ! -f $builder_present ]]
+    [[ $BUILDX_BUILDER == shared-buildx && $REPO_SANDBOX_BUILDER == shared-repo ]]
+  done
+
+  [[ -f $builder_late_marker ]]
 
   : >"$builder_calls"
-  builder_failure=create
+  builder_failure=listing
   if start_cache_boundary_builder; then exit 1; fi
   cleanup_cache_boundary_builder
   [[ $(wc -l <"$builder_calls") -eq 1 ]]
-  [[ $BUILDX_BUILDER == shared-buildx && $REPO_SANDBOX_BUILDER == shared-repo ]]
 
   : >"$builder_calls"
-  builder_failure=inspect
-  if start_cache_boundary_builder; then exit 1; fi
-  owned=$cache_boundary_owned
-  [[ -n $owned ]]
+  builder_failure=
+  printf '%s\n' "$owned" >"$builder_present"
+  if start_cache_boundary_builder 2>/dev/null; then exit 1; fi
   cleanup_cache_boundary_builder
-  grep -Fxq "buildx rm --force $owned" "$builder_calls"
-  [[ $(wc -l <"$builder_calls") -eq 3 ]]
-  [[ $BUILDX_BUILDER == shared-buildx && $REPO_SANDBOX_BUILDER == shared-repo ]]
+  [[ $(wc -l <"$builder_calls") -eq 1 && -f $builder_present ]]
+  rm "$builder_present"
+
+  # A separate real shell receives TERM from the create mock after persisting
+  # its state. Its EXIT trap must remove that state despite no create return.
+  for builder_failure in interrupt interrupt-int; do
+    : >"$builder_calls"
+    if bash -c "$(declare -f cache_boundary_builder_name start_cache_boundary_builder cleanup_cache_boundary_builder docker sleep)
+      trap cleanup_cache_boundary_builder EXIT
+      start_cache_boundary_builder
+      exit 99"; then
+      exit 1
+    else
+      signal_status=$?
+      if [[ $builder_failure == interrupt ]]; then
+        [[ $signal_status -eq 143 ]]
+      else
+        [[ $signal_status -eq 130 ]]
+      fi
+    fi
+    grep -Fxq "buildx rm --force $owned" "$builder_calls"
+    [[ ! -f $builder_present ]]
+    [[ $BUILDX_BUILDER == shared-buildx && $REPO_SANDBOX_BUILDER == shared-repo ]]
+  done
+  python3 - "$selection_fixture" <<'PYMANIFESTFIXTURE'
+import copy, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+index = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+         "manifests": [{"digest": "sha256:" + digest * 64,
+                        "platform": {"os": "linux", "architecture": architecture}}
+                       for architecture, digest in (("amd64", "a"), ("arm64", "b"))]}
+for name, indent in (("pretty", 2), ("compact", None)):
+    (root / f"manifest-{name}.json").write_text(json.dumps(index, indent=indent, separators=(",", ":") if indent is None else None))
+docker_index = dict(index, mediaType="application/vnd.docker.distribution.manifest.list.v2+json")
+(root / "manifest-docker.json").write_text(json.dumps(docker_index, indent=2))
+mutations = {}
+for architecture in ("amd64", "arm64"):
+    value = copy.deepcopy(index)
+    value["manifests"] = [item for item in value["manifests"] if item["platform"]["architecture"] != architecture]
+    mutations[f"missing-{architecture}"] = value
+    value = copy.deepcopy(index)
+    value["manifests"] = [copy.deepcopy(next(item for item in value["manifests"] if item["platform"]["architecture"] == architecture))] * 2
+    mutations[f"duplicate-{architecture}"] = value
+for name, key, value in (("schema", "schemaVersion", 1), ("media", "mediaType", "application/vnd.oci.image.manifest.v1+json")):
+    mutations[name] = dict(index, **{key: value})
+value = copy.deepcopy(index)
+value["manifests"][0]["platform"]["os"] = "windows"
+mutations["wrong-os"] = value
+for name, value in mutations.items():
+    (root / f"manifest-invalid-{name}.json").write_text(json.dumps(value))
+PYMANIFESTFIXTURE
+  primary_fixture="sha256:$(printf '%064d' 0 | tr 0 a)"
+  for encoding in pretty compact docker; do
+    assert_multi_platform_manifest "$selection_fixture/manifest-$encoding.json" "$primary_fixture"
+  done
+  for invalid_manifest in "$selection_fixture"/manifest-invalid-*.json; do
+    if assert_multi_platform_manifest "$invalid_manifest" "$primary_fixture" 2>/dev/null; then
+      echo "invalid platform index was accepted: $invalid_manifest" >&2; exit 1
+    fi
+  done
+  # The arm64 digest is present, but must not be accepted as the verified amd64 digest.
+  for invalid_primary in '' "sha256:$(printf '%064d' 0 | tr 0 b)"; do
+    if assert_multi_platform_manifest "$selection_fixture/manifest-pretty.json" "$invalid_primary" 2>/dev/null; then
+      echo 'incorrect verified primary digest was accepted' >&2; exit 1
+    fi
+  done
   exit 0
 fi
 
@@ -651,9 +801,7 @@ PYMANIFEST
           "$multi_report")
         docker buildx imagetools inspect "$multi_immutable" --format '{{json .Manifest}}' \
           >"$result_directory/multi-manifest.json"
-        grep -Fq "$multi_primary" "$result_directory/multi-manifest.json"
-        [[ $(grep -o '"architecture":"amd64"' "$result_directory/multi-manifest.json" | wc -l) -eq 1 ]]
-        [[ $(grep -o '"architecture":"arm64"' "$result_directory/multi-manifest.json" | wc -l) -eq 1 ]]
+        assert_multi_platform_manifest "$result_directory/multi-manifest.json" "$multi_primary"
         docker buildx imagetools inspect "$alias" --format '{{json .Manifest}}' \
           >"$result_directory/multi-alias.json"
         [[ $(sha256sum "$result_directory/multi-manifest.json" | awk '{print $1}') == \

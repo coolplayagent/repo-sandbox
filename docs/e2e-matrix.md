@@ -59,6 +59,10 @@ CI prepares the arm64 environment in an explicit cache-only Buildx step before
 running the matrix. It gives builder bootstrap 60 seconds and emulated offline
 seed preparation 45 minutes, preserving their plain progress logs under
 `target/e2e/preparation/` even on failure. A preparation failure fails the job.
+CI uploads compact diagnostics separately from the complete results archive.
+The compact archive omits only `task-layout/blobs/`; logs, reports, OCI indexes
+and registry manifests remain available without downloading image layers.
+The original full archive and all runtime blob-digest assertions are retained.
 The native cold CLI build remains in the matrix; all scenario deadlines and
 publication, offline, cache, and size assertions remain required. This separates
 emulated toolchain setup from the multi-platform CLI contract checks. The cold/warm
