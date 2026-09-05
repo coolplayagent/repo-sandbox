@@ -24,9 +24,12 @@ the large upstream assembly image, the downloader, optional BuildKit secret,
 and transient installation state. `environment-base` starts from Debian slim,
 installs only task-runtime build dependencies, and copies the Rust/Cargo,
 fixed Bazel, and optional Bazelisk executables across an explicit
-`COPY --from=toolchain-build` boundary. `offline-seed` resolves a fixed,
-centrally owned `genrule` plus `cc_test` fixture without access to repository
-source or the optional GitHub token. The final `environment` copies only the
+`COPY --from=toolchain-build` boundary. `offline-seed` resolves two fixed, centrally owned graphs: the existing
+`genrule` plus `cc_test` baseline and a separate Rust workspace fixture with
+its pinned crate-universe closure. Neither graph has access to repository
+source or the optional GitHub token. A `RUN --network=none` instruction
+rebuilds both graphs separately after expanded repositories and action caches
+are removed. The final `environment` copies only the
 resulting content-addressed Bazel repository closure. The actual Bazel binary is pinned by
 the trusted central template to Bazel 8.3.1, so repositories cannot override
 `bazel_version` or `bazelisk_version`, and the normal `bazel` command does not
@@ -39,9 +42,11 @@ repository downloads. Task containers use Docker network `none`. When a source
 snapshot has no `MODULE.bazel.lock`, the task image supplies the checksum-pinned
 baseline lock for Bazel 8.3.1's built-in C++, Java, shell, and platform module
 mapping. The read-only image closure contains both registry metadata and source
-archives, rather than relying on a BuildKit cache mount. Version 1 seeds only
-the centrally defined baseline module closure; any additional dependency or
-extension closure that requires a download fails closed at runtime. Apt and Cargo
+archives, rather than relying on a BuildKit cache mount. Version 1 seeds the
+centrally defined C++ baseline and the separate pinned Rust workspace closure;
+any additional dependency or extension closure that requires a download fails
+closed at runtime. The CI offline-baseline contract checks that the Rust seed
+graph matches the workspace inputs. Apt and Cargo
 paths use locked, architecture-specific BuildKit cache mounts; those mounts and
 `/run/secrets` are never committed to a layer.
 

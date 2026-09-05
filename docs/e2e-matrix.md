@@ -41,7 +41,8 @@ isolated data root, socket, exec root and bridge, and first proves that a
 `busybox:1.36` container can be created and run with
 `--storage-opt size=32M`. BuildKit and disposable dogfood acceptance build
 stages that fetch public dependencies use the host network; final task
-containers and runner scenarios stay on the isolated bridge. The job removes
+containers and runner scenarios use Docker network `none`. The isolated bridge
+belongs only to the task-owned test daemon and its supporting fixtures. The job removes
 its exact Buildx builder, verifies the
 daemon PID and command line before terminating it, unmounts the task filesystem,
 its exec-root network namespace and loop device, removes the task bridge and

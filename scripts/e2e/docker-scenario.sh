@@ -15,6 +15,33 @@ task_source_rebuilt_stream() {
   '
 }
 
+# Fold journal events before selecting a live container: quota probes and the
+# runner both have Container records, and earlier registrations may be cleaned.
+journal_container_records() {
+  python3 - "$1" <<'PYRECORDS'
+import json, pathlib, sys
+latest = {}
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
+    for item in json.loads(path.read_text()):
+        if item.get("kind") == "container":
+            latest[item["identifier"]] = (item, path)
+for item, path in latest.values():
+    if item.get("state") != "cleaned":
+        print(item["identifier"], item["task_id"], path, sep="\t")
+PYRECORDS
+}
+
+select_task_container() {
+  local identifier task_id manifest name
+  while IFS=$'\t' read -r identifier task_id manifest; do
+    name=$(docker inspect --format '{{.Name}}' "$identifier" 2>/dev/null || true)
+    if [[ $name == "/repo-sandbox-$task_id" ]]; then
+      printf '%s\n' "$identifier"
+      return 0
+    fi
+  done < <(journal_container_records "$1")
+}
+
 if [[ ${1-} == --self-test-task-id ]]; then
   [[ $# == 1 ]]
   valid_task_id_value '1234-0123456789abcdef-987654321'
@@ -28,6 +55,30 @@ if [[ ${1-} == --self-test-task-id ]]; then
     task_source_rebuilt_stream
   ! printf '%s\n' '#8 [1/4] COPY --link source/ /workspace/' '#8 CACHED' | \
     task_source_rebuilt_stream
+  selection_fixture=$(mktemp -d)
+  trap 'rm -rf "$selection_fixture"' EXIT
+  python3 - "$selection_fixture" <<'PYFIXTURE'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+records = [
+    {"kind": "container", "identifier": "old-probe", "task_id": "task", "state": "registered"},
+    {"kind": "container", "identifier": "old-probe", "task_id": "task", "state": "cleaned"},
+    {"kind": "container", "identifier": "live-probe", "task_id": "task", "state": "registered"},
+    {"kind": "container", "identifier": "runner", "task_id": "task", "state": "registered"},
+]
+for index, item in enumerate(records):
+    (root / f"event-{index:020}.json").write_text(json.dumps([item]))
+PYFIXTURE
+  docker() {
+    case ${4-} in
+      live-probe) printf '%s\n' /repo-sandbox-quota-probe-task ;;
+      runner) printf '%s\n' /repo-sandbox-task ;;
+      *) return 1 ;;
+    esac
+  }
+  [[ $(journal_container_records "$selection_fixture" | wc -l) -eq 2 ]]
+  [[ $(select_task_container "$selection_fixture") == runner ]]
+  [[ $(journal_container_records "$selection_fixture" | awk -F '\t' '$1 == "runner" {print $3}') ==     "$selection_fixture/event-00000000000000000003.json" ]]
   exit 0
 fi
 
@@ -335,8 +386,9 @@ EOF
         [[ $(docker inspect --format '{{.Id}}' "$retained") == "$retained_before" ]]
         [[ $(sha256sum "$cache_marker") == "$marker_before" ]]
 
-        container_manifest=$(grep -Fl '"kind": "container"' \
-          "$fixture"/.repo-sandbox/tasks/*.json | head -n 1)
+        container_manifest=$(journal_container_records "$fixture/.repo-sandbox/tasks" | \
+          awk -F '\t' -v retained="$retained" '$1 == retained { print $3; exit }')
+        [[ -n $container_manifest && -f $container_manifest ]]
         container_manifest_name=$(basename "$container_manifest")
         mv "$fixture/.repo-sandbox/tasks" "$fixture/.repo-sandbox/tasks-owned"
         mkdir "$fixture/.repo-sandbox/tasks"
@@ -350,10 +402,7 @@ EOF
         rm -rf -- "$fixture/.repo-sandbox/tasks"
         mv "$fixture/.repo-sandbox/tasks-owned" "$fixture/.repo-sandbox/tasks"
 
-        owned_image=$(awk '
-          /"kind": "image"/ { image=1 }
-          image && /"identifier":/ { value=$0; sub(/^.*"identifier": "/, "", value); sub(/".*$/, "", value); print value; exit }
-        ' "$fixture"/.repo-sandbox/tasks/*.json)
+        owned_image=$(docker inspect --format '{{.Image}}' "$retained")
         [[ $owned_image =~ ^sha256:[0-9a-f]{64}$ ]]
         owned_image_reference=$(docker create "$owned_image" true)
         referenced_output="$result_directory/clean-referenced.log"
@@ -402,12 +451,7 @@ EOF
           >"$interrupt_log" 2>&1 &
         cli_pid=$!
         for _ in $(seq 1 600); do
-          container_manifest=$(grep -Fl '"kind": "container"' \
-            "$fixture"/.repo-sandbox/tasks/*.json 2>/dev/null | head -n 1 || true)
-          if [[ -n $container_manifest ]]; then
-            task_container=$(sed -nE \
-              's/^[[:space:]]*"identifier": "([^"]+)",?$/\1/p' "$container_manifest")
-          fi
+          task_container=$(select_task_container "$fixture/.repo-sandbox/tasks")
           if [[ -n $task_container ]] \
             && docker exec "$task_container" test -f /workspace/cancel-ready 2>/dev/null; then
             break

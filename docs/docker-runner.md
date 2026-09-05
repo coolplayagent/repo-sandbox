@@ -5,7 +5,7 @@ into a bounded local Docker job. `plan(&RunSpec)` returns the structured Docker
 argv without executing it, so callers can inspect the security and resource
 policy before starting a container.
 
-The default plan uses Docker's `bridge` network, runs without `--privileged`,
+The plan uses Docker's `none` network, runs without `--privileged`,
 does not mount the Docker socket, enables `no-new-privileges`, drops all Linux
 capabilities, and allocates explicit CPU, memory, memory-swap, writable-layer,
 and `/tmp` tmpfs limits. It starts no TTY or interactive session. A small non-interactive keeper
