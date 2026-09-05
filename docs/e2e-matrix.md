@@ -18,9 +18,16 @@ The default output is a unique `target/e2e/<pid>-<timestamp>/` directory. Every
 executed scenario gets its own directory containing the complete
 `scenario.log`, assertion-bearing `report.json`, and its declared artifacts.
 An existing scenario directory is never reused or overwritten.
-On Linux the runner starts each command in a new session; on Windows it uses an
-exact root PID. A matrix timeout terminates that owned process tree before the
-scenario is reaped, so child Docker or SSH clients cannot outlive the run.
+On Linux the runner starts each command in a new session and requires
+[`pidfd_open`](https://man7.org/linux/man-pages/man2/pidfd_open.2.html)/
+[`pidfd_send_signal`](https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html)
+support (Linux 5.3+ or equivalent backports). It
+probes those APIs before spawning a scenario. Cleanup binds each process by
+pidfd, verifies its session, and removes remaining live session members even
+when they use another process group or the scenario leader exits first. The
+leader is reaped only after cleanup, keeping its session identity reserved.
+This requirement applies to the matrix harness, not the installed CLI. On
+Windows the harness terminates the tree rooted at the exact scenario PID.
 
 ## Required host matrix
 
@@ -47,6 +54,14 @@ its exact Buildx builder, verifies the
 daemon PID and command line before terminating it, unmounts the task filesystem,
 its exec-root network namespace and loop device, removes the task bridge and
 directory, and asserts those resources are gone.
+
+CI prepares the arm64 environment in an explicit cache-only Buildx step before
+running the matrix. It gives builder bootstrap 60 seconds and emulated offline
+seed preparation 45 minutes, preserving their plain progress logs under
+`target/e2e/preparation/` even on failure. A preparation failure fails the job.
+The native cold CLI build remains in the matrix; all scenario deadlines and
+publication, offline, cache, and size assertions remain required. This separates
+emulated toolchain setup from the multi-platform CLI contract checks.
 
 Failure cleanup is ownership-scoped. Images and containers use unique run IDs.
 The runner failure test checks the retained container's

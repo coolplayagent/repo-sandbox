@@ -42,6 +42,17 @@ select_task_container() {
   done < <(journal_container_records "$1")
 }
 
+assert_report_exports_file() {
+  python3 - "$1" "$2" <<'PYEXPORT'
+import json, pathlib, sys
+with open(sys.argv[1]) as source:
+    report = json.load(source)
+artifact = pathlib.Path(sys.argv[2]).resolve()
+roots = [pathlib.Path(value).resolve() for value in report["exported_artifacts"]]
+assert any(artifact != root and artifact.is_relative_to(root) for root in roots), "artifact is not beneath a reported export directory"
+PYEXPORT
+}
+
 if [[ ${1-} == --self-test-task-id ]]; then
   [[ $# == 1 ]]
   valid_task_id_value '1234-0123456789abcdef-987654321'
@@ -79,6 +90,15 @@ PYFIXTURE
   [[ $(journal_container_records "$selection_fixture" | wc -l) -eq 2 ]]
   [[ $(select_task_container "$selection_fixture") == runner ]]
   [[ $(journal_container_records "$selection_fixture" | awk -F '\t' '$1 == "runner" {print $3}') ==     "$selection_fixture/event-00000000000000000003.json" ]]
+  printf '%s\n' '{"exported_artifacts":["/task/artifacts/profile-artifacts"]}' >"$selection_fixture/export.json"
+  assert_report_exports_file "$selection_fixture/export.json" /task/artifacts/profile-artifacts/profile-artifact.txt
+  for invalid_artifact in /task/artifacts/other/profile-artifact.txt /task/artifacts/profile-artifacts \
+    /task/artifacts/profile-artifacts/../unreported.txt; do
+    if assert_report_exports_file "$selection_fixture/export.json" "$invalid_artifact" 2>/dev/null; then
+      echo "unreported artifact was accepted: $invalid_artifact" >&2
+      exit 1
+    fi
+  done
   exit 0
 fi
 
@@ -749,7 +769,7 @@ PYARCHITECTURE
       -name profile-artifact.txt -print -quit)
     [[ -n $artifact ]]
     grep -Fxq 'artifact-ok' "$artifact"
-    grep -Fq 'profile-artifact.txt' "$artifact_report"
+    assert_report_exports_file "$artifact_report" "$artifact"
     ! grep -R -Fq -- "$profile_secret" "$artifact_repository/.repo-sandbox" "$artifact_report"
     echo 'profile_cli=timeout,memory,temporary-storage,architecture,secret-artifact status=verified'
     printf 'passed\n' >"$result_directory/cli-profile-contracts.passed"

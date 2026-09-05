@@ -106,6 +106,22 @@ jobs:
           docker buildx inspect "$builder" --bootstrap
           docker buildx inspect "$builder" | grep -Eq 'Platforms:.*linux/amd64'
           echo "REPO_SANDBOX_BUILDER=$builder" >> "$GITHUB_ENV"
+      # Keep emulated toolchain setup separate from CLI publication deadlines,
+      # and preserve progress even if preparation times out. The native cold
+      # build and all existing matrix deadlines/assertions remain exercised.
+      - name: Prepare the arm64 offline environment with visible progress
+        run: |
+          set -euo pipefail
+          mkdir -p target/e2e/preparation
+          timeout --signal=TERM --kill-after=30s 60s \
+            docker buildx inspect "$REPO_SANDBOX_BUILDER" --bootstrap \
+            2>&1 | tee target/e2e/preparation/builder.log
+          timeout --signal=TERM --kill-after=30s 2700s \
+            docker buildx build --builder "$REPO_SANDBOX_BUILDER" \
+              --platform linux/arm64 --target environment --provenance=false \
+              --output type=cacheonly --progress plain \
+              templates/rust-bazel/context \
+            2>&1 | tee target/e2e/preparation/arm64-environment.log
       - name: Run required runner integration scenarios
         env:
           # Fixed non-production fixture value; matrix assertions require that it is redacted.

@@ -4,36 +4,98 @@ set -euo pipefail
 assert_cached_step() {
   local log=$1
   local description=$2
-  # Vertex numbering changes when a Dockerfile gains a stage instruction.
-  # Match its stage/operation and require every matching vertex to be cached.
+  # The total instruction count and optional platform prefix are presentation
+  # details. Keep the ordinal so distinct RUN instructions remain required.
   awk -v description="$description" '
     function stable(text) {
-      gsub(/ [0-9]+\/[0-9]+\]/, "]", text)
+      gsub(/\[linux\/[^ ]+ /, "[", text)
+      gsub(/\/[0-9]+\]/, "]", text)
       return text
     }
-    index(stable($0), stable(description)) { expected[$1]=1 }
+    {
+      line=stable($0)
+      wanted=stable(description)
+      offset=index(line, wanted)
+      next_char=substr(line, offset + length(wanted), 1)
+      if (offset && (next_char == "" || next_char ~ /[[:space:]]/)) expected[$1]=1
+    }
     $2 == "CACHED" { cached[$1]=1 }
     END {
       count=0
       for (step in expected) {
         count++
-        if (!cached[step]) exit 1
+        if (!cached[step]) {
+          print "required cache vertex not cached: " step " for " description > "/dev/stderr"
+          exit 1
+        }
       }
+      if (count == 0) print "required cache operation missing: " description > "/dev/stderr"
       exit count == 0
     }
   ' "$log"
 }
 
+assert_environment_cached() {
+  local warm_log=$1
+  assert_cached_step "$warm_log" '[toolchain-build 2/2] RUN' || return 1
+  assert_cached_step "$warm_log" '[environment-base 2/7] RUN' || return 1
+  assert_cached_step "$warm_log" '[environment-base 3/7] COPY --from=toolchain-build /usr/local/cargo/' || return 1
+  assert_cached_step "$warm_log" '[environment-base 4/7] COPY --from=toolchain-build /usr/local/rustup/' || return 1
+  assert_cached_step "$warm_log" '[environment-base 5/7] COPY --from=toolchain-build /toolchain/bin/bazel' || return 1
+  assert_cached_step "$warm_log" '[environment-base 6/7] COPY --from=toolchain-build /toolchain/bin/bazelisk' || return 1
+  assert_cached_step "$warm_log" '[environment-base 7/7] RUN' || return 1
+  assert_cached_step "$warm_log" '[offline-seed 2/2] RUN' || return 1
+  assert_cached_step "$warm_log" '[offline-seed 3/3] RUN' || return 1
+  assert_cached_step "$warm_log" '[environment 1/4] COPY --from=offline-seed /toolchain/bazel-seed/cache/repos/' || return 1
+  assert_cached_step "$warm_log" '[environment 4/4] RUN' || return 1
+}
+
 if [[ ${1-} == --self-test-cache-assertions ]]; then
   cache_fixture=$(mktemp)
-  trap 'rm -f "$cache_fixture"' EXIT
+  trap 'rm -f "$cache_fixture" "$cache_fixture.miss"' EXIT
   printf '%s\n' '#17 [offline-seed 2/3] RUN online-seed' '#17 CACHED' \
     '#19 [offline-seed 3/3] RUN offline-verify' '#19 CACHED' >"$cache_fixture"
   assert_cached_step "$cache_fixture" '[offline-seed 2/2] RUN'
-  ! assert_cached_step "$cache_fixture" '[environment 1/4] COPY'
+  cat >"$cache_fixture" <<'CACHELOG'
+#11 [linux/amd64 toolchain-build 2/2] RUN install-tools
+#11 CACHED
+#12 [linux/amd64 environment-base 2/7] RUN install-runtime
+#12 CACHED
+#13 [linux/amd64 environment-base 3/7] COPY --from=toolchain-build /usr/local/cargo/
+#13 CACHED
+#14 [linux/amd64 environment-base 4/7] COPY --from=toolchain-build /usr/local/rustup/
+#14 CACHED
+#15 [linux/amd64 environment-base 5/7] COPY --from=toolchain-build /toolchain/bin/bazel
+#15 CACHED
+#16 [linux/amd64 environment-base 6/7] COPY --from=toolchain-build /toolchain/bin/bazelisk
+#16 CACHED
+#17 [linux/amd64 environment-base 7/7] RUN verify-tools
+#17 CACHED
+#18 [offline-seed 2/3] RUN online-seed
+#18 CACHED
+#19 [offline-seed 3/3] RUN offline-verify
+#19 CACHED
+#20 [environment 1/4] COPY --from=offline-seed /toolchain/bazel-seed/cache/repos/
+#20 CACHED
+#21 [environment 4/4] RUN install-wrapper
+#21 CACHED
+CACHELOG
+  assert_environment_cached "$cache_fixture"
+  for vertex in $(seq 11 21); do
+    sed "s/^#$vertex CACHED$/#$vertex DONE 0.1s/" "$cache_fixture" >"$cache_fixture.miss"
+    if assert_environment_cached "$cache_fixture.miss" 2>/dev/null; then echo "uncached vertex $vertex was accepted" >&2; exit 1; fi
+    sed "/^#$vertex /d" "$cache_fixture" >"$cache_fixture.miss"
+    if assert_environment_cached "$cache_fixture.miss" 2>/dev/null; then echo "missing required vertex $vertex was accepted" >&2; exit 1; fi
+  done
+  sed '/^#15 /s|/toolchain/bin/bazel$|/toolchain/bin/bazelisk|' "$cache_fixture" >"$cache_fixture.miss"
+  if assert_environment_cached "$cache_fixture.miss" 2>/dev/null; then echo 'bazelisk substituted for bazel was accepted' >&2; exit 1; fi
+  sed '/^#11 /s/] RUN /] RUNNER /' "$cache_fixture" >"$cache_fixture.miss"
+  if assert_environment_cached "$cache_fixture.miss" 2>/dev/null; then echo 'operation prefix collision was accepted' >&2; exit 1; fi
+  rm -f "$cache_fixture.miss"
+  if assert_cached_step "$cache_fixture" '[missing-stage 1/4] COPY' 2>/dev/null; then exit 1; fi
   printf '%s\n' '#17 [offline-seed 2/3] RUN online-seed' '#17 CACHED' \
     '#19 [offline-seed 3/3] RUN offline-verify' '#19 DONE 0.1s' >"$cache_fixture"
-  ! assert_cached_step "$cache_fixture" '[offline-seed 2/2] RUN'
+  if assert_cached_step "$cache_fixture" '[offline-seed 3/3] RUN' 2>/dev/null; then exit 1; fi
   exit 0
 fi
 
@@ -109,16 +171,7 @@ for architecture in amd64 arm64; do
   test "$cold_environment_identity" = "$warm_environment_identity"
   printf '%s environment cold/warm identity: %s\n' \
     "$architecture" "$warm_environment_identity"
-  assert_cached_step "$warm_log" '[toolchain-build 2/2] RUN'
-  assert_cached_step "$warm_log" '[environment-base 2/7] RUN'
-  assert_cached_step "$warm_log" '[environment-base 3/7] COPY --from=toolchain-build /usr/local/cargo/'
-  assert_cached_step "$warm_log" '[environment-base 4/7] COPY --from=toolchain-build /usr/local/rustup/'
-  assert_cached_step "$warm_log" '[environment-base 5/7] COPY --from=toolchain-build /toolchain/bin/bazel'
-  assert_cached_step "$warm_log" '[environment-base 6/7] COPY --from=toolchain-build /toolchain/bin/bazelisk'
-  assert_cached_step "$warm_log" '[environment-base 7/7] RUN'
-  assert_cached_step "$warm_log" '[offline-seed 2/2] RUN'
-  assert_cached_step "$warm_log" '[environment 1/4] COPY --from=offline-seed /toolchain/bazel-seed/cache/repos/'
-  assert_cached_step "$warm_log" '[environment 4/4] RUN'
+  assert_environment_cached "$warm_log"
 
   source_digest=$(tar -C "$temporary/context/source" --sort=name --mtime='UTC 1970-01-01' \
     --owner=0 --group=0 --numeric-owner -cf - . | sha256sum | awk '{print "sha256:"$1}')

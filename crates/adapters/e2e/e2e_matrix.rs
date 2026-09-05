@@ -266,6 +266,9 @@ fn execute(
     for (name, value) in &scenario.command.env {
         command.env(name, expand(value)?);
     }
+    #[cfg(target_os = "linux")]
+    probe_pidfd_cleanup()
+        .map_err(|error| format!("Linux matrix requires pidfd-safe cleanup: {error}"))?;
     let started = Instant::now();
     let mut child = command
         .spawn()
@@ -282,8 +285,7 @@ fn execute(
     let stderr_reader = thread::spawn(move || read_all(stderr));
     let deadline = started + Duration::from_secs(scenario.timeout_seconds);
     let (status, timed_out) = loop {
-        if let Some(status) = child
-            .try_wait()
+        if let Some(status) = poll_scenario(&mut child)
             .map_err(|error| format!("wait for scenario {}: {error}", scenario.id))?
         {
             break (status, false);
@@ -410,23 +412,161 @@ fn kill_process_tree(child: &mut std::process::Child) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn kill_process_tree(child: &mut std::process::Child) -> io::Result<()> {
-    let group = format!("-{}", child.id());
-    let status = Command::new("kill")
-        .args(["-TERM", "--", &group])
-        .stdin(Stdio::null())
-        .status()?;
-    if !status.success() {
-        return child.kill();
+fn task_session_members(session: u32) -> io::Result<BTreeSet<u32>> {
+    let own = fs::read_to_string("/proc/self/stat")?;
+    if process_session(&own).is_some_and(|(_, own_session)| own_session == session) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refused to signal the matrix session",
+        ));
     }
-    thread::sleep(Duration::from_millis(250));
-    if child.try_wait()?.is_none() {
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &group])
-            .stdin(Stdio::null())
-            .status();
+    let mut members = BTreeSet::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        // Processes may exit while /proc is enumerated. Only members of the
+        // exact scenario session are eligible; user IDs and command names are
+        // deliberately not ownership criteria.
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if let Some((_, found_session)) = process_session(&stat)
+            && found_session == session
+            && pid > 1
+        {
+            members.insert(pid);
+        }
+    }
+    Ok(members)
+}
+
+#[cfg(target_os = "linux")]
+fn process_session(stat: &str) -> Option<(u32, u32)> {
+    // comm is parenthesized and may itself contain spaces or ')'. The fields
+    // after its final ')' are state, ppid, pgrp, session, ... .
+    let (_, fields) = stat.rsplit_once(')')?;
+    let mut fields = fields.split_whitespace();
+    fields.next()?;
+    fields.next()?;
+    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+}
+
+// These syscall numbers are shared by the supported Linux x86_64/aarch64 hosts.
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u32) -> io::Result<File> {
+    use std::os::fd::FromRawFd;
+    unsafe extern "C" {
+        fn syscall(number: std::ffi::c_long, ...) -> std::ffi::c_long;
+    }
+    let fd = unsafe { syscall(434, pid as i32, 0_u32) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd as i32) })
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pidfd(fd: &File, signal: i32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn syscall(number: std::ffi::c_long, ...) -> std::ffi::c_long;
+    }
+    if unsafe {
+        syscall(
+            424,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<std::ffi::c_void>(),
+            0_u32,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn probe_pidfd_cleanup() -> io::Result<()> {
+    // Fail before spawning any scenario on kernels/sandboxes without these APIs.
+    signal_pidfd(&open_pidfd(std::process::id())?, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn signal_task_session(session: u32, signal: i32) -> io::Result<usize> {
+    let mut live = 0;
+    for pid in task_session_members(session)? {
+        let fd = match open_pidfd(pid) {
+            Ok(fd) => fd,
+            Err(error) if error.raw_os_error() == Some(3) => continue,
+            Err(error) => return Err(error),
+        };
+        // Bind the process first, then recheck ownership. PID reuse between
+        // enumeration and opening cannot cause us to signal an unrelated task.
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if !process_session(&stat).is_some_and(|(_, found)| found == session)
+            || process_state(&stat) == Some("Z")
+        {
+            continue;
+        }
+        live += 1;
+        if let Err(error) = signal_pidfd(&fd, signal)
+            && error.raw_os_error() != Some(3)
+        {
+            return Err(error);
+        }
+    }
+    Ok(live)
+}
+
+#[cfg(target_os = "linux")]
+fn kill_process_tree(child: &mut std::process::Child) -> io::Result<()> {
+    // Keep the leader unreaped throughout cleanup so its unique SID cannot
+    // be reused, even when TERM makes the leader exit before its descendants.
+    signal_task_session(child.id(), 15)?;
+    thread::sleep(Duration::from_millis(250));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // A live parent may fork between enumeration and its signal. Rescan
+        // until no live member can create children or retain the log pipes.
+        if signal_task_session(child.id(), 9)? == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "scenario session did not exit after SIGKILL",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_state(stat: &str) -> Option<&str> {
+    stat.rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().next())
+}
+
+#[cfg(target_os = "linux")]
+fn poll_scenario(child: &mut std::process::Child) -> io::Result<Option<std::process::ExitStatus>> {
+    let stat = fs::read_to_string(format!("/proc/{}/stat", child.id()))?;
+    if process_state(&stat) == Some("Z") {
+        // A finished shell can leave new-PGID descendants holding log pipes.
+        // Clean its session before reaping, then readers can reach EOF.
+        kill_process_tree(child)?;
+        return child.wait().map(Some);
+    }
+    Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn poll_scenario(child: &mut std::process::Child) -> io::Result<Option<std::process::ExitStatus>> {
+    child.try_wait()
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -591,6 +731,168 @@ fn run_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::{file_secret_variants, redact};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_session_worker() {
+        use std::os::unix::process::CommandExt;
+        let Ok(role) = std::env::var("REPO_SANDBOX_E2E_TEST_WORKER") else {
+            return;
+        };
+        if role == "parent" || role == "parent-exit" {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "tests::linux_session_worker", "--nocapture"])
+                .env("REPO_SANDBOX_E2E_TEST_WORKER", "grandchild")
+                .process_group(0);
+            let mut child = child.spawn().unwrap();
+            if role == "parent" {
+                child.wait().unwrap();
+            }
+        } else {
+            unsafe extern "C" {
+                fn signal(signal: i32, handler: usize) -> usize;
+            }
+            // Confined to this explicitly spawned worker process.
+            unsafe {
+                signal(15, 1);
+            } // SIGTERM, SIG_IGN
+            std::fs::write(
+                std::env::var_os("REPO_SANDBOX_E2E_TEST_PID").unwrap(),
+                std::process::id().to_string(),
+            )
+            .unwrap();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timeout_kills_new_process_group_grandchild_after_session_leader_exits() {
+        assert_session_cleanup(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_leader_cleans_new_process_group_and_releases_log_pipe() {
+        assert_session_cleanup(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_session_cleanup(leader_exits: bool) {
+        use std::{
+            fs,
+            process::{Command, Stdio},
+            thread,
+            time::{Duration, Instant},
+        };
+        struct OwnedSession(std::process::Child, bool);
+        impl Drop for OwnedSession {
+            fn drop(&mut self) {
+                if self.1 {
+                    return;
+                }
+                let _ = super::kill_process_tree(&mut self.0);
+                let _ = self.0.wait();
+            }
+        }
+        super::probe_pidfd_cleanup().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let spawn = |role: &str, pid: &std::path::Path| {
+            OwnedSession(
+                Command::new("setsid")
+                    .arg(std::env::current_exe().unwrap())
+                    .args(["--exact", "tests::linux_session_worker", "--nocapture"])
+                    .env("REPO_SANDBOX_E2E_TEST_WORKER", role)
+                    .env("REPO_SANDBOX_E2E_TEST_PID", pid)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+                false,
+            )
+        };
+        let owned_pid = directory.path().join("owned");
+        let foreign_pid = directory.path().join("foreign");
+        let mut owned = spawn(
+            if leader_exits {
+                "parent-exit"
+            } else {
+                "parent"
+            },
+            &owned_pid,
+        );
+        let mut stdout = owned.0.stdout.take().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            use std::io::Read;
+            let result = stdout.read_to_end(&mut Vec::new());
+            let _ = sent.send(result);
+        });
+        let foreign = spawn("unrelated", &foreign_pid);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while [&owned_pid, &foreign_pid].iter().any(|path| {
+            fs::read_to_string(path)
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .is_none()
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "session workers did not become ready"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild: u32 = fs::read_to_string(&owned_pid).unwrap().parse().unwrap();
+        let stat = fs::read_to_string(format!("/proc/{grandchild}/stat")).unwrap();
+        let (group, session) = super::process_session(&stat).unwrap();
+        assert_eq!(session, owned.0.id());
+        assert_ne!(
+            group, session,
+            "fixture must create an independent descendant PGID"
+        );
+        if leader_exits {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while super::poll_scenario(&mut owned.0).unwrap().is_none() {
+                assert!(Instant::now() < deadline, "session leader did not exit");
+                thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            super::kill_process_tree(&mut owned.0).unwrap();
+            owned.0.wait().unwrap();
+        }
+        owned.1 = true;
+        received
+            .recv_timeout(Duration::from_secs(3))
+            .expect("descendant kept scenario stdout open")
+            .unwrap();
+        reader.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let gone = fs::read_to_string(format!("/proc/{grandchild}/stat"))
+                .map(|value| {
+                    value.rsplit_once(')').unwrap().1.split_whitespace().next() == Some("Z")
+                })
+                .unwrap_or(true);
+            if gone {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "new-PGID descendant survived scenario timeout"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            super::process_state(
+                &fs::read_to_string(format!("/proc/{}/stat", foreign.0.id())).unwrap()
+            ) != Some("Z"),
+            "unrelated session must survive"
+        );
+    }
 
     fn assert_streams_redacted(contents: &str) {
         let secrets = file_secret_variants(contents.to_owned());

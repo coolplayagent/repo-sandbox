@@ -729,10 +729,16 @@ impl<E: ProcessExecutor> BuildKit<E> {
         invocation: &ProcessInvocation,
         cancellation: &dyn Cancellation,
     ) -> Result<(), BuildError> {
-        let output = self
-            .executor
-            .execute(invocation, cancellation)
-            .map_err(|source| BuildError::Process { operation, source })?;
+        // Operation names are static, so progress cannot expose credential or
+        // repository arguments. Emit boundaries before buffered child output.
+        eprintln!("BuildKit operation started: {operation}");
+        let started = std::time::Instant::now();
+        let result = self.executor.execute(invocation, cancellation);
+        eprintln!(
+            "BuildKit operation finished: {operation} ({} ms)",
+            started.elapsed().as_millis()
+        );
+        let output = result.map_err(|source| BuildError::Process { operation, source })?;
         if output.interrupted {
             return Err(BuildError::Interrupted {
                 operation,
@@ -763,10 +769,16 @@ impl<E: ProcessExecutor> BuildKit<E> {
         invocation: &ProcessInvocation,
         cancellation: &dyn Cancellation,
     ) -> Result<ProcessOutput, BuildError> {
-        let output = self
-            .executor
-            .execute(invocation, cancellation)
-            .map_err(|source| BuildError::Process { operation, source })?;
+        // Operation names are static, so progress cannot expose credential or
+        // repository arguments. Emit boundaries before buffered child output.
+        eprintln!("BuildKit operation started: {operation}");
+        let started = std::time::Instant::now();
+        let result = self.executor.execute(invocation, cancellation);
+        eprintln!(
+            "BuildKit operation finished: {operation} ({} ms)",
+            started.elapsed().as_millis()
+        );
+        let output = result.map_err(|source| BuildError::Process { operation, source })?;
         if output.interrupted {
             return Err(BuildError::Interrupted {
                 operation,
