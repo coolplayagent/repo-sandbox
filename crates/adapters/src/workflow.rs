@@ -2513,6 +2513,9 @@ fn preflight_registry_with_builder(
             executor,
             vec![
                 "build".into(),
+                // A selected docker-container builder does not load by default.
+                // The following Docker push requires a daemon-local image.
+                "--load".into(),
                 "--file".into(),
                 docker_host_path(&temporary.path().join("Dockerfile")),
                 "--tag".into(),
@@ -2910,6 +2913,9 @@ fn preflight_writable_layer_quota_recorded(
         executor,
         vec![
             "build".into(),
+            // BUILDX_BUILDER can select a non-Docker driver even for docker build.
+            // Quota validation and ownership reconciliation use the local daemon.
+            "--load".into(),
             "--file".into(),
             docker_host_path(&dockerfile),
             "--tag".into(),
@@ -7408,6 +7414,167 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[derive(Default)]
+    struct LoadAwareProbeState {
+        image_visible: bool,
+        container_visible: bool,
+        pushed: bool,
+        quota: bool,
+        events: Vec<&'static str>,
+    }
+
+    #[derive(Default)]
+    struct LoadAwareProbeExecutor(std::sync::Mutex<LoadAwareProbeState>);
+
+    impl ProcessExecutor for LoadAwareProbeExecutor {
+        fn execute(
+            &self,
+            invocation: &ProcessInvocation,
+            _cancellation: &dyn Cancellation,
+        ) -> std::io::Result<crate::buildkit::ProcessOutput> {
+            let mut state = self.0.lock().unwrap();
+            let args = invocation
+                .args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let image_id = format!("sha256:{}", "f".repeat(64));
+            let container_id = "b".repeat(64);
+            let stdout = match args.as_slice() {
+                ["build", ..] => {
+                    // A docker-container builder reports successful construction
+                    // even when the result remains exclusively in its cache.
+                    state.image_visible = args.contains(&"--load");
+                    state.quota = args
+                        .iter()
+                        .any(|arg| arg.starts_with("repo-sandbox-quota-probe:"));
+                    state.events.push("build");
+                    String::new()
+                }
+                ["image", "inspect", ..] => {
+                    assert!(
+                        state.image_visible,
+                        "probe inspected an image left only in the selected builder cache"
+                    );
+                    state.events.push("inspect-image");
+                    let kind = if state.quota {
+                        "quota-probe"
+                    } else {
+                        "registry-preflight"
+                    };
+                    format!("{image_id}|{kind}|fixture")
+                }
+                ["container", "create", ..] => {
+                    assert!(
+                        state.image_visible,
+                        "quota container requires a loaded image"
+                    );
+                    state.container_visible = true;
+                    state.events.push("create-container");
+                    container_id.clone()
+                }
+                ["container", "inspect", ..] => {
+                    assert!(state.container_visible);
+                    state.events.push("inspect-container");
+                    format!("{container_id}|quota-probe|fixture")
+                }
+                ["container", "rm", "--force", id] => {
+                    assert_eq!(*id, container_id);
+                    assert!(state.container_visible);
+                    state.container_visible = false;
+                    state.events.push("remove-container");
+                    String::new()
+                }
+                ["push", ..] => {
+                    assert!(
+                        state.image_visible,
+                        "docker push cannot see the selected builder's private cache"
+                    );
+                    state.pushed = true;
+                    state.events.push("push");
+                    format!("digest: {image_id}")
+                }
+                ["buildx", "imagetools", "inspect", ..] => {
+                    assert!(state.pushed);
+                    state.events.push("inspect-remote");
+                    if args.contains(&"--format") {
+                        r#"{"io.repo-sandbox.kind":"registry-preflight","io.repo-sandbox.task-id":"fixture"}"#.into()
+                    } else {
+                        format!("Digest: {image_id}")
+                    }
+                }
+                ["image", "rm", "--force", id] => {
+                    assert_eq!(*id, image_id);
+                    assert!(state.image_visible);
+                    assert!(
+                        !state.container_visible,
+                        "remove the quota container before its image"
+                    );
+                    state.image_visible = false;
+                    state.events.push("remove-image");
+                    String::new()
+                }
+                other => panic!("unexpected local probe operation: {other:?}"),
+            };
+            Ok(crate::buildkit::ProcessOutput {
+                exit_code: Some(0),
+                stdout,
+                stderr: String::new(),
+                interrupted: false,
+            })
+        }
+    }
+
+    #[test]
+    fn quota_preflight_loads_container_builder_result_before_use_and_cleanup() {
+        let executor = LoadAwareProbeExecutor::default();
+        preflight_writable_layer_quota_with_identity(&executor, 384, &NeverCancelled, "fixture")
+            .unwrap();
+        let state = executor.0.lock().unwrap();
+        assert!(!state.image_visible && !state.container_visible);
+        assert_eq!(
+            state.events,
+            [
+                "build",
+                "inspect-image",
+                "create-container",
+                "inspect-container",
+                "remove-container",
+                "remove-image"
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_preflight_loads_container_builder_result_before_push_and_cleanup() {
+        let executor = LoadAwareProbeExecutor::default();
+        let mut facts = Vec::new();
+        preflight_registry_with(
+            &executor,
+            "localhost:5000/team/image",
+            "fixture",
+            false,
+            &DeadlineCancellation::new(std::time::Duration::from_secs(2)),
+            |fact| facts.push(fact),
+        )
+        .unwrap();
+        let state = executor.0.lock().unwrap();
+        assert!(state.pushed);
+        assert!(!state.image_visible && !state.container_visible);
+        assert_eq!(
+            state.events,
+            [
+                "build",
+                "push",
+                "inspect-remote",
+                "inspect-remote",
+                "inspect-image",
+                "remove-image"
+            ]
+        );
+        assert!(facts.iter().any(|fact| fact.verified));
+    }
+
     #[test]
     fn registry_preflight_uses_the_single_platform_push_boundary_and_records_remote_fact() {
         let digest = format!("sha256:{}", "a".repeat(64));
@@ -7449,7 +7616,7 @@ mod tests {
         .unwrap();
         let calls = executor.calls.lock().unwrap();
         assert_eq!(calls.len(), 6);
-        assert_eq!(calls[0].args[0], "build");
+        assert_eq!(&calls[0].args[..2], ["build", "--load"]);
         assert_eq!(calls[1].args[0], "push");
         assert_eq!(&calls[2].args[..3], ["buildx", "imagetools", "inspect"]);
         assert_eq!(&calls[3].args[..3], ["buildx", "imagetools", "inspect"]);
@@ -7972,7 +8139,7 @@ mod tests {
             .unwrap();
         let calls = executor.calls.lock().unwrap();
         assert_eq!(calls.len(), 6);
-        assert_eq!(calls[0].args[0], "build");
+        assert_eq!(&calls[0].args[..2], ["build", "--load"]);
         assert!(calls[0].args.iter().any(|arg| arg.ends_with("Dockerfile")));
         assert_eq!(&calls[1].args[..2], ["image", "inspect"]);
         assert_eq!(&calls[2].args[..2], ["container", "create"]);
