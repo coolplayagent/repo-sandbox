@@ -745,6 +745,10 @@ mod tests {
                 .args(["--exact", "tests::linux_session_worker", "--nocapture"])
                 .env("REPO_SANDBOX_E2E_TEST_WORKER", "grandchild")
                 .process_group(0);
+            #[allow(
+                clippy::zombie_processes,
+                reason = "The parent-exit fixture deliberately leaves its child alive; the outer test cleans the owned session to reproduce and verify early-leader-exit cleanup"
+            )]
             let mut child = child.spawn().unwrap();
             if role == "parent" {
                 child.wait().unwrap();
